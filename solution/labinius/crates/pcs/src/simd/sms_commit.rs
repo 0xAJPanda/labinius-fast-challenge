@@ -600,15 +600,16 @@ unsafe fn transpose16x16_u32(r: &[__m512i; 16]) -> [__m512i; 16] {
     out
 }
 
-/// What [`write_rows`] writes: a whole column's rows, or one of the two halves of its
-/// ring-element range ([`HALVES`]). The first half to finish leaves its raw partial rows (the
-/// base residue canonical in `[0, 9721)`, the tail total without the means and unmasked); the
-/// second adds its own to them and writes the final rows.
+/// What [`write_rows`] writes: a whole column's rows, or one of the [`HALVES`] parts of its
+/// ring-element range. The first part to finish leaves its raw partial rows (the base residue
+/// canonical in `[0, 9721)`, the tail total without the means and unmasked); a middle part adds
+/// its own to them; the last adds its own, the public means and the tail mask.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowsMode {
     Full,
     First,
-    Second,
+    Middle,
+    Last,
 }
 
 /// The group's two rows per column: the base stream canonical in `[0, 9721)` (NTT domain) and the
@@ -634,7 +635,7 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
             let b = _mm512_load_si512(pt.add(2 * j + 1));
             _mm512_store_si512(pt.add(2 * j), zero);
             _mm512_store_si512(pt.add(2 * j + 1), zero);
-            let mu = if mode == RowsMode::First { 0 } else { keys.mu[j] as i32 };
+            let mu = if matches!(mode, RowsMode::First | RowsMode::Middle) { 0 } else { keys.mu[j] as i32 };
             rt[s] = _mm512_add_epi32(_mm512_add_epi32(a, b), _mm512_set1_epi32(mu));
         }
         let c0 = transpose16x16_u32(&r0);
@@ -643,12 +644,12 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
         for c in 0..gc {
             let (db, dt) = ((dst.add(2 * c) as *mut i32).add(j0), (dst.add(2 * c + 1) as *mut i32).add(j0));
             let (mut b, mut t) = (c0[c], ct[c]);
-            if mode == RowsMode::Second {
+            if matches!(mode, RowsMode::Middle | RowsMode::Last) {
                 b = _mm512_add_epi32(b, _mm512_maskz_loadu_epi32(m, db));
                 b = _mm512_mask_sub_epi32(b, _mm512_cmp_epi32_mask(b, q, _MM_CMPINT_NLT), b, q);
                 t = _mm512_add_epi32(t, _mm512_maskz_loadu_epi32(m, dt));
             }
-            if mode != RowsMode::First {
+            if matches!(mode, RowsMode::Full | RowsMode::Last) {
                 t = _mm512_and_si512(t, mask);
             }
             _mm512_mask_storeu_epi32(db, m, b);
@@ -660,8 +661,8 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
 
 /// Parts of a column's ring-element range committed as separate work units by
 /// [`commit_paired`]: the commitment's coarse units otherwise leave cores idle at its end. Each
-/// part is whole digit chunks and one half-column chunk of the last digit.
-const HALVES: usize = 2;
+/// part is whole digit chunks.
+const HALVES: usize = 4;
 
 /// Where a group writes its rows: in full, or as one half of the range under its group's lock
 /// (`state` counts the halves already written).
@@ -677,9 +678,9 @@ enum RowsOut<'a> {
 unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
     let g = cols.len();
     assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
-    let hl = np / 2;
+    let hl = np / HALVES;
     let span = range.end - range.start;
-    assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
+    assert!(range.start % hl == 0 && (span == np || span == hl), "whole parts of the column");
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     let mut half = 0usize;
@@ -735,12 +736,11 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         } else {
             vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
         }
-        // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
-        let (e, cph) = (b + LOCK, chunks_per_half(np));
-        let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
+        // Chunk ends: every CHUNK_PAIRS pair batches, and the part's end.
+        let (e, local) = (b + LOCK, { let e = b + LOCK; e - (e - 1) / hl * hl });
         if (local % CHUNK_PAIRS == 0 || local == hl) && mode != 3 {
-            let chunk = eh * cph + (local - 1) / CHUNK_PAIRS;
-            // The next chunk's length: the rest of this half, or the next half's first chunk.
+            let chunk = (e - 1) / CHUNK_PAIRS;
+            // The next chunk's length: the rest of this part, or the next part's first chunk.
             let next = if local == hl { CHUNK_PAIRS.min(hl) } else { CHUNK_PAIRS.min(hl - local) };
             ws.bias[0] = fold_bias(next);
             for d in 0..CHUNKED {
@@ -764,7 +764,13 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
         RowsOut::Half(state) => {
             let mut done = state.lock().unwrap();
-            let mode = if *done == 0 { RowsMode::First } else { RowsMode::Second };
+            let mode = if *done == 0 {
+                RowsMode::First
+            } else if *done as usize + 1 == HALVES {
+                RowsMode::Last
+            } else {
+                RowsMode::Middle
+            };
             write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, mode);
             *done += 1;
         }
