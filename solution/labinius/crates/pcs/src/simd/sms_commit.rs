@@ -628,7 +628,6 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
         for s in 0..n {
             let j = j0 + s;
             let v0 = _mm512_load_si512(pa.add(STREAMS * j));
-            _mm512_store_si512(pa.add(STREAMS * j), zero);
             r0[s] = canon_red16::<P>(v0);
             let a = _mm512_load_si512(pt.add(2 * j));
             let b = _mm512_load_si512(pt.add(2 * j + 1));
@@ -683,11 +682,11 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     let mut half = 0usize;
-    for s in 0..STREAMS {
-        // Stream 0 runs over the range; the digits' spans are whole chunks of it.
-        let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
-        fill_stream(&mut ws.acc[0], s, b);
-    }
+    // Only stream 0 is filled here. The range starts on a chunk boundary, so the first lockstep
+    // step takes the `*_first` slot body, which broadcasts `ws.bias` into the seven digit
+    // accumulators instead of loading them: filling those rows now would be overwritten before
+    // any read.
+    fill_stream(&mut ws.acc[0], 0, fold_bias(span));
     // The range's first chunk starts from the same value; every later chunk end rewrites it.
     ws.bias[0] = fold_bias(CHUNK_PAIRS.min(hl));
     let acc = ws.acc[0].v.as_mut_ptr() as *mut i32;
