@@ -1,0 +1,37 @@
+name: Graviton4 production smoke
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  smoke:
+    name: Smoke ${{ matrix.host_label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        host_label:
+          - labinius-graviton4-prod-01
+          - labinius-graviton4-prod-02
+          - labinius-graviton4-prod-03
+    runs-on:
+      group: labinius-prod-graviton4-neoverse-v2-sve2-c8g
+      labels:
+        - ARM64
+        - sve2
+        - ${{ matrix.host_label }}
+    timeout-minutes: 10
+    steps:
+      - name: Verify trusted Graviton4 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" = 1100
+          test "$(uname -m)" = aarch64
+          test "$(nproc)" = 8
+          /usr/local/bin/validate-graviton4-cpu
+          /opt/cargo/bin/rustc --version | grep -F 'rustc 1.99.0 '
+          /opt/cargo/bin/cargo --version | grep -F 'cargo 1.99.0 '
+          gcc-13 --version | head -n 1
+          bwrap --ro-bind / / --dev /dev --proc /proc /bin/true
