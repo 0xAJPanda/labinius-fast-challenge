@@ -1,13 +1,13 @@
 //! Commitment modulo 9721 * 2^22 with a single witness NTT.
 //!
 //! `t = sum_j A_j s_j` is wanted modulo `Q = 9721 * 2^22`. The witness transform modulo 9721 feeds
-//! nine accumulation streams that differ only in their public key:
+//! seven accumulation streams that differ only in their public key:
 //!
 //! - stream 0: `A mod 9721`, accumulated over the whole column (the ordinary residue);
-//! - streams 1..=7: the balanced mixed-radix digits `L_d` of `A mod 2^22` (`L_0..L_5` base 9 in
-//!   `[-4, 4]`, `L_6` base 8 in `[-4, 4)`), so that `A ≡ sum_d 9^d L_d (mod 2^22)`
-//!   (`9^6 * 8 >= 2^22`: seven digits instead of the eight base-8 ones, one accumulation stream
-//!   fewer for the same chunking).
+//! - streams 1..=6: the balanced mixed-radix digits `L_d` of `A mod 2^22` (`L_0..L_4` base 13 in
+//!   `[-6, 6]`, `L_5` base 12 in `[-6, 6)`), so that `A ≡ sum_d 13^d L_d (mod 2^22)`
+//!   (`13^5 * 12 >= 2^22`: six digits instead of seven base-9 ones, one accumulation stream fewer,
+//!   paid for with chunks half as long and so twice the inverse transforms).
 //!
 //! A digit stream's sum `X = sum_{j in chunk} L_{d,j} s_j` over a chunk of [`CHUNK_PAIRS`] pair
 //! batches is an integer whose mean `mu = (1/2) sum_j L_{d,j} U` (`U` the all-ones polynomial on
@@ -27,42 +27,54 @@ use crate::simd::ntt::gen_small;
 pub const P: u16 = 9721;
 pub const TAIL_BITS: u32 = 22;
 pub const MODULUS: u128 = (P as u128) << TAIL_BITS;
-/// Accumulation streams: the base residue and seven digits.
-pub const STREAMS: usize = 8;
+/// Accumulation streams: the base residue and six digits.
+pub const STREAMS: usize = 7;
 pub const DIGITS: usize = STREAMS - 1;
-/// Radix of digit `d`: base 9 below the last digit, base 8 for the last.
+/// Radix of digit `d`: base 13 below the last digit, base 12 for the last
+/// (`13^5 * 12 = 4455516 >= 2^22`).
 pub const fn digit_radix(d: usize) -> i64 {
-    if d + 1 < DIGITS { 9 } else { 8 }
+    if d + 1 < DIGITS { 13 } else { 12 }
 }
-/// Weight of digit `d`, `9^d`.
+/// Digit `d` lies in `[-digit_offset(d), digit_radix(d) - 1 - digit_offset(d)]`: `[-6, 6]` for
+/// base 13 and `[-6, 5]` for base 12.
+pub const fn digit_offset(d: usize) -> i64 {
+    digit_radix(d) / 2
+}
+/// Weight of digit `d`, the product of the radices below it.
 pub const fn digit_weight(d: usize) -> u32 {
-    let mut w = 1u32;
+    let mut w = 1i64;
     let mut i = 0;
     while i < d {
-        w *= 9;
+        w *= digit_radix(i);
         i += 1;
     }
-    w
+    w as u32
 }
 /// The balanced representatives cover `[-REP_LOW, 2^22 - REP_LOW)`, all of `Z / 2^22`.
 const REP_LOW: i64 = {
-    // every digit at its least value, -4
+    // every digit at its least value
     let mut low = 0i64;
     let mut d = 0;
     while d < DIGITS {
-        low += 4 * digit_weight(d) as i64;
+        low += digit_offset(d) * digit_weight(d) as i64;
         d += 1;
     }
     low
 };
 const _: () = {
     // The digits' range is contiguous and at least 2^22 wide.
-    let high = REP_LOW - digit_weight(DIGITS - 1) as i64;
+    let mut high = 0i64;
+    let mut d = 0;
+    while d < DIGITS {
+        high += (digit_radix(d) - 1 - digit_offset(d)) * digit_weight(d) as i64;
+        d += 1;
+    }
     assert!(REP_LOW + high + 1 >= 1 << TAIL_BITS);
 };
-/// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 256 ring
-/// elements of a column (the base-9 digits' margin, about 8.1 sigma, does not allow 192).
-pub const CHUNK_PAIRS: usize = 128;
+/// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 128 ring
+/// elements of a column. Half the chunk of the base-9 layout leaves room for base-13 digits
+/// (about 7.9 sigma on the real matrix), one accumulation stream fewer than seven base-9 digits.
+pub const CHUNK_PAIRS: usize = 64;
 /// Chunks of each half column: [`CHUNK_PAIRS`] pair batches each and a shorter last one, so
 /// that every chunk lies in one half (the commitment's work units are halves).
 pub const fn chunks_per_half(np: usize) -> usize {
@@ -213,8 +225,8 @@ impl SmsKeyData {
     }
 }
 
-/// The balanced digits of `x mod 2^22`: `x ≡ sum_d 9^d L_d`, `L_0..L_5 in [-4, 4]`,
-/// `L_6 in [-4, 4)`.
+/// The balanced digits of `x mod 2^22`: `x ≡ sum_d digit_weight(d) L_d`, `L_0..L_4 in [-6, 6]`,
+/// `L_5 in [-6, 6)`.
 pub fn digits(x: u128) -> [i8; DIGITS] {
     let mut r = (x & TAIL_MASK as u128) as i64;
     if r >= (1 << TAIL_BITS) - REP_LOW {
@@ -222,8 +234,8 @@ pub fn digits(x: u128) -> [i8; DIGITS] {
     }
     let mut out = [0i8; DIGITS];
     for d in 0..DIGITS {
-        let b = digit_radix(d);
-        let v = (r + 4).rem_euclid(b) - 4;
+        let (b, o) = (digit_radix(d), digit_offset(d));
+        let v = (r + o).rem_euclid(b) - o;
         out[d] = v as i8;
         r = (r - v) / b;
     }
@@ -378,7 +390,9 @@ static FOLD: Fold = Fold({
 /// lockstep product, then the second, ..., and are stored (folded back first in `reduce`), so at
 /// most nine dependent `vpdpwssd` wait at a time and every round's nine are independent.
 include!("sms_slot_gen.rs");
-const _: () = assert!(STREAMS == 8 && (LOCK == 8 || LOCK == 4 || LOCK == 16));
+// `sms_slot8` is generated for STREAMS accumulators (zmm20.., zmm29 the fold scratch); the
+// LOCK = 4 and 16 bodies are still the eight-stream ones and are not used.
+const _: () = assert!(STREAMS == 7 && LOCK == 8);
 
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
@@ -1021,10 +1035,16 @@ mod tests {
                 v = v * digit_radix(k) + d[k] as i64;
             }
             assert_eq!((v.rem_euclid(1 << TAIL_BITS)) as u128, x % (1 << TAIL_BITS));
-            for k in 0..DIGITS - 1 {
-                assert!((-4..=4).contains(&d[k]));
+            for k in 0..DIGITS {
+                let (b, o) = (digit_radix(k) as i8, digit_offset(k) as i8);
+                assert!((-o..=b - 1 - o).contains(&d[k]), "digit {k} = {} out of range", d[k]);
             }
-            assert!((-4..4).contains(&d[DIGITS - 1]));
+        }
+        // The range ends: every residue modulo 2^22 has digits.
+        for x in [0u128, 1, (1 << TAIL_BITS) - 1, (1 << TAIL_BITS) - REP_LOW as u128, (1 << TAIL_BITS) - REP_LOW as u128 - 1] {
+            let d = digits(x);
+            let v = (0..DIGITS).rev().fold(0i64, |v, k| v * digit_radix(k) + d[k] as i64);
+            assert_eq!(v.rem_euclid(1 << TAIL_BITS) as u128, x);
         }
     }
 
@@ -1058,8 +1078,9 @@ mod tests {
 
     #[test]
     fn commitment_matches_reference() {
-        commitment_matches_reference_at(512, 8.0); // one short chunk per half
-        commitment_matches_reference_at(1024, 7.0); // a full chunk and a 64-pair one per half
+        commitment_matches_reference_at(512, 7.5); // two full chunks per half
+        commitment_matches_reference_at(576, 7.5); // two full chunks and a 16-pair one per half
+        commitment_matches_reference_at(1024, 7.5); // four full chunks per half
     }
 
     fn commitment_matches_reference_at(elements: usize, floor: f64) {
