@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 2,
+  "name": "labinius-fast",
+  "tracks": [
+    {
+      "name": "x86",
+      "description": "Packed binary PCS including the GHASH field switch, over 2^31 Boolean evaluations, on an Intel Xeon Platinum 8488C with AVX-512 (8 CPUs). Edit solution/x86. Score: median prover process time in milliseconds across five sequential runs. Also records each run's time and proof size, plus the verified commitment modulus.",
+      "category": "rust",
+      "direction": "-",
+      "editablePaths": [
+        "solution/x86"
+      ],
+      "setupCommand": [
+        "bash",
+        ".yukon/setup.sh",
+        "--track",
+        "x86"
+      ],
+      "benchmarkCommand": [
+        "bash",
+        ".yukon/benchmark.sh",
+        "--track",
+        "x86"
+      ],
+      "scorePath": ".yukon/labinius-fast-x86-score.json",
+      "maxSubmissionBytes": 16777216,
+      "runner": {
+        "provider": "github-actions",
+        "workflow": "dispatch-x86.yml",
+        "maxConcurrentWorkflows": 1
+      }
+    },
+    {
+      "name": "arm",
+      "description": "Packed binary PCS including the GHASH field switch, over 2^31 Boolean evaluations, proved on an AWS Graviton4 (Neoverse V2, SVE2, 8 vCPUs, no AVX-512) and verified on x86 by the same pinned verifier as the x86 track. Edit solution/arm. Score: median prover process time in milliseconds across five sequential runs. Also records each run's time and proof size, plus the verified commitment modulus.",
+      "category": "rust",
+      "direction": "-",
+      "editablePaths": [
+        "solution/arm"
+      ],
+      "setupCommand": [
+        "bash",
+        ".yukon/setup.sh",
+        "--track",
+        "arm"
+      ],
+      "benchmarkCommand": [
+        "bash",
+        ".yukon/benchmark.sh",
+        "--track",
+        "arm"
+      ],
+      "scorePath": ".yukon/labinius-fast-arm-score.json",
+      "maxSubmissionBytes": 16777216,
+      "runner": {
+        "provider": "github-actions",
+        "workflow": "dispatch-arm.yml",
+        "maxConcurrentWorkflows": 1
+      }
+    }
+  ]
+}
