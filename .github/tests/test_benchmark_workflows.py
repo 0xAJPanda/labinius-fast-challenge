@@ -18,7 +18,16 @@ TRUSTED_REF = "${{ job.workflow_sha }}"
 TRACKS = ("x86", "arm")
 READ_ONLY = {"contents": "read", "actions": "read"}
 SOLUTION_INPUTS = {"solution_repository", "solution_ref"}
-PINNED_WORKFLOW_SHA = "2b5b09893c89958f29b2234e1a4c07feb82ebd0c"
+PINNED_WORKFLOWS = {
+    "x86": (
+        "Layr-Labs/labinius-fast",
+        "2b5b09893c89958f29b2234e1a4c07feb82ebd0c",
+    ),
+    "arm": (
+        "Layr-Labs/labinius-fast-challenge",
+        "6ca90ac0fa5e1c6827141a97e2581ae38046a0c3",
+    ),
+}
 
 
 def load_workflow(name: str) -> dict:
@@ -40,14 +49,21 @@ def score_path(track: str) -> str:
 class BenchmarkWorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
         self.workflows = {track: load_workflow(f"benchmark-{track}.yml") for track in TRACKS}
-        self.pull_request = load_workflow("test-benchmark.yml")
+        self.dispatchers = {
+            track: load_workflow(f"dispatch-{track}.yml") for track in TRACKS
+        }
         with (ROOT / "benchmark.json").open(encoding="utf-8") as manifest_file:
             self.manifest = json.load(manifest_file)
 
-    def test_only_the_track_workflows_and_the_pull_request_check_exist(self) -> None:
+    def test_only_the_track_workflows_and_dispatchers_exist(self) -> None:
         self.assertEqual(
             sorted(path.name for path in WORKFLOWS.glob("*.yml")),
-            ["benchmark-arm.yml", "benchmark-x86.yml", "test-benchmark.yml"],
+            [
+                "benchmark-arm.yml",
+                "benchmark-x86.yml",
+                "dispatch-arm.yml",
+                "dispatch-x86.yml",
+            ],
         )
 
     def test_manifest_declares_one_track_per_solution_directory(self) -> None:
@@ -70,7 +86,7 @@ class BenchmarkWorkflowTest(unittest.TestCase):
                 track["runner"],
                 {
                     "provider": "github-actions",
-                    "workflow": f"benchmark-{name}.yml",
+                    "workflow": f"dispatch-{name}.yml",
                     "maxConcurrentWorkflows": 1,
                 },
             )
@@ -210,21 +226,17 @@ class BenchmarkWorkflowTest(unittest.TestCase):
             )
             self.assertEqual(upload["with"]["if-no-files-found"], "error")
 
-    def test_pull_request_runs_both_tracks(self) -> None:
-        self.assertEqual(self.pull_request["on"], {"pull_request": ""})
-        self.assertEqual(self.pull_request["permissions"], READ_ONLY)
-        self.assertEqual(
-            set(self.pull_request["jobs"]),
-            {"workflow-structure", "benchmark-x86", "benchmark-arm"},
-        )
+    def test_dispatchers_pin_reviewed_executors_and_forward_the_solution(self) -> None:
         for track in TRACKS:
-            job = self.pull_request["jobs"][f"benchmark-{track}"]
+            dispatcher = self.dispatchers[track]
+            self.assertEqual(dispatcher["on"], {"workflow_dispatch": ""})
+            self.assertEqual(dispatcher["permissions"], READ_ONLY)
+            self.assertEqual(set(dispatcher["jobs"]), {"benchmark"})
+            job = dispatcher["jobs"]["benchmark"]
+            repository, sha = PINNED_WORKFLOWS[track]
             self.assertEqual(
                 job["uses"],
-                (
-                    "Layr-Labs/labinius-fast/.github/workflows/"
-                    f"benchmark-{track}.yml@{PINNED_WORKFLOW_SHA}"
-                ),
+                f"{repository}/.github/workflows/benchmark-{track}.yml@{sha}",
             )
             self.assertEqual(
                 job["with"],
@@ -235,7 +247,7 @@ class BenchmarkWorkflowTest(unittest.TestCase):
             )
         # The called arm workflow deletes its proof artifact, which the caller must allow.
         self.assertEqual(
-            self.pull_request["jobs"]["benchmark-arm"]["permissions"],
+            self.dispatchers["arm"]["jobs"]["benchmark"]["permissions"],
             {"contents": "read", "actions": "write"},
         )
 
