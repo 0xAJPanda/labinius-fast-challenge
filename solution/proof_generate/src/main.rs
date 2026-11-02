@@ -452,17 +452,9 @@ fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
 }
 
 fn populate_part(addr: usize, bytes: usize) {
-    #[cfg(target_os = "linux")]
-    {
-        // whole pages: the range need not start on one
-        let start = addr & !4095;
-        let done = unsafe {
-            sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_POPULATE_READ)
-        };
-        if done == 0 {
-            return;
-        }
-    }
+    // Use file-backed fault-around reads directly. This only makes the same read-only
+    // bytes resident; it does not modify the witness, keys, or proof arithmetic.
+    // Avoid concurrent MADV_POPULATE_READ walks of every PTE in the shared mapping.
     let mut off = 0;
     let mut sink = 0u8;
     while off < bytes {
