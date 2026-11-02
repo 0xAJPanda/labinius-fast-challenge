@@ -5,6 +5,7 @@ umask 077
 script_dir=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=.yukon/lib/sandbox.sh
 source "$script_dir/lib/sandbox.sh"
+labinius_parse_track_args "$@"
 
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 require_host_command /opt/cargo/bin/cargo
@@ -48,8 +49,11 @@ if require_runner_temp_path "$test_root/state-link"; then
   exit 1
 fi
 
-source_solution="$test_root/source/solution"
-staged_solution="$test_root/staged/solution"
+source_root="$test_root/source/solution"
+staged_root="$test_root/staged/solution"
+track=$(labinius_track)
+source_solution="$source_root/$track"
+staged_solution="$staged_root/$track"
 outside="$test_root/outside-secret"
 mkdir -p "$source_solution/proof_generate/src"
 printf 'host secret\n' > "$outside"
@@ -75,7 +79,7 @@ fn main() {
 }
 RUST
 
-python3 "$script_dir/stage-solution.py" "$source_solution" "$staged_solution"
+python3 "$script_dir/stage-solution.py" "$source_root" "$staged_root"
 
 symlink_source="$test_root/symlink-source"
 mkdir -p "$symlink_source"
@@ -92,7 +96,7 @@ mkdir -p "$target" "$cargo_home"
 
 export LABINIUS_TEST_SECRET=must-not-cross-sandbox
 run_contestant_build \
-  "$staged_solution" \
+  "$staged_root" \
   "$target" \
   "$cargo_home" \
   offline \
