@@ -1,0 +1,24 @@
+name: Benchmark arm dispatch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+# No concurrency group here: the called executor declares one, and an identical key on this
+# caller would make the run wait on itself.
+jobs:
+  benchmark:
+    # Runner-group admission is bound to the reviewed executor at this exact commit, not to
+    # whichever ref Yukon dispatches. This caller requests no runner; it forwards the
+    # dispatched repository and commit as the untrusted solution input.
+    uses: Layr-Labs/labinius-fast/.github/workflows/benchmark-arm.yml@2b5b09893c89958f29b2234e1a4c07feb82ebd0c
+    with:
+      solution_repository: ${{ github.repository }}
+      solution_ref: ${{ github.sha }}
+    permissions:
+      contents: read
+      # The executor's x86 verify job deletes the ARM proof artifact once it is checked.
+      actions: write

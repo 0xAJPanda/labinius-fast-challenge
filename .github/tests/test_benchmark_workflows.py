@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Structural regression checks for the protected benchmark workflow adapter."""
+"""Structural regression checks for the per-track benchmark workflows."""
 
 import json
 from pathlib import Path
@@ -10,16 +10,15 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
-WRAPPER_CALL = (
-    "Layr-Labs/labinius-fast-challenge/"
-    ".github/workflows/benchmark-runner.yml@master"
-)
-PR_CALL = (
-    "Layr-Labs/labinius-fast-challenge/"
-    ".github/workflows/benchmark.yml@master"
-)
-DEFAULT_REPOSITORY = "${{ inputs.solution_repository || github.repository }}"
-DEFAULT_REF = "${{ inputs.solution_ref || github.sha }}"
+CHECKOUT = "actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd"
+UPLOAD = "actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f"
+DOWNLOAD = "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131"
+TRUSTED_REPOSITORY = "${{ job.workflow_repository }}"
+TRUSTED_REF = "${{ job.workflow_sha }}"
+TRACKS = ("x86", "arm")
+READ_ONLY = {"contents": "read", "actions": "read"}
+SOLUTION_INPUTS = {"solution_repository", "solution_ref"}
+PINNED_WORKFLOW_SHA = "2b5b09893c89958f29b2234e1a4c07feb82ebd0c"
 
 
 def load_workflow(name: str) -> dict:
@@ -29,71 +28,111 @@ def load_workflow(name: str) -> dict:
         return yaml.load(workflow_file, Loader=yaml.BaseLoader)
 
 
-def step_named(workflow: dict, name: str) -> dict:
-    steps = workflow["jobs"]["benchmark"]["steps"]
+def step_named(workflow: dict, job: str, name: str) -> dict:
+    steps = workflow["jobs"][job]["steps"]
     return next(step for step in steps if step["name"] == name)
+
+
+def score_path(track: str) -> str:
+    return f".yukon/labinius-fast-{track}-score.json"
 
 
 class BenchmarkWorkflowTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.wrapper = load_workflow("benchmark.yml")
-        self.executor = load_workflow("benchmark-runner.yml")
+        self.workflows = {track: load_workflow(f"benchmark-{track}.yml") for track in TRACKS}
         self.pull_request = load_workflow("test-benchmark.yml")
-
-    def test_manifest_keeps_original_workflow_filename(self) -> None:
         with (ROOT / "benchmark.json").open(encoding="utf-8") as manifest_file:
-            manifest = json.load(manifest_file)
-        self.assertEqual(manifest["runner"]["workflow"], "benchmark.yml")
+            self.manifest = json.load(manifest_file)
 
-    def test_wrapper_preserves_dispatch_and_call_entrypoints(self) -> None:
+    def test_only_the_track_workflows_and_the_pull_request_check_exist(self) -> None:
         self.assertEqual(
-            set(self.wrapper["on"]), {"workflow_dispatch", "workflow_call"}
+            sorted(path.name for path in WORKFLOWS.glob("*.yml")),
+            ["benchmark-arm.yml", "benchmark-x86.yml", "test-benchmark.yml"],
         )
-        for event in ("workflow_dispatch", "workflow_call"):
-            inputs = self.wrapper["on"][event]["inputs"]
+
+    def test_manifest_declares_one_track_per_solution_directory(self) -> None:
+        self.assertEqual(self.manifest["schemaVersion"], 2)
+        self.assertEqual(set(self.manifest), {"schemaVersion", "name", "tracks"})
+        tracks = {track["name"]: track for track in self.manifest["tracks"]}
+        self.assertEqual(list(tracks), list(TRACKS))
+        for name, track in tracks.items():
+            self.assertEqual(track["editablePaths"], [f"solution/{name}"])
             self.assertEqual(
-                set(inputs), {"solution_repository", "solution_ref"}
+                track["setupCommand"], ["bash", ".yukon/setup.sh", "--track", name]
             )
-            for input_name in inputs:
-                self.assertEqual(inputs[input_name]["required"], "false")
-                self.assertEqual(inputs[input_name]["type"], "string")
+            self.assertEqual(
+                track["benchmarkCommand"],
+                ["bash", ".yukon/benchmark.sh", "--track", name],
+            )
+            self.assertEqual(track["scorePath"], score_path(name))
+            self.assertEqual(track["direction"], "-")
+            self.assertEqual(
+                track["runner"],
+                {
+                    "provider": "github-actions",
+                    "workflow": f"benchmark-{name}.yml",
+                    "maxConcurrentWorkflows": 1,
+                },
+            )
 
-    def test_baseline_and_submission_defaults_use_dispatch_run_identity(self) -> None:
-        self.assertEqual(set(self.wrapper["jobs"]), {"benchmark"})
-        job = self.wrapper["jobs"]["benchmark"]
-        self.assertEqual(job["uses"], WRAPPER_CALL)
-        self.assertNotIn("runs-on", job)
-        self.assertNotIn("steps", job)
-        self.assertEqual(
-            job["with"],
-            {
-                "solution_repository": DEFAULT_REPOSITORY,
-                "solution_ref": DEFAULT_REF,
-            },
-        )
-        self.assertEqual(
-            self.wrapper["concurrency"],
-            {
-                "group": (
-                    "benchmark-${{ github.repository }}-"
+    def test_workflows_are_dispatchable_and_callable(self) -> None:
+        for track, workflow in self.workflows.items():
+            self.assertEqual(set(workflow["on"]), {"workflow_dispatch", "workflow_call"})
+            for trigger in workflow["on"].values():
+                self.assertEqual(set(trigger["inputs"]), SOLUTION_INPUTS)
+                for spec in trigger["inputs"].values():
+                    self.assertEqual(spec["required"], "false")
+            self.assertEqual(workflow["permissions"], READ_ONLY)
+            self.assertEqual(
+                workflow["concurrency"],
+                {
+                    "group": f"benchmark-{track}-${{{{ github.repository }}}}-"
                     "${{ github.workflow }}-${{ github.ref }}-"
-                    "${{ inputs.solution_ref || github.sha }}"
-                ),
-                "cancel-in-progress": "true",
-            },
-        )
+                    "${{ inputs.solution_ref || github.sha }}",
+                    "cancel-in-progress": "true",
+                },
+            )
 
-    def test_permissions_remain_read_only(self) -> None:
-        expected = {"contents": "read", "actions": "read"}
-        self.assertEqual(self.wrapper["permissions"], expected)
-        self.assertEqual(self.executor["permissions"], expected)
-        self.assertEqual(self.pull_request["permissions"], expected)
+    def test_harness_is_pinned_independently_of_the_caller(self) -> None:
+        for workflow in self.workflows.values():
+            for name in workflow["jobs"]:
+                trusted = step_named(workflow, name, "Checkout trusted harness")
+                self.assertEqual(trusted["uses"].split(" ")[0], CHECKOUT)
+                self.assertEqual(trusted["with"]["repository"], TRUSTED_REPOSITORY)
+                self.assertEqual(trusted["with"]["ref"], TRUSTED_REF)
+                self.assertEqual(trusted["with"]["path"], ".trusted-src")
+                self.assertEqual(trusted["with"]["persist-credentials"], "false")
+                paths = step_named(workflow, name, "Resolve isolated paths")["run"]
+                self.assertIn("TRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.trusted-src", paths)
+                self.assertIn("UNTRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.untrusted-src", paths)
+                for step in workflow["jobs"][name]["steps"]:
+                    if ".yukon/" in step.get("run", ""):
+                        self.assertIn('bash "$TRUSTED_CHECKOUT/.yukon/', step["run"])
 
-    def test_executor_is_the_only_runner_job(self) -> None:
-        self.assertEqual(set(self.executor["on"]), {"workflow_call"})
-        self.assertEqual(set(self.executor["jobs"]), {"benchmark"})
-        job = self.executor["jobs"]["benchmark"]
-        self.assertNotIn("uses", job)
+    def test_solution_is_checked_out_separately(self) -> None:
+        jobs = {"x86": ["benchmark"], "arm": ["prove"]}
+        for track, names in jobs.items():
+            workflow = self.workflows[track]
+            for name in names:
+                solution = step_named(workflow, name, "Checkout untrusted solution input")
+                self.assertEqual(
+                    solution["with"],
+                    {
+                        "repository": "${{ inputs.solution_repository || github.repository }}",
+                        "ref": "${{ inputs.solution_ref || github.sha }}",
+                        "path": ".untrusted-src",
+                        "fetch-depth": "1",
+                        "submodules": "false",
+                        "persist-credentials": "false",
+                    },
+                )
+        verify_steps = [step["name"] for step in self.workflows["arm"]["jobs"]["verify"]["steps"]]
+        self.assertNotIn("Checkout untrusted solution input", verify_steps)
+
+    def test_x86_proves_and_verifies_on_the_dedicated_host(self) -> None:
+        workflow = self.workflows["x86"]
+        self.assertEqual(set(workflow["jobs"]), {"benchmark"})
+        job = workflow["jobs"]["benchmark"]
         self.assertEqual(
             job["runs-on"],
             {
@@ -101,82 +140,103 @@ class BenchmarkWorkflowTest(unittest.TestCase):
                 "labels": "labinius-avx512-c7i",
             },
         )
-        self.assertEqual(job["timeout-minutes"], "120")
-        self.assertNotIn("concurrency", self.executor)
-
-    def test_pr_and_bot_concurrency_keys_do_not_collide(self) -> None:
-        template = self.wrapper["concurrency"]["group"]
-
-        def evaluate(workflow: str, ref: str, solution_sha: str) -> str:
-            replacements = {
-                "${{ github.repository }}": "Layr-Labs/labinius-fast-challenge",
-                "${{ github.workflow }}": workflow,
-                "${{ github.ref }}": ref,
-                "${{ inputs.solution_ref || github.sha }}": solution_sha,
-            }
-            key = template
-            for expression, value in replacements.items():
-                key = key.replace(expression, value)
-            self.assertNotIn("${{", key)
-            return key
-
-        solution_sha = "a" * 40
-        bot_key = evaluate(
-            "Benchmark", "refs/heads/submissions/example", solution_sha
-        )
-        repeated_bot_key = evaluate(
-            "Benchmark", "refs/heads/submissions/example", solution_sha
-        )
-        pr_key = evaluate(
-            "Test PCS benchmark", "refs/pull/123/merge", solution_sha
-        )
-
-        self.assertEqual(bot_key, repeated_bot_key)
-        self.assertNotEqual(bot_key, pr_key)
-
-    def test_executor_keeps_trusted_and_solution_checkout_identity(self) -> None:
-        trusted = step_named(self.executor, "Checkout trusted harness")
         self.assertEqual(
-            trusted["with"]["repository"],
-            "Layr-Labs/labinius-fast-challenge",
+            step_named(workflow, "benchmark", "Setup")["run"],
+            'bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track x86',
         )
-        self.assertEqual(trusted["with"]["ref"], "${{ job.workflow_sha }}")
-        self.assertEqual(trusted["with"]["path"], ".trusted-src")
-        self.assertEqual(trusted["with"]["submodules"], "recursive")
-        self.assertEqual(trusted["with"]["persist-credentials"], "false")
-
-        solution = step_named(self.executor, "Checkout untrusted solution input")
-        self.assertEqual(solution["with"]["repository"], DEFAULT_REPOSITORY)
-        self.assertEqual(solution["with"]["ref"], DEFAULT_REF)
-        self.assertEqual(solution["with"]["path"], ".untrusted-src")
-        self.assertEqual(solution["with"]["fetch-depth"], "1")
-        self.assertEqual(solution["with"]["submodules"], "false")
-        self.assertEqual(solution["with"]["persist-credentials"], "false")
-
-    def test_executor_keeps_score_artifact_contract(self) -> None:
-        upload = step_named(self.executor, "Upload score")
-        self.assertEqual(upload["if"], "always()")
-        self.assertEqual(upload["with"]["name"], "benchmark-score")
         self.assertEqual(
-            upload["with"]["path"],
-            (
-                "${{ github.workspace }}/.trusted-src/"
-                ".yukon/labinius-fast-score.json"
-            ),
+            step_named(workflow, "benchmark", "Benchmark")["run"],
+            'bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track x86',
         )
-        self.assertEqual(upload["with"]["if-no-files-found"], "error")
 
-    def test_pull_request_workflow_still_calls_protected_wrapper(self) -> None:
-        job = self.pull_request["jobs"]["benchmark"]
-        self.assertEqual(job["uses"], PR_CALL)
+    def test_arm_proves_on_arm_and_verifies_on_x86(self) -> None:
+        workflow = self.workflows["arm"]
+        self.assertEqual(set(workflow["jobs"]), {"prove", "verify"})
+        prove, verify = workflow["jobs"]["prove"], workflow["jobs"]["verify"]
         self.assertEqual(
-            job["with"],
-            {
-                "solution_repository": (
-                    "${{ github.event.pull_request.head.repo.full_name }}"
+            prove["runs-on"],
+            {"group": "labinius-graviton4-neoverse-v2-sve2-c8g", "labels": ["ARM64", "sve2"]},
+        )
+        self.assertIn(
+            "/usr/local/bin/validate-graviton4-cpu",
+            step_named(workflow, "prove", "Require dedicated Graviton4 host")["run"],
+        )
+        # The dedicated host ships the toolchain; only the hosted x86 verifier provisions one.
+        prove_runs = [step.get("run", "") for step in prove["steps"]]
+        self.assertFalse(any("provision.sh" in run for run in prove_runs))
+        self.assertIn(
+            "provision.sh", step_named(workflow, "verify", "Setup toolchain")["run"]
+        )
+        self.assertEqual(verify["runs-on"], "blacksmith-8vcpu-ubuntu-2404")
+        self.assertEqual(verify["needs"], "prove")
+        self.assertEqual(
+            step_named(workflow, "prove", "Setup")["run"],
+            'bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track arm',
+        )
+        self.assertEqual(
+            step_named(workflow, "prove", "Benchmark proofs")["run"],
+            'bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track arm --prove-only "$RUNNER_TEMP/labinius-arm-runs"',
+        )
+        self.assertEqual(
+            step_named(workflow, "verify", "Setup verifier")["run"],
+            'bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track arm --verifier-only',
+        )
+        self.assertEqual(
+            step_named(workflow, "verify", "Benchmark verification")["run"],
+            'bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track arm --verify-only "$RUNNER_TEMP/labinius-arm-runs"',
+        )
+        upload = step_named(workflow, "prove", "Upload proofs")
+        download = step_named(workflow, "verify", "Download proofs")
+        self.assertEqual(upload["uses"].split(" ")[0], UPLOAD)
+        self.assertEqual(download["uses"].split(" ")[0], DOWNLOAD)
+        self.assertEqual(upload["with"]["name"], download["with"]["name"])
+        self.assertEqual(upload["with"]["path"], download["with"]["path"])
+        self.assertEqual(prove["outputs"]["proofs"], "${{ steps.upload.outputs.artifact-id }}")
+        self.assertEqual(verify["permissions"], {"contents": "read", "actions": "write"})
+        delete = step_named(workflow, "verify", "Delete proofs")
+        self.assertEqual(delete["if"], "always()")
+        self.assertEqual(delete["env"]["ARTIFACT_ID"], "${{ needs.prove.outputs.proofs }}")
+
+    def test_score_artifact_carries_the_manifest_score_path(self) -> None:
+        jobs = {"x86": "benchmark", "arm": "verify"}
+        for track, job in jobs.items():
+            upload = step_named(self.workflows[track], job, "Upload score")
+            self.assertEqual(upload["if"], "always()")
+            self.assertEqual(upload["uses"].split(" ")[0], UPLOAD)
+            self.assertEqual(upload["with"]["name"], f"benchmark-score-{track}")
+            self.assertEqual(
+                upload["with"]["path"],
+                f"${{{{ github.workspace }}}}/.trusted-src/{score_path(track)}",
+            )
+            self.assertEqual(upload["with"]["if-no-files-found"], "error")
+
+    def test_pull_request_runs_both_tracks(self) -> None:
+        self.assertEqual(self.pull_request["on"], {"pull_request": ""})
+        self.assertEqual(self.pull_request["permissions"], READ_ONLY)
+        self.assertEqual(
+            set(self.pull_request["jobs"]),
+            {"workflow-structure", "benchmark-x86", "benchmark-arm"},
+        )
+        for track in TRACKS:
+            job = self.pull_request["jobs"][f"benchmark-{track}"]
+            self.assertEqual(
+                job["uses"],
+                (
+                    "Layr-Labs/labinius-fast/.github/workflows/"
+                    f"benchmark-{track}.yml@{PINNED_WORKFLOW_SHA}"
                 ),
-                "solution_ref": "${{ github.event.pull_request.head.sha }}",
-            },
+            )
+            self.assertEqual(
+                job["with"],
+                {
+                    "solution_repository": "${{ github.repository }}",
+                    "solution_ref": "${{ github.sha }}",
+                },
+            )
+        # The called arm workflow deletes its proof artifact, which the caller must allow.
+        self.assertEqual(
+            self.pull_request["jobs"]["benchmark-arm"]["permissions"],
+            {"contents": "read", "actions": "write"},
         )
 
 

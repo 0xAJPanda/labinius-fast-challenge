@@ -1,0 +1,200 @@
+name: Benchmark arm
+
+on:
+  workflow_dispatch:
+    inputs:
+      solution_repository:
+        description: Repository containing the untrusted solution
+        required: false
+        type: string
+      solution_ref:
+        description: Immutable commit containing the untrusted solution
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      solution_repository:
+        description: Repository containing the untrusted solution
+        required: false
+        type: string
+      solution_ref:
+        description: Immutable commit containing the untrusted solution
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: benchmark-arm-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ inputs.solution_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Proves on ARM. Nothing here verifies: the proofs, seeds, and timings go to the x86 job.
+  prove:
+    # The organization runner group is a separate admission boundary and must
+    # allow this workflow.
+    runs-on:
+      group: labinius-graviton4-neoverse-v2-sve2-c8g
+      labels: [ARM64, sve2]
+    # Five sequential runs share the previous per-run 15 minute prover cap.
+    timeout-minutes: 120
+    outputs:
+      proofs: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Require dedicated Graviton4 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ $(uname -m) != aarch64 ]]; then
+            echo "unexpected runner architecture: $(uname -m)" >&2
+            exit 1
+          fi
+          cpus=$(nproc)
+          if [[ "$cpus" -ne 8 ]]; then
+            echo "unexpected runner CPU count: $cpus (expected 8)" >&2
+            exit 1
+          fi
+          /usr/local/bin/validate-graviton4-cpu
+
+      - name: Resolve isolated paths
+        shell: bash
+        env:
+          SOLUTION_REPOSITORY: ${{ inputs.solution_repository || github.repository }}
+          SOLUTION_REF: ${{ inputs.solution_ref || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOLUTION_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "solution_repository must be an owner/repository name" >&2
+            exit 1
+          fi
+          if [[ ! "$SOLUTION_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "solution_ref must be an immutable 40-hex commit SHA" >&2
+            exit 1
+          fi
+          {
+            echo "TRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.trusted-src"
+            echo "UNTRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.untrusted-src"
+            echo "TRUSTED_DIR=$RUNNER_TEMP/labinius-trusted"
+            echo "TRUSTED_CARGO_HOME=$RUNNER_TEMP/labinius-trusted-cargo"
+            echo "TRUSTED_TARGET_DIR=$RUNNER_TEMP/labinius-trusted-target"
+            echo "CONTESTANT_DIR=$RUNNER_TEMP/labinius-contestant"
+            echo "CONTESTANT_CARGO_HOME=$RUNNER_TEMP/labinius-contestant-cargo"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout trusted harness
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .trusted-src
+          persist-credentials: false
+
+      - name: Checkout untrusted solution input
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: ${{ inputs.solution_repository || github.repository }}
+          ref: ${{ inputs.solution_ref || github.sha }}
+          path: .untrusted-src
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Setup
+        shell: bash
+        run: bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track arm
+
+      - name: Benchmark proofs
+        shell: bash
+        run: bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track arm --prove-only "$RUNNER_TEMP/labinius-arm-runs"
+
+      - name: Upload proofs
+        id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: arm-proofs
+          path: ${{ runner.temp }}/labinius-arm-runs
+          retention-days: 1
+          if-no-files-found: error
+
+  # Checks the ARM proofs with the pinned verifier, which runs on x86-64 with AVX-512 only,
+  # and publishes the score. It never checks out the solution.
+  verify:
+    needs: prove
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Deletes the proof artifact once checked, so the score is the run's only artifact.
+      actions: write
+    steps:
+      - name: Require AVX-512 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ $(uname -m) != x86_64 ]] || ! grep -qw avx512f /proc/cpuinfo; then
+            echo "the pinned verifier needs an x86-64 host with avx512f" >&2
+            exit 1
+          fi
+
+      - name: Resolve isolated paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "TRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.trusted-src"
+            echo "UNTRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.untrusted-src"
+            echo "TRUSTED_DIR=$RUNNER_TEMP/labinius-trusted"
+            echo "TRUSTED_CARGO_HOME=$RUNNER_TEMP/labinius-trusted-cargo"
+            echo "TRUSTED_TARGET_DIR=$RUNNER_TEMP/labinius-trusted-target"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout trusted harness
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .trusted-src
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup toolchain
+        shell: bash
+        run: bash "$TRUSTED_CHECKOUT/.yukon/provision.sh"
+
+      - name: Setup verifier
+        shell: bash
+        run: bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track arm --verifier-only
+
+      - name: Download proofs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: arm-proofs
+          path: ${{ runner.temp }}/labinius-arm-runs
+
+      - name: Benchmark verification
+        shell: bash
+        run: bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track arm --verify-only "$RUNNER_TEMP/labinius-arm-runs"
+
+      - name: Upload score
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: benchmark-score-arm
+          path: ${{ github.workspace }}/.trusted-src/.yukon/labinius-fast-arm-score.json
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Delete proofs
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ needs.prove.outputs.proofs }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID"
