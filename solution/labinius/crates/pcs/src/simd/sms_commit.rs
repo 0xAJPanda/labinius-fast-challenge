@@ -85,7 +85,7 @@ pub const fn mur_len(elements: usize) -> usize {
     CHUNKED * chunk_count(elements) * N
 }
 /// Pair batches transformed in lockstep per accumulator read-modify-write.
-pub const LOCK: usize = 8;
+pub const LOCK: usize = 16;
 const TAIL_MASK: u32 = (1u32 << TAIL_BITS) - 1;
 
 /// Centered `2^16 mod q`, the weight [`reduce_vec_c`] gives the high half.
@@ -475,8 +475,13 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
                 else if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
             } else if LOCK == 16 {
-                call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
-                    x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
+                if FIRST {
+                    call_first!(sms_slot16, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
+                        x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
+                } else {
+                    call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
+                        x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
+                }
             } else {
                 if RED { call!(sms_slot4, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
                 else { call!(sms_slot4, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
