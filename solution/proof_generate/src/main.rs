@@ -80,8 +80,22 @@ fn codec() -> impl Options {
 use keygen::params;
 fn seed() -> [u8; 32] {
     let s = std::env::var("LABINIUS_SEED").expect("LABINIUS_SEED is required");
-    assert_eq!(s.len(), 64);
+    parse_seed(&s)
+}
+/// A 32-byte seed from 64 hex digits, either case, as `LABINIUS_SEED` and `--seed` carry it.
+fn parse_seed(s: &str) -> [u8; 32] {
+    assert_eq!(s.len(), 64, "a seed is 64 hex digits");
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
+}
+/// `args` without a `--seed <hex>` pair, and the seed it named: the environment variable stays the
+/// scored interface, and a flag of the same shape lets a local reproduction name the seed without
+/// exporting anything.
+fn take_seed_flag(args: &mut Vec<String>) -> Option<[u8; 32]> {
+    let at = args.iter().position(|a| a == "--seed")?;
+    assert!(at + 1 < args.len(), "usage: --seed <64 hex digits>");
+    let seed = parse_seed(&args[at + 1]);
+    args.drain(at..at + 2);
+    Some(seed)
 }
 
 /// Threads the parallel phases use: what the sandbox lets the process see.
@@ -1858,14 +1872,15 @@ fn main() {
     if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
         yield_to_everything_else();
     }
-    let args: Vec<_> = std::env::args().collect();
+    let mut args: Vec<_> = std::env::args().collect();
+    let seed_override = take_seed_flag(&mut args);
     assert!(
         args.len() == 5 || args.len() == 7,
-        "usage: labinius-fast --prove FILE --table FILE [--modulus Q]"
+        "usage: labinius-fast --prove FILE --table FILE [--modulus Q] [--seed HEX]"
     );
     assert_eq!(args[1], "--prove", "unknown command");
     assert_eq!(args[3], "--table", "witness table path is required");
-    let seed = seed();
+    let seed = seed_override.unwrap_or_else(seed);
     let modulus = if args.len() == 7 {
         assert_eq!(args[5], "--modulus", "unknown prover option");
         modulus_choice::parse(&args[6]).expect("invalid commitment modulus")
