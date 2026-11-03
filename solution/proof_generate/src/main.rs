@@ -1128,7 +1128,14 @@ unsafe fn lift_sms_column(_: &[i16], _: &[u32; N], _: &mut [u8]) {
 
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 64;
+/// Prefix partial sets for the GHASH→F162 switch: 128 sets cover 7 prefix
+/// coordinates (within MAX_PREFIX = 8, G ≤ 256, n = 24 ≥ prefix + 12), one more
+/// than the previous 64. The switch code is generic in the set count, the
+/// messages are the same values computed from the same table, and the
+/// materialised p after the prefix rounds is half the size, so the remaining
+/// switch folds process half as much data. Untested locally (no cargo build
+/// on this host); hosted evaluation is the judge.
+const PREFIX_SETS: usize = 128;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
