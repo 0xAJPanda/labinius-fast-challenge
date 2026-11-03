@@ -1,7 +1,7 @@
 //! Commitment modulo 9721 * 2^22 with a single witness NTT.
 //!
 //! `t = sum_j A_j s_j` is wanted modulo `Q = 9721 * 2^22`. The witness transform modulo 9721 feeds
-//! nine accumulation streams that differ only in their public key:
+//! eight accumulation streams that differ only in their public key:
 //!
 //! - stream 0: `A mod 9721`, accumulated over the whole column (the ordinary residue);
 //! - streams 1..=7: the balanced mixed-radix digits `L_d` of `A mod 2^22` (`L_0..L_5` base 9 in
@@ -343,7 +343,7 @@ impl SmsKeyData {
 // the kernel's sink
 // =============================================================================================
 
-/// One column group's nine stream accumulators: `v[j][s]` is slot `j`, stream `s`, 16 columns.
+/// One column group's eight stream accumulators: `v[j][s]` is slot `j`, stream `s`, 16 columns.
 #[repr(C, align(64))]
 pub struct SAcc {
     pub v: [[[i32; 16]; STREAMS]; N],
@@ -374,9 +374,9 @@ static FOLD: Fold = Fold({
     f
 });
 
-/// One slot's nine streams, round by round: the nine accumulators are loaded, take the first
+/// One slot's eight streams, round by round: the eight accumulators are loaded, take the first
 /// lockstep product, then the second, ..., and are stored (folded back first in `reduce`), so at
-/// most nine dependent `vpdpwssd` wait at a time and every round's nine are independent.
+/// most eight dependent `vpdpwssd` wait at a time and every round's eight are independent.
 include!("sms_slot_gen.rs");
 const _: () = assert!(STREAMS == 8 && (LOCK == 8 || LOCK == 4 || LOCK == 16));
 
@@ -411,8 +411,8 @@ unsafe fn fill_stream(a: &mut SAcc, s: usize, v: i32) {
     }
 }
 
-/// The 4-batch lockstep sink: the batches' 27-slot blocks are staged in L1 and every slot's nine
-/// accumulators take all four products in one read-modify-write, folded back when `RED`.
+/// The 8-batch lockstep sink: the batches' 27-slot blocks are staged in L1 and every slot's eight
+/// accumulators take all eight products in one read-modify-write, folded back when `RED`.
 ///
 /// `FIRST` marks a chunk's first lockstep step: the digit streams then start from their fold bias
 /// broadcast out of `b` instead of being loaded from memory, because [`finish_stream`] left that
