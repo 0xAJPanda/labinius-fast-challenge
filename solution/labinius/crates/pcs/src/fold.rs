@@ -1379,7 +1379,7 @@ mod bitsliced {
     const SLOTS: usize = 243;
     /// Schedule entries ahead of use that the accumulation prefetches the planes of: the planes
     /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
-    const PF_AHEAD: usize = 0;
+    const PF_AHEAD: usize = 4;
     const BITS: usize = 15;
     /// Columns per group: 16 * 129 planes, 132 KB per worker. 32 columns (264 KB) halve the
     /// outer group loops and partial CSA trees, but on the scored 8488C the smaller planes'
