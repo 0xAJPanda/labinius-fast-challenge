@@ -1244,25 +1244,24 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     put(&mut at, &(parts.commitment.len() as u64).to_le_bytes());
     debug_assert_eq!(at, layout.commitment_at());
     let mut at = layout.middle_at();
-    let mut middle = Vec::with_capacity(layout.middle());
-    middle.extend_from_slice(&(parts.partials.len() as u64).to_le_bytes());
+    // Write the middle fields directly into their final, disjoint output region.
+    // Their byte order and fixed-width lengths are the same as the codec's.
+    put(&mut at, &(parts.partials.len() as u64).to_le_bytes());
     for v in &parts.partials {
-        middle.extend_from_slice(&v.to_le_bytes());
+        put(&mut at, &v.to_le_bytes());
     }
-    middle.extend_from_slice(&(parts.rounds.len() as u64).to_le_bytes());
+    put(&mut at, &(parts.rounds.len() as u64).to_le_bytes());
     for r in &parts.rounds {
         for x in r.iter().flatten() {
-            middle.extend_from_slice(&x.to_le_bytes());
+            put(&mut at, &x.to_le_bytes());
         }
     }
     for x in &parts.opened {
-        middle.extend_from_slice(&x.to_le_bytes());
+        put(&mut at, &x.to_le_bytes());
     }
-    middle.extend_from_slice(&(parts.row.len() as u64).to_le_bytes());
-    middle.extend_from_slice(&parts.row);
-    middle.extend_from_slice(&(layout.folded_bytes as u64).to_le_bytes());
-    debug_assert_eq!(middle.len(), layout.middle());
-    put(&mut at, &middle);
+    put(&mut at, &(parts.row.len() as u64).to_le_bytes());
+    put(&mut at, &parts.row);
+    put(&mut at, &(layout.folded_bytes as u64).to_le_bytes());
     debug_assert_eq!(at, layout.folded_at());
     let elements = parts.folded.elements();
     assert!(
