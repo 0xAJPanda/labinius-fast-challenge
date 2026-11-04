@@ -971,6 +971,73 @@ unsafe fn intt_core<const Q: u16, const AUX: bool>(b: &mut Batch32) {
 pub unsafe fn intt_gen_batch32<const Q: u16>(b: &mut Batch32) {
     intt_core::<Q, false>(b);
 }
+/// `ipass_a` with its four finished rows handed to `consume` instead of stored back: a verbatim
+/// copy of `ipass_a`'s butterfly arithmetic (same `ir2`/`mont`/`barrett`/`center` calls, same
+/// order), except each `st(p, i, ...)` becomes `consume(i, ...)` and likewise for `i + 162`,
+/// `i + 324`, `i + 486`. The consumed values are therefore bit-identical to the rows
+/// `intt_gen_batch32` would have stored; the caller must not read `b` afterwards as a
+/// finished transform, since the final pass's rows are never written back.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn ipass_a_consume<const Q: u16, const AUX: bool, F: FnMut(usize, __m512i)>(p: *mut __m512i, mut consume: F) {
+    let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
+    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
+    let half = _mm512_set1_epi32(TwI::<Q, AUX>::HALF as i32);
+    let nhalf = _mm512_set1_epi32(TwI::<Q, AUX>::NHALF as i32);
+    let l1 = TwI::<Q, AUX>::IL1.as_ptr();
+    let (zap, za) = (bc(l1), bc(l1.add(1)));
+    let (zbp, zb) = (bc(l1.add(2)), bc(l1.add(3)));
+    let ka = TwI::<Q, AUX>::KA.as_ptr();
+    let kb = TwI::<Q, AUX>::KB.as_ptr();
+    let kc = TwI::<Q, AUX>::KC.as_ptr();
+    for i in 0..162 {
+        let (mut c0, c1) = ir2(ld(p, i), ld(p, i + 162), zap, za, q);
+        let (mut c2, c3) = ir2(ld(p, i + 324), ld(p, i + 486), zbp, zb, q);
+        if TwI::<Q, AUX>::BAR_S1 {
+            c0 = barrett(c0, bv, q);
+            c2 = barrett(c2, bv, q);
+        }
+        let d0 = sub(c0, c2);
+        let s0 = add(c0, c2);
+        let a1 = mont(d0, bc(ka), bc(ka.add(1)), q);
+        let a0 = add(
+            mont(s0, bc(kb), bc(kb.add(1)), q),
+            mont(d0, bc(kc), bc(kc.add(1)), q),
+        );
+        let d1 = sub(c1, c3);
+        let s1 = add(c1, c3);
+        let b1 = mont(d1, bc(ka), bc(ka.add(1)), q);
+        let b0 = add(
+            mont(s1, bc(kb), bc(kb.add(1)), q),
+            mont(d1, bc(kc), bc(kc.add(1)), q),
+        );
+        consume(i, center(a0, q, half, nhalf));
+        consume(i + 162, center(b0, q, half, nhalf));
+        consume(i + 324, center(a1, q, half, nhalf));
+        consume(i + 486, center(b1, q, half, nhalf));
+    }
+}
+
+/// Inverse NTT of a batch of 32 polynomials where the final pass's rows are consumed instead of
+/// stored: identical to `intt_gen_batch32` through the `ipass_d`/`ipass_c5`/`ipass_c4`/`ipass_b`
+/// passes, then `ipass_a_consume`. The shared `intt_gen_batch32` is untouched, as are the
+/// scalar/generic paths elsewhere in the crate. `b` is left in an intermediate state (the final
+/// pass never written back) and must be fully overwritten before any later read; the caller
+/// guarantees that. `b.representation` is set to `Coefficients`, matching the finished transform.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+pub unsafe fn intt_gen_batch32_consume<const Q: u16, F: FnMut(usize, __m512i)>(b: &mut Batch32, consume: F) {
+    debug_assert_eq!(b.representation, Representation::Ntt);
+    let p = b.v.as_mut_ptr() as *mut __m512i;
+    for blk in 0..4 {
+        for k4 in 6 * blk..6 * blk + 6 {
+            ipass_d::<Q, false>(p, k4);
+            ipass_c5::<Q, false>(p, k4);
+            ipass_c4::<Q, false>(p, k4);
+        }
+        ipass_b::<Q, false>(p, blk);
+    }
+    ipass_a_consume::<Q, false, F>(p, consume);
+    b.representation = Representation::Coefficients;
+}
 
 /// Inverse for the hybrid auxiliary stream modulo 3889 only.
 ///

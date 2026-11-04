@@ -515,29 +515,60 @@ struct Total {
 /// The digit `d` residues of two chunks (`c0` in lanes 0..16, `c0 + 1` in lanes 16..32 when
 /// `both`), inverse transformed and centered, reconstructed around their means and added to the
 /// total with weight `8^d`.
+/// Hoisted per-digit constants for [`reconstruct_row`]: the two chunks' chunk-mean pointers
+/// (low half in lanes 0..16, high half in lanes 16..32) and the broadcast modulus, centre
+/// bounds and digit weight. Built once per digit so the per-row step does no broadcasting.
+struct ReconstructCtx {
+    mlo: *const i16,
+    mhi: *const i16,
+    q: __m512i,
+    hq: __m512i,
+    nhq: __m512i,
+    wd: __m512i,
+}
+
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
+unsafe fn reconstruct_ctx(d: usize, keys: &SmsKeys, c0: usize, both: bool) -> ReconstructCtx {
     let chunks = chunk_count(keys.elements);
     let at = d * chunks + c0;
     let mlo = keys.mur.as_ptr().add(at * N);
     let mhi = if both { keys.mur.as_ptr().add((at + 1) * N) } else { mlo };
-    let q = _mm512_set1_epi16(P as i16);
-    let hq = _mm512_set1_epi16(((P - 1) / 2) as i16);
-    let nhq = _mm512_set1_epi16(-(((P - 1) / 2) as i16));
-    let wd = _mm512_set1_epi32(digit_weight(d) as i32);
+    ReconstructCtx {
+        mlo,
+        mhi,
+        q: _mm512_set1_epi16(P as i16),
+        hq: _mm512_set1_epi16(((P - 1) / 2) as i16),
+        nhq: _mm512_set1_epi16(-(((P - 1) / 2) as i16)),
+        wd: _mm512_set1_epi32(digit_weight(d) as i32),
+    }
+}
+
+/// One row of [`reconstruct`], verbatim: subtract the row's chunk means, centre into
+/// `[-(q-1)/2, (q-1)/2]`, weight by `9^d` and add into the row's total lanes (both halves
+/// when `both`, the low half only otherwise). Called once per row, in digit order, by both
+/// the stored-batch path and the fused-NTT path, so the two agree exactly.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline(always)]
+unsafe fn reconstruct_row(ctx: &ReconstructCtx, m: usize, x: __m512i, both: bool, total: &mut Total) {
+    let mu = _mm512_mask_blend_epi16(0xFFFF_0000, _mm512_set1_epi16(*ctx.mlo.add(m)), _mm512_set1_epi16(*ctx.mhi.add(m)));
+    let mut y = _mm512_sub_epi16(x, mu);
+    y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, ctx.hq), y, ctx.q);
+    y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, ctx.nhq), y, ctx.q);
+    let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), ctx.wd);
+    let t = total.t[m].as_mut_ptr() as *mut __m512i;
+    _mm512_store_si512(t, _mm512_add_epi32(_mm512_load_si512(t), lo));
+    if both {
+        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), ctx.wd);
+        _mm512_store_si512(t.add(1), _mm512_add_epi32(_mm512_load_si512(t.add(1)), hi));
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
+    let ctx = reconstruct_ctx(d, keys, c0, both);
     for m in 0..N {
         let x = _mm512_load_si512(b.v[m].as_ptr() as *const __m512i);
-        let mu = _mm512_mask_blend_epi16(0xFFFF_0000, _mm512_set1_epi16(*mlo.add(m)), _mm512_set1_epi16(*mhi.add(m)));
-        let mut y = _mm512_sub_epi16(x, mu);
-        y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
-        y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, nhq), y, q);
-        let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), wd);
-        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wd);
-        let t = total.t[m].as_mut_ptr() as *mut __m512i;
-        _mm512_store_si512(t, _mm512_add_epi32(_mm512_load_si512(t), lo));
-        if both {
-            _mm512_store_si512(t.add(1), _mm512_add_epi32(_mm512_load_si512(t.add(1)), hi));
-        }
+        reconstruct_row(&ctx, m, x, both, total);
     }
 }
 
@@ -751,8 +782,26 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                 for d in 0..CHUNKED {
                     let pd = &mut ws.pend[d];
                     pd.representation = Representation::Ntt;
-                    gen_small::intt_gen_batch32::<P>(pd);
-                    reconstruct(pd, d, keys, chunk - half, both, &mut ws.total[0]);
+                    // Fused path (AVX-512 host, the only host this function runs on): the
+                    // inverse NTT's final pass feeds its finished rows straight into the
+                    // reconstruct step, so `pend[d]` is never stored back and never re-read
+                    // for this digit. `pend[d]` is fully overwritten by the next chunk's
+                    // `finish_stream` calls (both halves, in order) before any later read,
+                    // so leaving it in its intermediate post-pass state is safe. The
+                    // non-AVX-512 branch keeps the original stored-batch path intact.
+                    if std::arch::is_x86_feature_detected!("avx512f")
+                        && std::arch::is_x86_feature_detected!("avx512bw")
+                        && std::arch::is_x86_feature_detected!("avx512vl")
+                    {
+                        let ctx = reconstruct_ctx(d, keys, chunk - half, both);
+                        let total = &mut ws.total[0];
+                        gen_small::intt_gen_batch32_consume::<P, _>(pd, |m, row| {
+                            reconstruct_row(&ctx, m, row, both, total);
+                        });
+                    } else {
+                        gen_small::intt_gen_batch32::<P>(pd);
+                        reconstruct(pd, d, keys, chunk - half, both, &mut ws.total[0]);
+                    }
                 }
                 half = 0;
             } else {
