@@ -1,0 +1,25 @@
+name: Production ARM validation
+
+on:
+  push:
+    branches:
+      - bb/production-arm-validation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  smoke:
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/graviton4-production-smoke.yml@6ca90ac0fa5e1c6827141a97e2581ae38046a0c3
+
+  benchmark:
+    needs: smoke
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-arm.yml@6ca90ac0fa5e1c6827141a97e2581ae38046a0c3
+    with:
+      solution_repository: Layr-Labs/labinius-fast-challenge
+      solution_ref: 1aa6f6e926ba56cb67daae756c0d4d2f6312fa58
+    permissions:
+      contents: read
+      actions: write
