@@ -20,8 +20,8 @@ READ_ONLY = {"contents": "read", "actions": "read"}
 SOLUTION_INPUTS = {"solution_repository", "solution_ref"}
 PINNED_WORKFLOWS = {
     "x86": (
-        "Layr-Labs/labinius-fast",
-        "2b5b09893c89958f29b2234e1a4c07feb82ebd0c",
+        "Layr-Labs/labinius-fast-challenge",
+        "6ca90ac0fa5e1c6827141a97e2581ae38046a0c3",
     ),
     "arm": (
         "Layr-Labs/labinius-fast-challenge",

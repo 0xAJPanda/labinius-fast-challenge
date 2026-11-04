@@ -11,10 +11,10 @@ permissions:
 # caller would make the run wait on itself.
 jobs:
   benchmark:
-    # Runner-group admission is bound to the reviewed executor at this exact commit, not to
-    # whichever ref Yukon dispatches. This caller requests no runner; it forwards the
+    # Runner-group admission is bound to the reviewed public executor at this exact commit,
+    # not to whichever ref Yukon dispatches. This caller requests no runner; it forwards the
     # dispatched repository and commit as the untrusted solution input.
-    uses: Layr-Labs/labinius-fast/.github/workflows/benchmark-x86.yml@2b5b09893c89958f29b2234e1a4c07feb82ebd0c
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-x86.yml@6ca90ac0fa5e1c6827141a97e2581ae38046a0c3
     with:
       solution_repository: ${{ github.repository }}
       solution_ref: ${{ github.sha }}
