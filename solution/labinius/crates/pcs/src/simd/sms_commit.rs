@@ -385,7 +385,10 @@ const INPUT_PREFETCH: bool = false;
 
 /// Slots ahead the sink prefetches its key lines. The accumulator lines are L1-resident already,
 /// so prefetching them only spends issue slots.
-const PREFETCH_SLOTS: usize = 3;
+/// Raised from 3 to 6: each slot's key block is 256 bytes (STREAMS x LOCK x 4), so 6 slots of
+/// lookahead is ~1.5 KB, still inside the per-block window, and gives a DRAM miss more time
+/// to be covered by the large generated slot body.
+const PREFETCH_SLOTS: usize = 6;
 
 /// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
 /// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
