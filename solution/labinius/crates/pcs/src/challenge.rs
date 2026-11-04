@@ -178,7 +178,7 @@ impl Stream {
         }
         debug_assert_eq!(at, x);
         let plain = &self.tail;
-        let cvs = crate::par::pool().map(pieces.len(), |i| {
+        let mut cvs = crate::par::pool().map(pieces.len(), |i| {
             let (start, len) = pieces[i];
             if start == 0 {
                 // The first piece continues the stream absorbed so far.
@@ -195,12 +195,18 @@ impl Stream {
         let mut left = [[0u8; 32]; MAX_DEPTH];
         for (d, &(first, count)) in subtrees.iter().enumerate() {
             // Aligned siblings merge pairwise up to the subtree's root; more input follows.
-            let mut level: Vec<ChainingValue> = cvs[first..first + count as usize].to_vec();
-            while level.len() > 1 {
-                level = level
-                    .chunks_exact(2)
-                    .map(|p| hazmat::merge_subtrees_non_root(&p[0], &p[1], Mode::Hash))
-                    .collect();
+            let level = &mut cvs[first..first + count as usize];
+            let mut width = level.len();
+            while width > 1 {
+                let parents = width / 2;
+                // Each parent overwrites only children already consumed. Keep
+                // left/right order and the non-root hash mode unchanged.
+                for i in 0..parents {
+                    level[i] = hazmat::merge_subtrees_non_root(
+                        &level[2 * i], &level[2 * i + 1], Mode::Hash,
+                    );
+                }
+                width = parents;
             }
             left[d] = level[0];
         }
