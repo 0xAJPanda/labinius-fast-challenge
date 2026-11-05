@@ -182,12 +182,15 @@ mod bin_asm {
             let want = f162::index_rows_scalar(&lifted);
             let mut got = BinaryIndex32::zero();
             let mut staged = BinaryIndex32::zero();
+            let mut cols = BinaryIndex32::zero();
             unsafe {
                 tf::slice_b128_into(words, &mut got);
                 tf::slice_b128_staged_into(words, &mut staged);
+                tf::slice_b128_cols16_into(&core::array::from_fn(|c| words.as_ptr().add(8*c)), &mut cols);
             }
             for i in 0..162 {
                 assert!(want.rows[i] == got.rows[i], "slice_b128_into row {i}");
+                assert!(want.rows[i] == cols.rows[i], "slice_b128_cols16_into row {i}");
                 assert!(staged.rows[i] == got.rows[i], "slice_b128_into vs staged row {i}");
             }
         }
@@ -436,6 +439,37 @@ mod bin_asm {
                 assert!(worst as f64 / q as f64 <= 0.532);
             }
         }
+    }
+
+    // The pipelined producer has its own register allocation; compare its
+    // stored rows exactly with the ordinary kernel on adversarial and random input.
+    #[test]
+    fn pipelined_matches_plain() {
+        struct Sink<'a>(&'a mut [Batch32]);
+        impl vb::SliceSink<8> for Sink<'_> {
+            unsafe fn rows(&mut self,blk:usize,w:[*const i16;8],r0:usize,r1:usize) {
+                for h in 0..8 { for i in r0..r1 {
+                    self.0[h].v[27*blk+i].copy_from_slice(core::slice::from_raw_parts(w[h].add(32*i),32));
+                }}
+            }
+        }
+        #[repr(align(64))]
+        struct Scratch([i16;2*8*27*32]);
+        fn check<const Q:u16>() {
+            let inputs=batches(32,0x51227 ^ Q as u64);
+            for polys in inputs.chunks_exact(8) {
+                let idx:Vec<_>=polys.iter().map(idx_of_polys).collect();
+                let mut got:Vec<_>=(0..8).map(|_|Batch32::zero(Representation::Coefficients)).collect();
+                let mut scratch=Box::new(Scratch([0;2*8*27*32]));
+                unsafe {vb::ntt_bin_batch32_pipelined::<Q,8,_>(core::array::from_fn(|h|&idx[h]),scratch.0.as_mut_ptr(),&mut Sink(&mut got));}
+                for h in 0..8 {
+                    let mut expected=Batch32::zero(Representation::Coefficients);
+                    unsafe {vb::ntt_bin_batch32::<Q>(&idx[h],&mut expected);}
+                    assert_eq!(got[h].v,expected.v,"Q={Q}, batch={h}");
+                }
+            }
+        }
+        check::<3889>();check::<9721>();
     }
 
     /// The *proved* bound of the schedule (the shadow model only sees the inputs the test feeds it):

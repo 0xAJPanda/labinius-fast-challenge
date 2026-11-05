@@ -415,7 +415,7 @@ pub unsafe fn ntt_gen_batch32<const Q: u16>(b: &mut Batch32) {
 
 /// Compile-time inverse-twiddle tables, level-0 recombination constants, Barrett placement and
 /// the bound recursion of [`intt_gen_batch32`]. AUX defaults to false; its tighter
-/// schedule is instantiated only for the hybrid auxiliary inverse modulo 3889.
+/// schedule is instantiated for bounded hybrid/SMS auxiliary inverse inputs.
 /// AUX=true is unsupported for every other modulus.
 ///
 /// The twiddles are the plain ones inverted (`zeta^-1`, `zeta^-2`), in the same duplicated-u32
@@ -492,7 +492,7 @@ impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
     /// Declared input bound: the largest lazily reduced transform this crate produces, i.e.
     /// `ntt::bin_asm`'s 7.5 q (3889) / 2.3 q (9721). Everything smaller — the forward
     /// kernels' 3.40 q / 2.13 q, the fold's centered `(q-1)/2` — is covered.
-    pub const IN_BOUND: i32 = if AUX { 2 * Q as i32 - 1 } else if Q == 9721 { 22359 } else { 29167 };
+    pub const IN_BOUND: i32 = if AUX { if Q == 9721 { Q as i32 - 1 } else { 2 * Q as i32 - 1 } } else if Q == 9721 { 22359 } else { 29167 };
 
     /// Barrett the three loaded inputs of a level-6 butterfly. Unavoidable at the declared input
     /// bound: `y1 - y2` alone is 15 q (3889) / 4.6 q (9721) and already leaves i16.
@@ -529,7 +529,7 @@ impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
     /// `[after level 6, .., after level 1, after level 0 before centering]`, and the largest
     /// intermediate the pass ever forms (`PEAK`, which is what has to stay inside i16).
     const B: ([i32; 7], i32) = {
-        assert!(!AUX || Q == 3889, "auxiliary inverse schedule is only valid for 3889");
+        assert!(!AUX || Q == 3889 || Q == 9721, "unsupported bounded auxiliary inverse");
         inv_bounds::<Q, AUX>()
     };
     /// Per-level bound `BOUND[l]` = max |lane| after inverse level `l`; see the module comment.
@@ -542,6 +542,7 @@ impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
 
 const _: () = assert!(TwI::<3889>::PEAK <= 32767);
 const _: () = assert!(TwI::<9721>::PEAK <= 32767);
+const _: () = assert!(TwI::<9721, true>::PEAK <= 32767);
 
 /// `|mont(a, w)| <= |a| q / 2^17 + q/2` (`params::mont_mul_i16`).
 const fn mont_bound(b: i32, q: u16) -> i32 {
@@ -943,7 +944,7 @@ unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
 /// Shared inverse implementation; public entry points specify the input contract.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn intt_core<const Q: u16, const AUX: bool>(b: &mut Batch32) {
+unsafe fn intt_core<const Q: u16, const AUX: bool, const SMS_SCALED: bool>(b: &mut Batch32) {
     debug_assert_eq!(b.representation, Representation::Ntt);
     let p = b.v.as_mut_ptr() as *mut __m512i;
     for blk in 0..4 {
@@ -954,7 +955,12 @@ unsafe fn intt_core<const Q: u16, const AUX: bool>(b: &mut Batch32) {
         }
         ipass_b::<Q, AUX>(p, blk);
     }
-    ipass_a::<Q, AUX>(p);
+    if SMS_SCALED {
+        assert!(Q == 9721 && AUX);
+        ipass_a_sms_scaled(p);
+    } else {
+        ipass_a::<Q, AUX>(p);
+    }
     b.representation = Representation::Coefficients;
 }
 
@@ -969,7 +975,7 @@ unsafe fn intt_core<const Q: u16, const AUX: bool>(b: &mut Batch32) {
 /// The host must have AVX-512 F/BW/VL; `b` must be 64-byte aligned (`Batch32` is).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn intt_gen_batch32<const Q: u16>(b: &mut Batch32) {
-    intt_core::<Q, false>(b);
+    intt_core::<Q, false, false>(b);
 }
 
 /// Inverse for the hybrid auxiliary stream modulo 3889 only.
@@ -983,7 +989,7 @@ pub unsafe fn intt_gen_batch32<const Q: u16>(b: &mut Batch32) {
 /// AVX-512 F/BW/VL; b is aligned and in NTT representation, with the stated lane bound.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn intt_hybrid_batch32_3889(b: &mut Batch32) {
-    intt_core::<3889, true>(b);
+    intt_core::<3889, true, false>(b);
 }
 
 const _: () = {
@@ -1030,6 +1036,178 @@ mod hybrid_inverse_tests {
             }
             assert_eq!(tight.v, generic.v, "tight inverse case {case}");
             assert_eq!(tight.representation, Representation::Coefficients);
+        }
+    }
+}
+
+/// Inverse for SMS residues with |x| < 9721. The bounded folded reduction
+/// supplies this contract. All intermediate ranges are checked by TwI's
+/// recurrence; omitting the initial Barretts leaves the exact same centered
+/// coefficient output as the general inverse.
+///
+/// # Safety
+/// AVX-512 F/BW/VL; b is aligned, in NTT representation, and |lane| < 9721.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+pub unsafe fn intt_sms_batch32_9721(b: &mut Batch32) {
+    intt_core::<9721, true, false>(b);
+}
+
+#[cfg(test)]
+mod sms_bound_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_inverse_9721_matches_general() {
+        assert!(TwI::<9721, true>::PEAK <= 32767);
+        let mut state = 0x38dabc02576e1491u64;
+        for case in 0..9 {
+            let mut got = Batch32::zero(Representation::Ntt);
+            for j in 0..648 { for lane in 0..32 {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                got.v[j][lane] = match case {
+                    0 => 0, 1 => 9720, 2 => -9720,
+                    3 => if (j + lane) % 2 == 0 { 9720 } else { -9720 },
+                    _ => (state % 19441) as i16 - 9720,
+                };
+            } }
+            let mut expected = got.clone();
+            unsafe {
+                intt_gen_batch32::<9721>(&mut expected);
+                intt_sms_batch32_9721(&mut got);
+            }
+            assert!(got.v == expected.v, "bounded inverse case {case}");
+            assert_eq!(got.representation, Representation::Coefficients);
+        }
+    }
+}
+
+/// Auxiliary SMS key scales, one per Phi_6 half. The partial inverse above
+/// level zero has factor 324. Scaling by these constants makes its final
+/// coefficient pair (u+v, kappa*(v-u)-v), needing one Montgomery product.
+pub const fn sms_key_scales_9721() -> [u16; 2] {
+    let q = 9721u64;
+    let k = Params::<9721>::ZETA6 as u64;
+    let ki = (q + 1 - k) % q;
+    let det = (k + q - ki) % q;
+    let inverse = inv_mod(324 * det % q, q);
+    [((q - ki) * inverse % q) as u16, (k * inverse % q) as u16]
+}
+
+#[repr(C, align(64))]
+struct SmsCorrection([i16; 32]);
+static SMS_CORRECTION: SmsCorrection = SmsCorrection({
+    let mut out = [0i16; 32];
+    let mut i = 0;
+    while i < 32 {
+        out[i] = super::bin_asm::barrett_lut_corr(i, 9721);
+        i += 1;
+    }
+    out
+});
+const SMS_KAPPA: [u32; 2] = Tw::<9721>::pair(Params::<9721>::ZETA6);
+const _: () = {
+    let q = 9721i64;
+    // Every centered twiddle has |w| <= (q-1)/2. The Montgomery numerator
+    // is exactly divisible by 2^16, giving this whole-i16-domain bound.
+    let m = (32768 * (q - 1) / 2 + 32768 * q) / 65536;
+    let md = (2 * m * (q - 1) / 2 + 32768 * q) / 65536;
+    assert!(5625 <= m && 2 * m <= 32767);
+    assert!(2 * m < 3 * q / 2 && m + md < 3 * q / 2);
+};
+
+#[inline(always)]
+unsafe fn sms_sum_reduce(x: __m512i, correction: __m512i) -> __m512i {
+    let index = _mm512_srli_epi16::<11>(x);
+    add(x, _mm512_permutexvar_epi16(index, correction))
+}
+
+/// The level-one twiddles are unchanged. Its sums use the tighter 5625
+/// lookup bound; its other outputs are Montgomery products bounded by 7290.
+/// The new Phi_6 sums/differences fit i16, and each output is below 3q/2,
+/// so the same final centering needs only one subtract/add of q.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn ipass_a_sms_scaled(p: *mut __m512i) {
+    let q = _mm512_set1_epi32(Tw::<9721>::QD as i32);
+    let half = _mm512_set1_epi32(TwI::<9721, true>::HALF as i32);
+    let nhalf = _mm512_set1_epi32(TwI::<9721, true>::NHALF as i32);
+    let correction = _mm512_load_si512(SMS_CORRECTION.0.as_ptr().cast());
+    let l1 = TwI::<9721, true>::IL1.as_ptr();
+    let (zap, za) = (bc(l1), bc(l1.add(1)));
+    let (zbp, zb) = (bc(l1.add(2)), bc(l1.add(3)));
+    let (kp, k) = (bc(SMS_KAPPA.as_ptr()), bc(SMS_KAPPA.as_ptr().add(1)));
+    for i in 0..162 {
+        let (c0, c1) = ir2(ld(p, i), ld(p, i + 162), zap, za, q);
+        let (c2, c3) = ir2(ld(p, i + 324), ld(p, i + 486), zbp, zb, q);
+        let c0 = sms_sum_reduce(c0, correction);
+        let c2 = sms_sum_reduce(c2, correction);
+        let a0 = add(c0, c2);
+        let a1 = sub(mont(sub(c2, c0), kp, k, q), c2);
+        let b0 = add(c1, c3);
+        let b1 = sub(mont(sub(c3, c1), kp, k, q), c3);
+        st(p, i, center(a0, q, half, nhalf));
+        st(p, i + 162, center(b0, q, half, nhalf));
+        st(p, i + 324, center(a1, q, half, nhalf));
+        st(p, i + 486, center(b1, q, half, nhalf));
+    }
+}
+
+/// Inverse for auxiliary SMS keys preconditioned with sms_key_scales_9721.
+///
+/// # Safety
+/// AVX-512 F/BW/VL; b is aligned and in NTT representation, |lane| < 9721.
+/// Its first/second 324 slots carry the corresponding public key scale.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+pub unsafe fn intt_sms_scaled_batch32_9721(b: &mut Batch32) {
+    intt_core::<9721, true, true>(b);
+}
+
+#[cfg(test)]
+mod sms_scaled_tests {
+    use super::*;
+
+    #[test]
+    fn sum_lookup_exhaustive_i16() {
+        unsafe {
+            let correction = _mm512_load_si512(SMS_CORRECTION.0.as_ptr().cast());
+            for first in (i16::MIN as i32..=i16::MAX as i32).step_by(32) {
+                let input: [i16; 32] = std::array::from_fn(|i| (first+i as i32) as i16);
+                let reduced = sms_sum_reduce(_mm512_loadu_si512(input.as_ptr().cast()), correction);
+                let mut output = [0i16; 32];
+                _mm512_storeu_si512(output.as_mut_ptr().cast(), reduced);
+                for i in 0..32 {
+                    assert!(output[i].abs() <= 5625);
+                    assert_eq!((output[i] as i32-input[i] as i32).rem_euclid(9721), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_inverse_9721_matches_general() {
+        let scales = sms_key_scales_9721();
+        let mut state = 0x659b30cf1d27a4e8u64;
+        for case in 0..13 {
+            let mut got = Batch32::zero(Representation::Ntt);
+            for j in 0..648 { for lane in 0..32 {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                got.v[j][lane] = match case {
+                    0 => 0, 1 => 9720, 2 => -9720,
+                    3 => if (j+lane)%2==0 { 9720 } else { -9720 },
+                    4..=7 => if j == [0,162,324,486][case-4] { 1+lane as i16 } else { 0 },
+                    _ => (state%19441) as i16-9720,
+                };
+            } }
+            let mut expected = got.clone();
+            for j in 0..648 { for lane in 0..32 {
+                let x = (got.v[j][lane] as i64 * scales[usize::from(j>=324)] as i64).rem_euclid(9721);
+                got.v[j][lane] = if x > 4860 { (x-9721) as i16 } else { x as i16 };
+            } }
+            unsafe {
+                intt_gen_batch32::<9721>(&mut expected);
+                intt_sms_scaled_batch32_9721(&mut got);
+            }
+            assert!(got.v == expected.v, "scaled inverse case {case}");
+            assert_eq!(got.representation, Representation::Coefficients);
         }
     }
 }
