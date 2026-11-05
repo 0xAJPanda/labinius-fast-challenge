@@ -42,7 +42,7 @@ fn main() {
     std::fs::write(dir.join("sms-mu.bin"), mu).expect("write the mean total image");
 }
 
-/// For the single-transform modulus: the eight streams' keys in the lockstep layout, the digit
+/// For the single-transform modulus: the seven streams' keys in the lockstep layout, the digit
 /// chunks' mean residues and the means' total (`labinius::simd::commit::sms::SmsKeyData`), with
 /// the reconstruction margin checked here, at build time, from the public matrix alone.
 #[cfg(target_arch = "x86_64")]
@@ -56,8 +56,8 @@ fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     for (d, m) in data.margins.iter().enumerate() {
         println!("cargo:warning=digit {d}: margin {:.3} at chunk {} coefficient {} |mean| {}", m.0, m.1, m.2, m.3);
     }
-    // Base-9 digits over 128-pair chunks: the smallest margin is about 8.1 sigma on the real
-    // matrix, a Hoeffding union bound of about 1e-6 failures per proof over every reconstruction.
+    // Paired norm-313 digits: certify every public chunk, digit and coefficient.
+    // No instance data enters the key image or this reconstruction-margin check.
     assert!(data.margin >= 7.5, "the public matrix leaves too small a reconstruction margin");
     (
         data.pairs.iter().flat_map(|w| w.to_le_bytes()).collect(),
