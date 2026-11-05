@@ -658,7 +658,7 @@ pub unsafe fn slice_b128_cols16_into(
         _mm512_store_si512(u.add(8 * b) as *mut __m512i, mu);
         _mm512_store_si512(v.add(8 * b) as *mut __m512i, mv);
     }
-    uv_b128_to_rows(wk, out);
+    uv_b128_to_rows_fused(wk, out);
 }
 
 /// The same index rows for 128 words of `B128`, the lifted witness read in place (a lifted
@@ -683,3 +683,5 @@ pub unsafe fn slice_b128_staged_into(
     }
     slice_raw(dst as *const u8, out)
 }
+
+include!("transpose_legacy_fused.rs");

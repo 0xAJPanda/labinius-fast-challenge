@@ -1315,8 +1315,8 @@ pub unsafe fn ntt_bin_batch32_multi_sink<const Q: u16, const H: usize, S: MultiB
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn tail27_out_of_line<const Q: u16>(bp: *const i16, op: *mut i16, t4: *const u32, t5: *const u32, t6: *const u32, cv: *const i16) {
-    if needs_barrett(Q) {
-        tail27_b(bp, op, t4, t5, t6, cv);
+    if Q == 9721 {
+        tail27_mem_b(bp, op, t4, t5, t6, cv);
     } else {
         tail27_p(bp, op, t4, t5, t6, cv);
     }
@@ -1412,18 +1412,23 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
             let os = buf(kk);
-            let (t4, t5, t6) = (
+            let (t4, t5, t6) = if Q == 9721 {
+                (SMS_TWIDDLES.t4.as_ptr().add(4 * kk).cast::<u32>(),
+                 SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
+                 SMS_TWIDDLES.t6.as_ptr().add(36 * kk).cast::<u32>())
+            } else { (
                 t.tw4.as_ptr().add(kk).cast::<u32>(),
                 t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
                 t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
-            );
+            ) };
             for h in 0..core::hint::black_box(H) {
                 let bpj = bps[h].add(32 * 27 * j);
-                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
+                // Consume the independent previous block before producing the next tail.
                 if let Some(p) = pend {
                     let (r0, r1) = slice(h);
                     sink.rows(p, ro(buf(p)), r0, r1);
                 }
+                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
             }
             pend = Some(kk);
         }
@@ -1560,3 +1565,5 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         }
     }
 }
+
+include!("twiddle_expanded.rs");
