@@ -967,12 +967,18 @@ pub fn column_coefficients(base: &[u32; N], tail: &[u32; N]) -> Vec<u64> {
 }
 /// `2^-22 mod 9721`.
 pub const fn inv_tail() -> u64 {
-    let t = (1u64 << TAIL_BITS) % P as u64;
-    let mut x = 1u64;
-    while (x * t) % P as u64 != 1 {
-        x += 1;
-    }
-    x
+    // A const fn may still run at every runtime call site. Materialize the
+    // fixed public inverse in a constant so CRT serialization never searches.
+    const INVERSE: u64 = {
+        let t = (1u64 << TAIL_BITS) % P as u64;
+        let mut x = 1u64;
+        while (x * t) % P as u64 != 1 {
+            x += 1;
+        }
+        x
+    };
+    const _: () = assert!((INVERSE * ((1u64 << TAIL_BITS) % P as u64)) % P as u64 == 1);
+    INVERSE
 }
 
 #[cfg(test)]
