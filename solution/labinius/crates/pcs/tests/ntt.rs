@@ -182,12 +182,15 @@ mod bin_asm {
             let want = f162::index_rows_scalar(&lifted);
             let mut got = BinaryIndex32::zero();
             let mut staged = BinaryIndex32::zero();
+            let mut cols = BinaryIndex32::zero();
             unsafe {
                 tf::slice_b128_into(words, &mut got);
                 tf::slice_b128_staged_into(words, &mut staged);
+                tf::slice_b128_cols16_into(&core::array::from_fn(|c| words.as_ptr().add(8*c)), &mut cols);
             }
             for i in 0..162 {
                 assert!(want.rows[i] == got.rows[i], "slice_b128_into row {i}");
+                assert!(want.rows[i] == cols.rows[i], "slice_b128_cols16_into row {i}");
                 assert!(staged.rows[i] == got.rows[i], "slice_b128_into vs staged row {i}");
             }
         }
