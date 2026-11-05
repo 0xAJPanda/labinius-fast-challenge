@@ -1,68 +1,71 @@
-//! Commitment modulo 9721 * 2^22 with a single witness NTT.
+//! Commitment modulo 9721 * 2^22 with one witness NTT.
 //!
-//! `t = sum_j A_j s_j` is wanted modulo `Q = 9721 * 2^22`. The witness transform modulo 9721 feeds
-//! nine accumulation streams that differ only in their public key:
+//! Stream zero computes the ordinary residue modulo 9721. Six auxiliary streams
+//! encode paired radix-13 digits of the public matrix modulo 2^22. Pairing
+//! coefficients j and j+324 uses Z=X^324, Z^2-Z+1=0, and the quadratic norm
+//! a^2+a*b+b^2 to select short residue pairs. Integer carries preserve both
+//! coefficients exactly modulo 2^22; public position resolves digit ties.
 //!
-//! - stream 0: `A mod 9721`, accumulated over the whole column (the ordinary residue);
-//! - streams 1..=7: the balanced mixed-radix digits `L_d` of `A mod 2^22` (`L_0..L_5` base 9 in
-//!   `[-4, 4]`, `L_6` base 8 in `[-4, 4)`), so that `A ≡ sum_d 9^d L_d (mod 2^22)`
-//!   (`9^6 * 8 >= 2^22`: seven digits instead of the eight base-8 ones, one accumulation stream
-//!   fewer for the same chunking).
+//! Each digit sum is reconstructed around its public mean from its residue modulo
+//! 9721. The public matrix determines the exact second-moment bounds, and the build
+//! script refuses margins below its unchanged floor. Larger certified chunks
+//! reduce inverse-transform work. Every invocation still consumes its fresh table.
 //!
-//! A digit stream's sum `X = sum_{j in chunk} L_{d,j} s_j` over a chunk of [`CHUNK_PAIRS`] pair
-//! batches is an integer whose mean `mu = (1/2) sum_j L_{d,j} U` (`U` the all-ones polynomial on
-//! the 512 witness coefficients) is public. Its deviation from `mu` is a sum of independent bounded
-//! terms of the uniformly random table bits: Hoeffding bounds it by `Z sigma` except with
-//! probability `2 exp(-Z^2 / 2)`, where `sigma^2 = (1/4) sum_j sum_i M(L_{d,j})[m][i]^2` is
-//! computed from the public key ([`SmsKeys::build`] records the smallest margin `Z` over every
-//! chunk, digit and coefficient; at this shape it is above 12). Within that margin the residue of
-//! `X` modulo 9721 determines `X`: `X = mu + centered(X - mu mod 9721)`. The chunk's residues come
-//! out of one inverse transform per digit for two chunks at once, and `t mod 2^22 = sum_d 9^d X_d`
-//! accumulates in wrapping 32-bit lanes.
-//!
-//! Only public parameters are precomputed. Every invocation consumes its complete fresh table.
+//! Only public key data and reconstruction bounds are precomputed.
 use super::*;
 use crate::simd::ntt::gen_small;
 
 pub const P: u16 = 9721;
 pub const TAIL_BITS: u32 = 22;
 pub const MODULUS: u128 = (P as u128) << TAIL_BITS;
-/// Accumulation streams: the base residue and seven digits.
-pub const STREAMS: usize = 8;
+/// Accumulation streams: the base residue and six paired digits.
+pub const STREAMS: usize = 7;
+const DIGIT_RADIX: i64 = 13;
+const DIGIT_HALF: i64 = DIGIT_RADIX / 2;
+const DIGIT_BOUND: i8 = (2 * DIGIT_RADIX / 3) as i8;
+const PAIR_RESIDUES: usize = (DIGIT_RADIX * DIGIT_RADIX) as usize;
+const TOP_DIGIT_BOUND: i8 = {
+    let mut bound = 3 * (1i64 << (TAIL_BITS - 1));
+    let mut d = 0;
+    while d < DIGITS - 1 {
+        bound = (bound + DIGIT_BOUND as i64) / DIGIT_RADIX;
+        d += 1;
+    }
+    bound as i8
+};
 pub const DIGITS: usize = STREAMS - 1;
-/// Radix of digit `d`: base 9 below the last digit, base 8 for the last.
+/// Common radix of the auxiliary digit streams.
 pub const fn digit_radix(d: usize) -> i64 {
-    if d + 1 < DIGITS { 9 } else { 8 }
+    let _ = d; DIGIT_RADIX
 }
-/// Weight of digit `d`, `9^d`.
+/// Weight of digit `d`, `DIGIT_RADIX^d`.
 pub const fn digit_weight(d: usize) -> u32 {
     let mut w = 1u32;
     let mut i = 0;
     while i < d {
-        w *= 9;
+        w *= DIGIT_RADIX as u32;
         i += 1;
     }
     w
 }
 /// The balanced representatives cover `[-REP_LOW, 2^22 - REP_LOW)`, all of `Z / 2^22`.
 const REP_LOW: i64 = {
-    // every digit at its least value, -4
+    // Canonical scalar digits at their least value.
     let mut low = 0i64;
     let mut d = 0;
     while d < DIGITS {
-        low += 4 * digit_weight(d) as i64;
+        low += DIGIT_HALF * digit_weight(d) as i64;
         d += 1;
     }
     low
 };
 const _: () = {
     // The digits' range is contiguous and at least 2^22 wide.
-    let high = REP_LOW - digit_weight(DIGITS - 1) as i64;
+    let high = REP_LOW;
     assert!(REP_LOW + high + 1 >= 1 << TAIL_BITS);
 };
-/// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 256 ring
-/// elements of a column (the base-9 digits' margin, about 8.1 sigma, does not allow 192).
-pub const CHUNK_PAIRS: usize = 128;
+/// Pair batches per reconstruction chunk; the build checks the public matrix's margin.
+pub const CHUNK_PAIRS: usize = 104;
 /// Chunks of each half column: [`CHUNK_PAIRS`] pair batches each and a shorter last one, so
 /// that every chunk lies in one half (the commitment's work units are halves).
 pub const fn chunks_per_half(np: usize) -> usize {
@@ -80,6 +83,7 @@ pub fn chunk_range(np: usize, c: usize) -> core::ops::Range<usize> {
 }
 /// Digits reconstructed per chunk: all of them.
 pub const CHUNKED: usize = DIGITS;
+const _: () = assert!(CHUNKED % 2 == 0);
 /// Entries of [`SmsKeys::mur`] for `elements` ring elements per column.
 pub const fn mur_len(elements: usize) -> usize {
     CHUNKED * chunk_count(elements) * N
@@ -189,7 +193,7 @@ pub struct SmsKeys<'a> {
     /// coefficient `m`, as a centered residue modulo 9721; then the half-column means of the last
     /// digit at `mur[(CHUNKED * chunks + h) * N + m]`, `h` the half.
     pub mur: &'a [i16],
-    /// `mu[m] = sum_{d, c} 8^d mu'_{d,c}[m]`, wrapping.
+    /// `mu[m] = sum_{d,c} digit_weight(d) * mu'_{d,c}[m]`, wrapping.
     pub mu: &'a [u32],
     /// Ring elements per column.
     pub elements: usize,
@@ -213,8 +217,8 @@ impl SmsKeyData {
     }
 }
 
-/// The balanced digits of `x mod 2^22`: `x ≡ sum_d 9^d L_d`, `L_0..L_5 in [-4, 4]`,
-/// `L_6 in [-4, 4)`.
+/// Canonical scalar digits, retained as a regression reference for the radix identity.
+/// Public matrix construction uses the paired encoding below.
 pub fn digits(x: u128) -> [i8; DIGITS] {
     let mut r = (x & TAIL_MASK as u128) as i64;
     if r >= (1 << TAIL_BITS) - REP_LOW {
@@ -223,12 +227,127 @@ pub fn digits(x: u128) -> [i8; DIGITS] {
     let mut out = [0i8; DIGITS];
     for d in 0..DIGITS {
         let b = digit_radix(d);
-        let v = (r + 4).rem_euclid(b) - 4;
+        let v = (r + DIGIT_HALF).rem_euclid(b) - DIGIT_HALF;
         out[d] = v as i8;
         r = (r - v) / b;
     }
     debug_assert_eq!(r, 0);
     out
+}
+
+/// Squared norm in the quadratic pair basis: Z^2 - Z + 1 = 0, Z = X^324.
+const fn pair_norm(a: i64, b: i64) -> i64 { a * a + a * b + b * b }
+
+#[derive(Clone, Copy)]
+struct PairChoices { values: [[i8; 2]; 9], count: usize }
+
+const fn pair_digit_table() -> [PairChoices; PAIR_RESIDUES] {
+    let mut table = [PairChoices { values: [[0; 2]; 9], count: 0 }; PAIR_RESIDUES];
+    let mut i = 0;
+    while i < PAIR_RESIDUES {
+        let a = (i / DIGIT_RADIX as usize) as i64 - DIGIT_HALF;
+        let b = (i % DIGIT_RADIX as usize) as i64 - DIGIT_HALF;
+        let mut best = i64::MAX;
+        let mut u = -1;
+        while u <= 1 {
+            let mut v = -1;
+            while v <= 1 {
+                let (p, q) = (a + DIGIT_RADIX * u, b + DIGIT_RADIX * v);
+                let cost = pair_norm(p, q);
+                if cost < best { best = cost; table[i].count = 0; }
+                if cost == best {
+                    let k = table[i].count;
+                    table[i].values[k] = [p as i8, q as i8];
+                    table[i].count += 1;
+                }
+                v += 1;
+            }
+            u += 1;
+        }
+        let mut k = 0;
+        while k < table[i].count {
+            assert!(table[i].values[k][0] >= -DIGIT_BOUND && table[i].values[k][0] <= DIGIT_BOUND);
+            assert!(table[i].values[k][1] >= -DIGIT_BOUND && table[i].values[k][1] <= DIGIT_BOUND);
+            k += 1;
+        }
+        i += 1;
+    }
+    table
+}
+const PAIR_DIGITS: [PairChoices; PAIR_RESIDUES] = pair_digit_table();
+
+/// Choose a short representative of a coefficient pair modulo 2^22. Only public
+/// key coefficients and their position select among ties; no instance data enters.
+fn pair_representative(x: u128, y: u128, salt: usize) -> (i64, i64) {
+    let modulus = 1i64 << TAIL_BITS;
+    let center = |x: u128| {
+        let r = (x & TAIL_MASK as u128) as i64;
+        if r >= modulus / 2 { r - modulus } else { r }
+    };
+    let (a, b) = (center(x), center(y));
+    let mut choices = [(0i64, 0i64); 9];
+    let mut count = 0;
+    let mut best = i64::MAX;
+    for u in -1..=1 {
+        for v in -1..=1 {
+            let (p, q) = (a + u * modulus, b + v * modulus);
+            let cost = pair_norm(p, q);
+            if cost < best { best = cost; count = 0; }
+            if cost == best { choices[count] = (p, q); count += 1; }
+        }
+    }
+    choices[salt % count]
+}
+
+/// Encode a selected integer pair with minimum-norm radix residues and exact carries.
+/// The final carry is retained directly, preserving the two integer identities.
+fn encode_pair(mut a: i64, mut b: i64, salt: usize) -> ([i8; DIGITS], [i8; DIGITS]) {
+    let (mut da, mut db) = ([0i8; DIGITS], [0i8; DIGITS]);
+    for d in 0..DIGITS - 1 {
+        let i = (a + DIGIT_HALF).rem_euclid(DIGIT_RADIX) as usize * DIGIT_RADIX as usize
+            + (b + DIGIT_HALF).rem_euclid(DIGIT_RADIX) as usize;
+        let choices = PAIR_DIGITS[i];
+        let [p, q] = choices.values[salt.wrapping_add(d) % choices.count];
+        da[d] = p;
+        db[d] = q;
+        a = (a - p as i64) / DIGIT_RADIX;
+        b = (b - q as i64) / DIGIT_RADIX;
+    }
+    debug_assert!((-(TOP_DIGIT_BOUND as i64)..=TOP_DIGIT_BOUND as i64).contains(&a)
+        && (-(TOP_DIGIT_BOUND as i64)..=TOP_DIGIT_BOUND as i64).contains(&b));
+    da[DIGITS - 1] = a as i8;
+    db[DIGITS - 1] = b as i8;
+    (da, db)
+}
+
+/// Public-key representative search: redistribute the digit energy while
+/// keeping the represented integer pair no longer than ordinary centering.
+/// The fixed weights balance the tight lower-digit reconstruction margins.
+pub fn digits_pair(x: u128, y: u128, salt: usize) -> ([i8; DIGITS], [i8; DIGITS]) {
+    const WEIGHTS: [i64; DIGITS] = [1, 1, 3, 2, 2, 1];
+    let score = |digits: &([i8; DIGITS], [i8; DIGITS])| {
+        (0..DIGITS).map(|d| WEIGHTS[d] * pair_norm(digits.0[d] as i64, digits.1[d] as i64)).sum::<i64>()
+    };
+    let modulus = 1i64 << TAIL_BITS;
+    let center = |v: u128| {
+        let r = (v & TAIL_MASK as u128) as i64;
+        if r >= modulus / 2 { r - modulus } else { r }
+    };
+    let (a, b) = (center(x), center(y));
+    let limit = pair_norm(a, b);
+    let (p, q) = pair_representative(x, y, salt);
+    let mut best = encode_pair(p, q, salt);
+    let mut cost = score(&best);
+    for u in -1..=1 {
+        for v in -1..=1 {
+            let (p, q) = (a + u * modulus, b + v * modulus);
+            if pair_norm(p, q) > limit { continue; }
+            let candidate = encode_pair(p, q, salt);
+            let next = score(&candidate);
+            if next < cost { cost = next; best = candidate; }
+        }
+    }
+    best
 }
 
 /// `sum_i M(L)[m][i]^k` over the 512 witness coefficients `i` for `k = 1` and `k = 2`, where
@@ -275,7 +394,16 @@ impl SmsKeyData {
         assert!((elements / 4) % LOCK == 0 && ((elements / 4) % CHUNK_PAIRS) % LOCK == 0, "whole lockstep steps per chunk");
         let base = Modulus::ALL.into_iter().find(|m| m.prime() == P).unwrap();
         let len_f162 = 4 * elements;
-        let dig: Vec<[i8; DIGITS]> = a.iter().map(|&x| digits(x)).collect();
+        let mut dig = vec![[0i8; DIGITS]; a.len()];
+        for (ring_index, (coefficients, out)) in
+            a.chunks_exact(N).zip(dig.chunks_exact_mut(N)).enumerate()
+        {
+            for j in 0..N / 2 {
+                let (lo, hi) = digits_pair(coefficients[j], coefficients[j + N / 2], ring_index * (N / 2) + j);
+                out[j] = lo;
+                out[j + N / 2] = hi;
+            }
+        }
         let mut keys = Vec::with_capacity(STREAMS);
         keys.push(CommitmentKey::from_coefficients(len_f162, a, MODULUS, base, &[]));
         for d in 0..DIGITS {
@@ -343,7 +471,7 @@ impl SmsKeyData {
 // the kernel's sink
 // =============================================================================================
 
-/// One column group's nine stream accumulators: `v[j][s]` is slot `j`, stream `s`, 16 columns.
+/// `v[j][s]`: slot `j`, stream `s`, with sixteen column accumulators.
 #[repr(C, align(64))]
 pub struct SAcc {
     pub v: [[[i32; 16]; STREAMS]; N],
@@ -374,11 +502,9 @@ static FOLD: Fold = Fold({
     f
 });
 
-/// One slot's nine streams, round by round: the nine accumulators are loaded, take the first
-/// lockstep product, then the second, ..., and are stored (folded back first in `reduce`), so at
-/// most nine dependent `vpdpwssd` wait at a time and every round's nine are independent.
+// One slot's stream accumulators, round by round, with plain and folded variants.
 include!("sms_slot_gen.rs");
-const _: () = assert!(STREAMS == 8 && (LOCK == 8 || LOCK == 4 || LOCK == 16));
+const _: () = assert!(STREAMS == 7 && LOCK == 8);
 
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
@@ -394,8 +520,8 @@ const FOLD_EVERY: usize = PP;
 const _: () = assert!(LOCK <= PP || PP == 8);
 
 /// The value stream `s` starts from so that its two-uop folds cancel by its next reset: `32768`
-/// per fold, modulo `P`. Stream 0 runs over a whole column (`np` pair batches), the chunked digits
-/// over its chunk, the last digit over half a column: `span` is that run's pair batches.
+/// per fold, modulo `P`. The base runs over the commitment range; each digit
+/// runs over its reconstruction chunk. `span` counts that range's pair batches.
 fn fold_bias(span: usize) -> i32 {
     debug_assert!(span % FOLD_EVERY == 0);
     ((span / FOLD_EVERY) as u64 * 32768 % P as u64) as i32
@@ -506,25 +632,26 @@ unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) 
     }
 }
 
-/// A column-group lane total: `t[j][0..16]` takes the even chunks, `t[j][16..32]` the odd ones.
+/// A column-group total: the two lane banks collect the two digits of each inverse batch.
 #[repr(C, align(64))]
 struct Total {
     t: [[i32; 32]; N],
 }
 
-/// The digit `d` residues of two chunks (`c0` in lanes 0..16, `c0 + 1` in lanes 16..32 when
-/// `both`), inverse transformed and centered, reconstructed around their means and added to the
-/// total with weight `8^d`.
+/// Digits `d` and `d+1` of one chunk share the two 16-column lane banks.
+/// Each bank uses its own public mean and radix weight; the final row writer
+/// sums both banks, so this gives the same integer residue with one scratch batch.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
+unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, total: &mut Total) {
     let chunks = chunk_count(keys.elements);
     let at = d * chunks + c0;
     let mlo = keys.mur.as_ptr().add(at * N);
-    let mhi = if both { keys.mur.as_ptr().add((at + 1) * N) } else { mlo };
+    let mhi = keys.mur.as_ptr().add((at + chunks) * N);
     let q = _mm512_set1_epi16(P as i16);
     let hq = _mm512_set1_epi16(((P - 1) / 2) as i16);
     let nhq = _mm512_set1_epi16(-(((P - 1) / 2) as i16));
     let wd = _mm512_set1_epi32(digit_weight(d) as i32);
+    let wh = _mm512_set1_epi32(digit_weight(d + 1) as i32);
     for m in 0..N {
         let x = _mm512_load_si512(b.v[m].as_ptr() as *const __m512i);
         let mu = _mm512_mask_blend_epi16(0xFFFF_0000, _mm512_set1_epi16(*mlo.add(m)), _mm512_set1_epi16(*mhi.add(m)));
@@ -532,12 +659,10 @@ unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bo
         y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
         y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, nhq), y, q);
         let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), wd);
-        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wd);
+        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wh);
         let t = total.t[m].as_mut_ptr() as *mut __m512i;
         _mm512_store_si512(t, _mm512_add_epi32(_mm512_load_si512(t), lo));
-        if both {
-            _mm512_store_si512(t.add(1), _mm512_add_epi32(_mm512_load_si512(t.add(1)), hi));
-        }
+        _mm512_store_si512(t.add(1), _mm512_add_epi32(_mm512_load_si512(t.add(1)), hi));
     }
 }
 
@@ -555,7 +680,7 @@ impl SmsWorker {
     fn new() -> Self {
         SmsWorker {
             acc: zeroed_slice(1),
-            pend: zeroed_slice(DIGITS),
+            pend: zeroed_slice(1),
             total: zeroed_slice(1),
             idx: zeroed_slice(LOCK),
             w: zeroed_slice(2 * LOCK),
@@ -661,7 +786,7 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
 /// Parts of a column's ring-element range committed as separate work units by
 /// [`commit_paired`]: the commitment's coarse units otherwise leave cores idle at its end. Each
 /// part is whole digit chunks and one half-column chunk of the last digit.
-const HALVES: usize = 2;
+const HALVES: usize = 1;
 
 /// Where a group writes its rows: in full, or as one half of the range under its group's lock
 /// (`state` counts the halves already written).
@@ -682,7 +807,6 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
-    let mut half = 0usize;
     for s in 0..STREAMS {
         // Stream 0 runs over the range; the digits' spans are whole chunks of it.
         let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
@@ -743,20 +867,13 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
             // The next chunk's length: the rest of this half, or the next half's first chunk.
             let next = if local == hl { CHUNK_PAIRS.min(hl) } else { CHUNK_PAIRS.min(hl - local) };
             ws.bias[0] = fold_bias(next);
-            for d in 0..CHUNKED {
-                finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], half);
-            }
-            if half == 1 || b + LOCK == range.end {
-                let both = half == 1;
-                for d in 0..CHUNKED {
-                    let pd = &mut ws.pend[d];
-                    pd.representation = Representation::Ntt;
-                    gen_small::intt_gen_batch32::<P>(pd);
-                    reconstruct(pd, d, keys, chunk - half, both, &mut ws.total[0]);
-                }
-                half = 0;
-            } else {
-                half = 1;
+            for d in (0..CHUNKED).step_by(2) {
+                let pd = &mut ws.pend[0];
+                finish_stream(&mut ws.acc[0], 1 + d, pd, 0);
+                finish_stream(&mut ws.acc[0], 2 + d, pd, 1);
+                pd.representation = Representation::Ntt;
+                gen_small::intt_gen_batch32::<P>(pd);
+                reconstruct(pd, d, keys, chunk, &mut ws.total[0]);
             }
         }
     }
@@ -1022,16 +1139,57 @@ mod tests {
             }
             assert_eq!((v.rem_euclid(1 << TAIL_BITS)) as u128, x % (1 << TAIL_BITS));
             for k in 0..DIGITS - 1 {
-                assert!((-4..=4).contains(&d[k]));
+                assert!((-(DIGIT_HALF as i8)..=DIGIT_HALF as i8).contains(&d[k]));
             }
-            assert!((-4..4).contains(&d[DIGITS - 1]));
+            assert!((-(DIGIT_HALF as i8)..=DIGIT_HALF as i8).contains(&d[DIGITS - 1]));
         }
+    }
+
+    #[test]
+    fn shaped_pairs_preserve_both_coefficients() {
+        let modulus = 1i64 << TAIL_BITS;
+        let check = |x: u128, y: u128, salt: usize| {
+            let (a, b) = digits_pair(x, y, salt);
+            let value = |d: [i8; DIGITS]| d.iter().enumerate()
+                .map(|(i, &v)| v as i64 * digit_weight(i) as i64).sum::<i64>();
+            assert!(a[..DIGITS - 1].iter().chain(&b[..DIGITS - 1])
+                .all(|v| (-DIGIT_BOUND..=DIGIT_BOUND).contains(v)));
+            assert!((-TOP_DIGIT_BOUND..=TOP_DIGIT_BOUND).contains(&a[DIGITS - 1]));
+            assert!((-TOP_DIGIT_BOUND..=TOP_DIGIT_BOUND).contains(&b[DIGITS - 1]));
+            let (vx, vy) = (value(a), value(b));
+            assert_eq!(vx.rem_euclid(modulus) as u128, x & TAIL_MASK as u128);
+            assert_eq!(vy.rem_euclid(modulus) as u128, y & TAIL_MASK as u128);
+            let center = |x: u128| {
+                let r = (x & TAIL_MASK as u128) as i64;
+                if r >= modulus / 2 { r - modulus } else { r }
+            };
+            assert!(pair_norm(vx, vy) <= pair_norm(center(x), center(y)));
+        };
+        let edges = [0, 1, (modulus / 3) as u128, (modulus / 2) as u128,
+            (2 * modulus / 3) as u128, (modulus - 1) as u128];
+        for x in edges { for y in edges { for salt in 0..3 { check(x, y, salt); } } }
+        let mut state = 0x628d54a7c13e90bfu64;
+        for salt in 0..10000 {
+            let x = ((xorshift(&mut state) as u128) << 64) | xorshift(&mut state) as u128;
+            let y = ((xorshift(&mut state) as u128) << 64) | xorshift(&mut state) as u128;
+            check(x, y, salt);
+        }
+        for a in -DIGIT_HALF..=DIGIT_HALF { for b in -DIGIT_HALF..=DIGIT_HALF {
+            let choices = PAIR_DIGITS[((a + DIGIT_HALF) * DIGIT_RADIX + b + DIGIT_HALF) as usize];
+            for &[p, q] in &choices.values[..choices.count] {
+                assert_eq!((p as i64 - a).rem_euclid(DIGIT_RADIX), 0);
+                assert_eq!((q as i64 - b).rem_euclid(DIGIT_RADIX), 0);
+                for u in -2..=2 { for v in -2..=2 {
+                    assert!(pair_norm(p as i64, q as i64) <= pair_norm(a + DIGIT_RADIX * u, b + DIGIT_RADIX * v));
+                } }
+            }
+        } }
     }
 
     #[test]
     fn moments_match_direct() {
         let mut s = 0x77u64;
-        let l: [i8; N] = core::array::from_fn(|_| ((xorshift(&mut s) % 8) as i8) - 4);
+        let l: [i8; N] = core::array::from_fn(|_| ((xorshift(&mut s) % (2 * TOP_DIGIT_BOUND as u64 + 1)) as i8) - TOP_DIGIT_BOUND);
         let mut s1 = [0i64; N];
         let mut s2 = [0i64; N];
         moment_rows(&l, &mut s1, &mut s2);
@@ -1057,9 +1215,42 @@ mod tests {
     }
 
     #[test]
+    fn paired_inverse_banks_match_scalar_reconstruction() {
+        let elements = 512;
+        let chunks = chunk_count(elements);
+        let mut seed = 0xa2e78139ca040d65;
+        let mut mur = vec![0i16; mur_len(elements)];
+        for m in &mut mur { *m = (xorshift(&mut seed) % P as u64) as i16 - (P / 2) as i16; }
+        let means = [0u32; N];
+        let keys = SmsKeys { pairs: &[], mur: &mur, mu: &means, elements };
+        let mut batch = zeroed_slice::<Batch32>(1);
+        let mut total = zeroed_slice::<Total>(1);
+        for row in &mut total[0].t { for v in row { *v = xorshift(&mut seed) as i32; } }
+        for d in (0..DIGITS).step_by(2) {
+            for c in 0..chunks {
+                for row in &mut batch[0].v { for v in row {
+                    *v = (xorshift(&mut seed) % P as u64) as i16 - (P / 2) as i16;
+                } }
+                batch[0].v[0][0] = (P / 2) as i16;
+                batch[0].v[0][31] = -(P as i16 / 2);
+                let before = total[0].t.to_vec();
+                unsafe { reconstruct(&batch[0], d, &keys, c, &mut total[0]) };
+                for m in 0..N { for lane in 0..32 {
+                    let digit = d + usize::from(lane >= 16);
+                    let mean = mur[(digit * chunks + c) * N + m] as i32;
+                    let delta = (batch[0].v[m][lane] as i32 - mean + P as i32 / 2)
+                        .rem_euclid(P as i32) - P as i32 / 2;
+                    let expected = before[m][lane].wrapping_add(delta.wrapping_mul(digit_weight(digit) as i32));
+                    assert_eq!(total[0].t[m][lane], expected, "digit {digit}, chunk {c}, row {m}, lane {lane}");
+                } }
+            }
+        }
+    }
+
+    #[test]
     fn commitment_matches_reference() {
-        commitment_matches_reference_at(512, 8.0); // one short chunk per half
-        commitment_matches_reference_at(1024, 7.0); // a full chunk and a 64-pair one per half
+        commitment_matches_reference_at(512, 7.5); // full and short chunks in each half
+        commitment_matches_reference_at(1024, 7.5); // an inverse batch crosses the half boundary
     }
 
     fn commitment_matches_reference_at(elements: usize, floor: f64) {
