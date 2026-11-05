@@ -14,7 +14,7 @@ jobs:
     # Runner-group admission must allow the public executor at this exact commit,
     # not to whichever ref Yukon dispatches. This caller requests no runner; it forwards the
     # dispatched repository and commit as the untrusted solution input.
-    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-arm.yml@2a5364133ce0a446a3764dda26fb521217a41e5c
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-arm.yml@7a42f8889df508050e09c7d0e56ef716c3f37857
     with:
       solution_repository: ${{ github.repository }}
       solution_ref: ${{ github.sha }}

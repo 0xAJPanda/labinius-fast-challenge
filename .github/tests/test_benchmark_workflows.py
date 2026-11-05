@@ -21,11 +21,11 @@ SOLUTION_INPUTS = {"solution_repository", "solution_ref"}
 PINNED_WORKFLOWS = {
     "x86": (
         "Layr-Labs/labinius-fast-challenge",
-        "2cafc0d1250dcc0e895651c59646349fd8d3e4a8",
+        "7a42f8889df508050e09c7d0e56ef716c3f37857",
     ),
     "arm": (
         "Layr-Labs/labinius-fast-challenge",
-        "2a5364133ce0a446a3764dda26fb521217a41e5c",
+        "7a42f8889df508050e09c7d0e56ef716c3f37857",
     ),
 }
 
