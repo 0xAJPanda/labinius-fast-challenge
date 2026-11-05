@@ -32,9 +32,9 @@ concurrency:
 
 jobs:
   benchmark:
-    # Keep this dispatch/call workflow's filename and run head for Yukon
-    # correlation, while runner admission is bound to the protected executor.
-    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-runner.yml@master
+    # Isolated pre-merge validation of PR #260. This exact executor revision
+    # is admitted by the x86 runner group and runner-side policies.
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-runner.yml@0b084481452c19db03d4e02b3c550f9158148d27
     with:
       solution_repository: ${{ inputs.solution_repository || github.repository }}
       solution_ref: ${{ inputs.solution_ref || github.sha }}
