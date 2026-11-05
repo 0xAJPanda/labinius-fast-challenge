@@ -43,7 +43,7 @@ def step_named(workflow: dict, job: str, name: str) -> dict:
 
 
 def score_path(track: str) -> str:
-    return f".yukon/labinius-fast-{track}-score.json"
+    return ".yukon/labinius-fast-score.json" if track == "x86" else ".yukon/labinius-fast-arm-score.json"
 
 
 class BenchmarkWorkflowTest(unittest.TestCase):
@@ -61,6 +61,7 @@ class BenchmarkWorkflowTest(unittest.TestCase):
             [
                 "benchmark-arm.yml",
                 "benchmark-x86.yml",
+                "benchmark.yml",
                 "dispatch-arm.yml",
                 "dispatch-x86.yml",
             ],
@@ -72,13 +73,14 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         tracks = {track["name"]: track for track in self.manifest["tracks"]}
         self.assertEqual(list(tracks), list(TRACKS))
         for name, track in tracks.items():
-            self.assertEqual(track["editablePaths"], [f"solution/{name}"])
+            self.assertEqual(track["editablePaths"], ["solution" if name == "x86" else "solution-arm"])
+            args = [] if name == "x86" else ["--track", name]
             self.assertEqual(
-                track["setupCommand"], ["bash", ".yukon/setup.sh", "--track", name]
+                track["setupCommand"], ["bash", ".yukon/setup.sh", *args]
             )
             self.assertEqual(
                 track["benchmarkCommand"],
-                ["bash", ".yukon/benchmark.sh", "--track", name],
+                ["bash", ".yukon/benchmark.sh", *args],
             )
             self.assertEqual(track["scorePath"], score_path(name))
             self.assertEqual(track["direction"], "-")
@@ -86,10 +88,42 @@ class BenchmarkWorkflowTest(unittest.TestCase):
                 track["runner"],
                 {
                     "provider": "github-actions",
-                    "workflow": f"dispatch-{name}.yml",
+                    "workflow": "benchmark.yml" if name == "x86" else "dispatch-arm.yml",
                     "maxConcurrentWorkflows": 1,
                 },
             )
+
+    def test_x86_preserves_the_standalone_execution_contract(self) -> None:
+        # Captured from production master 48f2a6d36f6a4828dffd515eb84dd6959adac17f.
+        # Yukon #1348 rejects changes to execution fields during conversion.
+        legacy = json.loads((ROOT / ".github/tests/fixtures/legacy-x86-benchmark.json").read_text())
+        x86 = self.manifest["tracks"][0]
+        informational = {"schemaVersion", "name", "description", "category"}
+        self.assertEqual(
+            {k: v for k, v in x86.items() if k not in informational},
+            {k: v for k, v in legacy.items() if k not in informational},
+        )
+        paths = [t["editablePaths"][0] for t in self.manifest["tracks"]]
+        self.assertFalse(paths[0].startswith(paths[1] + "/"))
+        self.assertFalse(paths[1].startswith(paths[0] + "/"))
+        for path in paths:
+            self.assertTrue((ROOT / path / "proof_generate/Cargo.toml").is_file())
+        self.assertFalse((ROOT / "solution/arm").exists())
+        self.assertFalse((ROOT / "solution/x86").exists())
+
+    def test_legacy_workflow_preserves_optional_solution_inputs(self) -> None:
+        workflow = load_workflow("benchmark.yml")
+        self.assertEqual(workflow["permissions"], READ_ONLY)
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch", "workflow_call"})
+        for trigger in workflow["on"].values():
+            self.assertEqual(set(trigger["inputs"]), SOLUTION_INPUTS)
+        job = workflow["jobs"]["benchmark"]
+        self.assertEqual(job["uses"], self.dispatchers["x86"]["jobs"]["benchmark"]["uses"])
+        self.assertEqual(job["with"], {
+            "solution_repository": "${{ inputs.solution_repository || github.repository }}",
+            "solution_ref": "${{ inputs.solution_ref || github.sha }}",
+        })
+        self.assertNotIn("concurrency", workflow)
 
     def test_workflows_are_dispatchable_and_callable(self) -> None:
         for track, workflow in self.workflows.items():
@@ -158,11 +192,11 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         )
         self.assertEqual(
             step_named(workflow, "benchmark", "Setup")["run"],
-            'bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track x86',
+            'bash "$TRUSTED_CHECKOUT/.yukon/setup.sh"',
         )
         self.assertEqual(
             step_named(workflow, "benchmark", "Benchmark")["run"],
-            'bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track x86',
+            'bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh"',
         )
 
     def test_arm_proves_on_arm_and_verifies_on_x86(self) -> None:

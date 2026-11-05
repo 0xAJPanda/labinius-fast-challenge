@@ -14,10 +14,10 @@ This challenge has two independently scored tracks. They share the instance, pro
 
 | Track | Editable path | Scored on | Baseline |
 | --- | --- | --- | --- |
-| `x86` | `solution/x86` | Intel Xeon Platinum 8488C, 8 CPUs, AVX-512 | AVX-512 Labinius kernels with a precomputed commitment key |
-| `arm` | `solution/arm` | AWS Graviton4 (Neoverse V2, SVE2), 8 vCPUs, no AVX-512 (proofs verified on x86) | Labinius with portable fallbacks for every AVX-512 intrinsic, and a grouped-table mod-`Q` commitment |
+| `x86` | `solution` | Intel Xeon Platinum 8488C, 8 CPUs, AVX-512 | AVX-512 Labinius kernels with a precomputed commitment key |
+| `arm` | `solution-arm` | AWS Graviton4 (Neoverse V2, SVE2), 8 vCPUs, no AVX-512 (proofs verified on x86) | Labinius with portable fallbacks for every AVX-512 intrinsic, and a grouped-table mod-`Q` commitment |
 
-A submission to one track may change only that track's directory. Each track's prover is built from its own `solution/<track>/proof_generate` crate, which must produce the `labinius-fast` executable. Scores from different tracks measure different hardware and are not comparable.
+A submission to one track may change only that track's directory. Each track's prover is built from the `proof_generate` crate inside its editable directory, which must produce the `labinius-fast` executable. Scores from different tracks measure different hardware and are not comparable.
 
 ## Scoring
 
@@ -48,13 +48,13 @@ The lower bound comes from the challenge's module-BKZ security estimate. The ver
 
 **You are explicitly allowed to change the commitment modulus `Q` as part of your optimization.** The baseline prover's default `Q` is not fixed by the challenge. You may choose any integer `Q` within the bounds above that satisfies the trusted verifier's acceptance checks, including a power of two. The verifier does not require `Q` to be prime or have a particular factorization.
 
-You may modify the modulus selection, arithmetic, and serialization implementation under your track's `solution/<track>` directory to support your chosen `Q`. The baseline prover's use of products of supported primes is an implementation choice you may replace, not a challenge restriction. The resulting proof must retain the verifier's required format, carry the chosen `Q`, and pass the unchanged trusted verifier.
+You may modify the modulus selection, arithmetic, and serialization implementation under your track's editable directory to support your chosen `Q`. The baseline prover's use of products of supported primes is an implementation choice you may replace, not a challenge restriction. The resulting proof must retain the verifier's required format, carry the chosen `Q`, and pass the unchanged trusted verifier.
 
 The commitment modulus `Q` is separate from the GHASH field polynomial. Changing `Q` does not change the input field, table size, or opening being checked.
 
 ## What you may change
 
-Only your track's directory is editable: `solution/x86` for the `x86` track, `solution/arm` for the `arm` track, each including its vendored Labinius crates. The other track's directory is read-only to you. You may improve algorithms, arithmetic, memory layout, allocation, vectorization, threading, and serialization, provided every output remains compatible with the trusted verifier.
+Only your track's directory is editable: `solution` for the `x86` track, `solution-arm` for the `arm` track, each including its vendored Labinius crates. The other track's directory is read-only to you. You may improve algorithms, arithmetic, memory layout, allocation, vectorization, threading, and serialization, provided every output remains compatible with the trusted verifier.
 
 The trusted harness and verifier are checked out separately from the submission. Changes to `verifier/`, `.yukon/`, `.github/`, or `benchmark.json` are not solver changes and must not be used to make a candidate pass. Do not change the instance shape, weaken verification, alter the score calculation, or rely on proofs cached from earlier instances.
 
@@ -64,7 +64,7 @@ Contestant builds and prover execution are sandboxed. Dependency fetching is a s
 
 Official `x86` measurements require an **Intel Xeon Platinum 8488C**, **eight available CPUs**, and **AVX-512**. Official `arm` measurements run on an **AWS Graviton4** (Neoverse V2 with SVE2) with **eight vCPUs** (Ubuntu 24.04); its proofs are then checked on x86 by the same pinned verifier as the `x86` track. Binaries are compiled with `-C target-cpu=native`. Measurements on different CPUs or with different CPU availability are useful for development but are not equivalent official results.
 
-The runner environment supplies Rust/Cargo, GCC 13, bubblewrap, Python 3, OpenSSL, and standard Linux tools. The protected setup scripts define the toolchain locations and sandbox requirements. `yukon setup` needs Ubuntu 24.04 on a host matching the track: x86-64 with AVX-512 for `x86`, aarch64 for `arm`. An Apple Silicon Mac cannot run `yukon setup`, but it can build, prove, and verify the `arm` track outside the sandbox with `.yukon/run-prover.sh --track arm --runs 5`. That loop verifies with a development build of the verifier linked against `solution/arm/labinius`. It is useful for development but is not an official measurement.
+The runner environment supplies Rust/Cargo, GCC 13, bubblewrap, Python 3, OpenSSL, and standard Linux tools. The protected setup scripts define the toolchain locations and sandbox requirements. `yukon setup` needs Ubuntu 24.04 on a host matching the track: x86-64 with AVX-512 for `x86`, aarch64 for `arm`. An Apple Silicon Mac cannot run `yukon setup`, but it can build, prove, and verify the `arm` track outside the sandbox with `.yukon/run-prover.sh --track arm --runs 5`. That loop verifies with a development build of the verifier linked against `solution-arm/labinius`. It is useful for development but is not an official measurement.
 
 Use the installation and authentication instructions from the challenge's **Participate** dialog. With Yukon installed:
 
@@ -83,7 +83,7 @@ yukon run --track <x86|arm>
 yukon submissions --all
 ```
 
-This challenge's schema-v2 manifest declares both tracks on one shared branch, with the non-overlapping editable paths `solution/x86` and `solution/arm`. Pass `--track` to `yukon setup`, `yukon run`, and `yukon submit`; `yukon submit --track <track>` archives only that track's directory. `yukon switch <track>` changes only Yukon's local track selection: it does not check out a branch or change your `HEAD`, index, or worktree, so your local branches and uncommitted work stay in place. Switch before editing the other track so traces and commands without `--track` use the right one. Each track writes its own score file, `.yukon/labinius-fast-<track>-score.json`. Use a supported runner environment. If local setup reports missing trusted-checkout paths or sandbox prerequisites, resolve the environment rather than editing the protected scripts or disabling isolation.
+This challenge's schema-v2 manifest declares both tracks on one shared branch, with the non-overlapping editable paths `solution` and `solution-arm`. Pass `--track` to `yukon setup`, `yukon run`, and `yukon submit`; `yukon submit --track <track>` archives only that track's directory. `yukon switch <track>` changes only Yukon's local track selection: it does not check out a branch or change your `HEAD`, index, or worktree, so your local branches and uncommitted work stay in place. Switch before editing the other track so traces and commands without `--track` use the right one. The x86 track retains `.yukon/labinius-fast-score.json`; ARM writes `.yukon/labinius-fast-arm-score.json`. The harness commands default to x86 when `--track` is omitted, preserving existing standalone x86 checkouts. Use a supported runner environment. If local setup reports missing trusted-checkout paths or sandbox prerequisites, resolve the environment rather than editing the protected scripts or disabling isolation.
 
 The upcoming harness defines how the prover receives the input file and where it writes its proof. Read the checked-out `.yukon/run-prover.sh` and prover argument parser for the exact interface; do not assume an older seed-only invocation still applies.
 
@@ -92,28 +92,29 @@ The upcoming harness defines how the prover receives the input file and where it
 | Path | Purpose |
 | --- | --- |
 | `benchmark.json` | Schema-v2 manifest: both tracks' editable paths, commands, score paths, and workflows. |
-| `solution/x86/proof_generate/` | `x86` prover crate producing the `labinius-fast` executable. |
-| `solution/x86/proof_generate/src/parameters.rs` | `x86` baseline prover's instance constants and default modulus. |
-| `solution/x86/proof_generate/src/modulus_choice.rs` | Moduli supported by the `x86` baseline prover. |
-| `solution/x86/labinius/` | `x86` track's editable vendored implementation (AVX-512). |
-| `solution/arm/proof_generate/` | `arm` prover crate producing the `labinius-fast` executable. |
-| `solution/arm/labinius/` | `arm` track's editable vendored implementation, with portable intrinsics in `crates/pcs/src/arch/`. |
+| `solution/proof_generate/` | `x86` prover crate producing the `labinius-fast` executable. |
+| `solution/proof_generate/src/parameters.rs` | `x86` baseline prover's instance constants and default modulus. |
+| `solution/proof_generate/src/modulus_choice.rs` | Moduli supported by the `x86` baseline prover. |
+| `solution/labinius/` | `x86` track's editable vendored implementation (AVX-512). |
+| `solution-arm/proof_generate/` | `arm` prover crate producing the `labinius-fast` executable. |
+| `solution-arm/labinius/` | `arm` track's editable vendored implementation, with portable intrinsics in `crates/pcs/src/arch/`. |
 | `verifier/proof_verify/` | Trusted verifier and independent commitment-ring arithmetic. |
 | `verifier/labinius/` | Pinned verifier dependency (x86-64 only). Both tracks' proofs are verified with it on x86. |
 | `verifier/table_writer/` | Trusted, dependency-light writer of the input table, used on ARM, where the pinned verifier cannot run. |
 | `.yukon/` | Trusted setup, input staging, sandboxing, execution, and scoring. |
 | `.yukon/run-prover.sh` | One sandboxed prover run for the harness; with `--track`, a local build, prove, and verify loop. |
-| `.github/workflows/benchmark-x86.yml` | `x86` track's dispatch workflow: one job that sets up, proves, verifies, and uploads the score. |
-| `.github/workflows/benchmark-arm.yml` | `arm` track's dispatch workflow: proves on ARM, then verifies and scores on x86. |
-| `.github/workflows/test-benchmark.yml` | Pull-request check that runs both track workflows. |
+| `.github/workflows/benchmark.yml` | Existing x86 entrypoint, calling an immutable executor revision. |
+| `.github/workflows/benchmark-x86.yml` | x86 executor: sets up, proves, verifies, and uploads the score. |
+| `.github/workflows/dispatch-arm.yml` | ARM entrypoint, calling an immutable executor revision. |
+| `.github/workflows/benchmark-arm.yml` | ARM executor: proves on ARM, then verifies and scores on x86. |
+| `.github/tests/test_benchmark_workflows.py` | Regression checks for the dispatchers, executors, and legacy x86 contract. |
 
-Each track has one self-contained workflow, named by its manifest `runner.workflow`.
-Yukon dispatches it without inputs. Each job runs the trusted harness from its own checkout of
-the dispatched commit and benchmarks the solution from a separate checkout. That checkout uses
-the same commit by default, or the optional `solution_repository`/`solution_ref` inputs.
-The pull-request check calls both workflows the same way, without inputs, so a pull request
-is benchmarked exactly as a submission would be. Concurrency keys are prefixed with
-the track, so a pull request's two calls do not cancel each other.
+Each track has an entrypoint named by its manifest `runner.workflow`: `benchmark.yml`
+for x86 and `dispatch-arm.yml` for ARM. Yukon dispatches these without inputs. Each calls
+an executor at an immutable commit. The executor checks out its trusted harness using
+`job.workflow_repository` and `job.workflow_sha`, and checks out the submitted solution
+separately at the dispatched commit. Only the selected editable directory is staged.
+The older `dispatch-x86.yml` entrypoint remains available as an alias.
 
 The `x86` workflow runs on the admission-controlled runner group
 `labinius-intel-8488c-avx512-c7i`. The `arm` workflow's proving job runs on the
@@ -129,7 +130,7 @@ which keeps the run within Yukon's artifact size limit.
 
 1. Record the track, checkout revision, benchmark version, hardware, current promoted frontier, and baseline five-run result.
 2. Read the prover, verifier, and harness. Distinguish implementation choices from verifier requirements.
-3. Form a specific performance hypothesis and make a focused change under `solution/<track>`.
+3. Form a specific performance hypothesis and make a focused change under the selected editable directory.
 4. Run relevant implementation tests, then `yukon run --track <track>` in the supported environment. Confirm all five proofs are accepted.
 5. Compare medians under identical conditions. Repeat measurements when the gain is small relative to run-to-run variation.
 6. Record the change, commands, all five times, median, proof sizes, modulus, and any limitations.

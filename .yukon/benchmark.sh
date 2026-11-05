@@ -3,7 +3,8 @@
 # Trusted benchmark orchestration. The score is the median of five sequential
 # runs, published only when every run passes verification and the proof-size limit.
 #
-# usage: benchmark.sh --track x86|arm [--prove-only DIR | --verify-only DIR]
+# usage: benchmark.sh [--track x86|arm] [--prove-only DIR | --verify-only DIR]
+# No track flag selects the original x86 contract.
 #
 # By default this proves and verifies on one host. The arm track's CI splits the two: the ARM
 # job runs `--prove-only DIR`, which leaves each run's seed, timing, and proof in DIR together
@@ -31,17 +32,18 @@ while [[ "$#" -gt 0 ]]; do
       shift 2
       ;;
     *)
-      echo "usage: benchmark.sh --track x86|arm [--prove-only DIR | --verify-only DIR]" >&2
+      echo "usage: benchmark.sh [--track x86|arm] [--prove-only DIR | --verify-only DIR]" >&2
       exit 2
       ;;
   esac
 done
 export LABINIUS_TRACK
 track=$(labinius_track)
+score_file=$(labinius_score_file)
 
 # Recover the successful local build when no CI workspace was supplied.
 if [[ -z "${RUNNER_TEMP:-}" && -z "${GITHUB_ACTIONS:-}" ]]; then
-  rm -f "$script_dir/labinius-fast-$track-score.json"
+  rm -f "$script_dir/$score_file"
   state="$script_dir/local-workspace-$track"
   if [[ ! -f "$state" || -L "$state" ]]; then
     echo "Run yukon setup --track $track first." >&2
@@ -68,7 +70,7 @@ contestant="${CONTESTANT_DIR:-$RUNNER_TEMP/labinius-contestant}"
 require_runner_temp_path "$trusted"
 require_runner_temp_path "$contestant"
 
-score="$script_dir/labinius-fast-$track-score.json"
+score="$script_dir/$score_file"
 staged="$script_dir/labinius-fast-$track-score.tmp"
 checked_json="$script_dir/labinius-fast-$track-runs.tmp"
 rm -f "$score" "$staged" "$checked_json"
@@ -97,7 +99,7 @@ prove_runs() {
     echo "bubblewrap (bwrap) is required to run the untrusted prover" >&2
     return 1
   }
-  prover="$contestant/solution/$track/proof_generate/target/release/labinius-fast"
+  prover="$contestant/solution/proof_generate/target/release/labinius-fast"
   if [[ ! -f "$prover" || -L "$prover" ]]; then
     echo "missing regular contestant prover binary" >&2
     return 1

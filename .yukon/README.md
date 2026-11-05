@@ -1,5 +1,41 @@
 # Dedicated runner security boundary
 
+## Compatible x86 conversion
+
+The x86 track preserves the standalone execution contract: `solution/`, no-flag
+`setup.sh` and `benchmark.sh`, `.yukon/labinius-fast-score.json`, and the
+`benchmark.yml` entrypoint. ARM lives in the sibling `solution-arm/` directory.
+Yukon's in-place conversion (#1348) can therefore keep the x86 board ID and
+history without rewriting submission archives.
+
+Executor publication is a separate requirement. Commit the harness/executor
+changes first, then pin `benchmark.yml`, `dispatch-x86.yml`, and `dispatch-arm.yml`
+to that exact commit. Publish the referenced commit without squashing it away.
+The runner-group owners must admit the new immutable executor references in both
+groups before either dispatcher can use them. Retain the previous admission
+entries while existing runs still need them. A passing local test does not prove
+GitHub dispatch or runner admission.
+
+Before production conversion, exercise the transition on dev with a standalone
+x86 board, representative historical x86 submissions, and an ARM import. Confirm
+that both workflows complete all five runs, verify every proof, and that Yukon
+ingests the resulting scores. Recheck the current production x86 solution before
+merging so a newer promotion is not overwritten. Pause production intake and
+drain jobs before merging and converting; verify both tracks before reopening.
+
+Local regression checks (Python 3 with PyYAML, Bash 4.3 or newer on `PATH`):
+
+```bash
+python3 -m unittest discover -s .github/tests -v
+python3 -m unittest discover -s .yukon/tests -v
+```
+
+The track compatibility tests use a stub verifier and capture sandbox arguments.
+They test path selection, score publication, and failure cleanup; they do not
+replace the Linux sandbox smoke tests or real proof verification.
+
+## Runner admission and isolation
+
 The benchmark job targets organization runner group
 `labinius-intel-8488c-avx512-c7i` and compatibility label
 `labinius-avx512-c7i`. The group is an external admission boundary:
@@ -24,13 +60,13 @@ writes only the proof files. The `verify` job runs on an x86 Blacksmith runner w
 `benchmark.sh --verify-only`. It then writes the score from the ARM host's description and
 deletes the proof artifact, which needs `actions: write`.
 
-Every job checks out its trusted harness and verifier at the dispatched commit
-(`github.sha`) and runs only that checkout's scripts. Yukon admits submissions that change
+Every job checks out its trusted harness and verifier at the immutable executor commit
+(`job.workflow_sha` in `job.workflow_repository`) and runs only that checkout's scripts. Yukon admits submissions that change
 only the track's editable path, so that harness is the benchmark's own. The solution
 repository and immutable commit are checked out separately: the optional
 `solution_repository`/`solution_ref` inputs, defaulting to the dispatched commit.
 The `arm` verify job never checks out the solution. Only regular files and real
-directories beneath `solution/` are copied into disposable runner state;
+directories beneath the selected `solution/` or `solution-arm/` are copied into disposable runner state at `solution/`;
 symlinks, special files, `.git` control data, and path escapes are rejected. No
 workflow or Yukon script from the solution checkout is executed.
 
@@ -51,7 +87,7 @@ directory, and a read-only mount of the witness table at
 
 The leaderboard score is the median prover-process time, in milliseconds, across five sequential runs. Each run draws a fresh 32-byte seed. Before the timer starts, the trusted verifier writes that seed's witness table with `--write-table`. On `arm`, `labinius-table-writer` writes the same bytes. The timed interval then covers prover startup, loading of that file, and the rest of the prover process. Table generation and trusted verification stay outside the timer.
 
-A score file is written only when every run exits successfully, the proof is a regular file of at most 64 MiB, and the trusted verifier accepts the proof for that run's seed. Verification rebuilds the table from the seed with `trace` and does not read the file given to the prover. A failed run leaves the track's score file, `.yukon/labinius-fast-<track>-score.json`, unpublished.
+A score file is written only when every run exits successfully, the proof is a regular file of at most 64 MiB, and the trusted verifier accepts the proof for that run's seed. Verification rebuilds the table from the seed with `trace` and does not read the file given to the prover. A failed run leaves the score unpublished: `.yukon/labinius-fast-score.json` for x86, `.yukon/labinius-fast-arm-score.json` for ARM.
 
 `score` and `metrics.provingTimeMs` are that median. `metrics.proofBytes` is the proof size of the selected run. Runs are ordered by proving time and then by earlier execution index, and the middle position of that order is the selected run. `runs` lists the five executions in order, each with `run`, `provingTimeMs`, and `proofBytes`. The other `metrics` fields keep their previous meaning and come from the selected run's verifier output plus the host description.
 
@@ -105,7 +141,7 @@ CONTESTANT_DIR=$RUNNER_TEMP/labinius-contestant
 CONTESTANT_CARGO_HOME=$RUNNER_TEMP/labinius-contestant-cargo
 bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track x86
 bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track x86
-test -s "$TRUSTED_CHECKOUT/.yukon/labinius-fast-x86-score.json"
+test -s "$TRUSTED_CHECKOUT/.yukon/labinius-fast-score.json"
 rm -rf "$RUNNER_TEMP"
 ```
 
