@@ -1,15 +1,9 @@
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
-//! The default commitment modulus is 3889 * 9721 * 1024. Two witness NTTs feed
-//! ordinary residues and an exact auxiliary computation of the 1024 residue.
-//! Public matrix images and reconstruction bounds are computed at build time
-//! from the fixed matrix seed and modulus. Other supported prime products use
-//! the generic RNS implementation.
-//!
-//! The timed process reads the fresh table in place, commits without retaining
-//! witness transforms, runs the eighth-table field switch, computes the exact
-//! integer fold, and writes the checker-compatible proof. Transcript challenges
-//! are derived using the chosen modulus and the resulting commitment.
+//! The default integer modulus is9721*55*2^16. One witness NTT supplies
+//! the base residue and six auxiliary public coefficient banks. Exact public
+//! moments certify128-pair chunks. The prover consumes the fresh table, runs
+//! the GHASH-to-F162 switch and opening, and writes the unchanged proof format.
 use bincode::Options;
 use labinius::challenge::{
     sample_short_challenges_parallel, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT,
@@ -1034,10 +1028,10 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     }
 }
 
-/// The single-transform commitment's columns as coefficients modulo `9721 * 2^22`: `rows[2c]` is
-/// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo `2^22`. The
+/// The single-transform commitment's columns as coefficients modulo the selected integer modulus: `rows[2c]` is
+/// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo TAIL_MODULUS. The
 /// first goes through the inverse transform 32 columns at a time; each coefficient is then
-/// `t + 2^22 ((r - t) 2^-22 mod 9721)`, packed into its 5 wire bytes.
+/// `t + M*((r-t)*M^-1 mod9721)`, packed into its 5 wire bytes.
 fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffer: Option<Vec<u8>>) -> Vec<u8> {
     use labinius::simd::commit::sms;
     assert_eq!(rows.len(), 2 * columns);
@@ -1078,7 +1072,7 @@ fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffe
                     let r = (residues[i] as i64).rem_euclid(p as i64) as u64;
                     let t = rows[2 * (c0 + i / N) + 1][i % N] as u64;
                     let k = ((r + p - t % p) * inv) % p;
-                    let value = t + (k << sms::TAIL_BITS);
+                    let value = t + k*sms::TAIL_MODULUS as u64;
                     word.copy_from_slice(&value.to_le_bytes()[..5]);
                 }
             }
@@ -1089,8 +1083,8 @@ fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffe
 
 /// [`commitment_bytes_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
 /// `r` brought into `[0, 9721)`, `d = r - t mod 9721` in `[0, 9721)` (the `t mod 9721` and the
-/// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 2^25`
-/// as in [`lift_hybrid_column`]), `value = t + 2^22 (d 2^-22 mod 9721)`, packed into 5-byte words.
+/// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 9721^2`
+/// as in [`lift_hybrid_column`]), `value=t+M*(d*M^-1 mod9721)`, packed into 5-byte words.
 ///
 /// # Safety
 /// AVX-512 F, BW and VBMI; `r` must hold `N` centered residues and `out` be `5 N` bytes.
@@ -1102,6 +1096,7 @@ unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
     assert!(r.len() == N && out.len() == 5 * N && N % 8 == 0);
     let q = _mm512_set1_epi64(sms::P as i64);
     let inv = _mm512_set1_epi64(sms::inv_tail() as i64);
+    const _:()=assert!(((3_619_418_999u64*9721-(1u64<<45))*9720*9720)<(1u64<<45));
     let magic = _mm512_set1_epi64(3_619_418_999);
     let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
     let keep: __mmask64 = (1u64 << 40) - 1;
@@ -1116,7 +1111,7 @@ unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
         let d = _mm512_sub_epi64(a, modq(t));
         let d = _mm512_add_epi64(d, _mm512_and_si512(_mm512_srai_epi64::<63>(d), q));
         let k = modq(_mm512_mul_epu32(d, inv));
-        let value = _mm512_add_epi64(t, _mm512_slli_epi64::<22>(k));
+        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k,_mm512_set1_epi64(sms::TAIL_MODULUS as i64)));
         _mm512_mask_storeu_epi8(out.as_mut_ptr().add(40 * j) as *mut i8, keep, _mm512_permutexvar_epi8(pick, value));
     }
 }
@@ -1801,20 +1796,29 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
-        load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
-        (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
-        (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
-        (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
-        (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
-        encode_time.as_micros(), workers,
-        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
-        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
+    if profiling() {
+        let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
+            load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
+            (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
+            (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
+            (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
+            (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
+            encode_time.as_micros(), workers,
+            labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
+            labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
+    }
     proof
 }
 
 /// The run's `labinius-profile` line, written with the others at the end: stderr is unbuffered,
 /// and a formatted line goes out as one `write` per piece.
+/// Optional diagnostics are enabled for tests or an explicit developer opt-in.
+#[inline]
+fn profiling() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| cfg!(test) || std::env::var_os("LABINIUS_PROFILE").is_some())
+}
+
 static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// CLOCK_MONOTONIC in nanoseconds: the clock an outside timer (Python's perf_counter on Linux)
@@ -1878,17 +1882,19 @@ fn main() {
     let prove_return = output_clock.elapsed();
     output.write(proof);
     let write_time = output_clock.elapsed() - prove_return;
-    let report = format!(
-        "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
-        PROFILE.get().map_or("", |p| p.as_str()),
-        prove_return.as_micros(),
-        write_time.as_micros(),
-        main_ns,
-        monotonic_ns()
-    );
-    {
-        use std::io::Write;
-        let _ = std::io::stderr().write_all(report.as_bytes());
+    if profiling() {
+        let report = format!(
+            "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
+            PROFILE.get().map_or("", |p| p.as_str()),
+            prove_return.as_micros(),
+            write_time.as_micros(),
+            main_ns,
+            monotonic_ns()
+        );
+        {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(report.as_bytes());
+        }
     }
     // The proof is on disk; nothing the destructors would do is observable.
     std::process::exit(0);
@@ -2142,7 +2148,7 @@ mod tests {
 
     /// The vectorised hybrid lift is the scalar one, word for word.
     /// The single-transform modulus's vector lift against the scalar formula, on random
-    /// residues and tails, and the result is the unique value modulo `9721 * 2^22` with both.
+    /// residues and tails, and the result is the unique value modulo `9721*TAIL_MODULUS` with both.
     #[test]
     fn wide_sms_lift_is_the_scalar_lift() {
         use labinius::simd::commit::sms;
@@ -2158,7 +2164,7 @@ mod tests {
         };
         for _ in 0..64 {
             let r: Vec<i16> = (0..N).map(|_| (next() % sms::P as u64) as i16 - (sms::P / 2) as i16).collect();
-            let tail: [u32; N] = core::array::from_fn(|_| (next() as u32) & ((1 << sms::TAIL_BITS) - 1));
+            let tail: [u32; N] = core::array::from_fn(|_| (next()%sms::TAIL_MODULUS as u64)as u32);
             let mut out = vec![0u8; 5 * N];
             unsafe { lift_sms_column(&r, &tail, &mut out) };
             for i in 0..N {
@@ -2166,7 +2172,7 @@ mod tests {
                 b[..5].copy_from_slice(&out[5 * i..5 * i + 5]);
                 let v = u64::from_le_bytes(b);
                 assert!((v as u128) < sms::MODULUS);
-                assert_eq!(v % (1 << sms::TAIL_BITS), tail[i] as u64);
+                assert_eq!(v % sms::TAIL_MODULUS as u64, tail[i] as u64);
                 assert_eq!((v % sms::P as u64) as i64, (r[i] as i64).rem_euclid(sms::P as i64));
             }
         }
