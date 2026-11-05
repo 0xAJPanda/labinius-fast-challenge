@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -58,7 +59,7 @@ class BenchmarkTimingTest(unittest.TestCase):
         self.assertEqual(caught.exception.returncode, 23)
         self.assertEqual(self.output.getvalue(), "")
 
-    def test_deadline_kills_child_and_does_not_publish_a_time(self):
+    def run_with_short_deadline(self, prover):
         original_run = subprocess.run
 
         def shortened_deadline(command, **kwargs):
@@ -71,18 +72,41 @@ class BenchmarkTimingTest(unittest.TestCase):
 
         with mock.patch.object(subprocess, "run", shortened_deadline):
             with self.assertRaises(subprocess.CalledProcessError) as caught:
-                self.run_timer('echo $$ > "$2/pid"\nexec /bin/sleep 5\n')
+                self.run_timer(prover)
         self.assertIn(caught.exception.returncode, (-signal.SIGKILL, 137))
         self.assertEqual(self.output.getvalue(), "")
-        pid = int((self.root / "pid").read_text())
-        # Killed children may briefly await reaping by init.
+
+    def assert_process_stopped(self, pid_file):
+        pid = int((self.root / pid_file).read_text())
         status = Path(f"/proc/{pid}/stat")
-        try:
-            state = status.read_text().split(") ", 1)[1][0]
-        except FileNotFoundError:
-            pass
-        else:
-            self.assertEqual(state, "Z")
+        # timeout can return before a signalled child finishes exiting. A zombie
+        # has stopped executing and may briefly await reaping by init.
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            try:
+                state = status.read_text().split(") ", 1)[1][0]
+            except FileNotFoundError:
+                return
+            if state == "Z":
+                return
+            time.sleep(0.01)
+        self.fail(f"timed-out process {pid} is still running")
+
+    def test_deadline_kills_child_and_does_not_publish_a_time(self):
+        self.run_with_short_deadline(
+            'echo $$ > "$2/pid"\nexec /bin/sleep 5\n'
+        )
+        self.assert_process_stopped("pid")
+
+    def test_deadline_kills_child_and_its_descendant(self):
+        self.run_with_short_deadline(
+            'echo $$ > "$2/pid"\n'
+            '/bin/sleep 5 &\n'
+            'echo $! > "$2/descendant-pid"\n'
+            'wait\n'
+        )
+        self.assert_process_stopped("pid")
+        self.assert_process_stopped("descendant-pid")
 
 
 if __name__ == "__main__":
