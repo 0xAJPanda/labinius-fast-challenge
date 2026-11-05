@@ -205,7 +205,7 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         prove, verify = workflow["jobs"]["prove"], workflow["jobs"]["verify"]
         self.assertEqual(
             prove["runs-on"],
-            {"group": "labinius-graviton4-neoverse-v2-sve2-c8g", "labels": ["ARM64", "sve2"]},
+            {"group": "labinius-prod-graviton4-neoverse-v2-sve2-c8g", "labels": ["ARM64", "sve2"]},
         )
         self.assertIn(
             "/usr/local/bin/validate-graviton4-cpu",
