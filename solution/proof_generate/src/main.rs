@@ -1,10 +1,9 @@
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
-//! The default commitment modulus is 3889 * 9721 * 1024. Two witness NTTs feed
-//! ordinary residues and an exact auxiliary computation of the 1024 residue.
-//! Public matrix images and reconstruction bounds are computed at build time
-//! from the fixed matrix seed and modulus. Other supported prime products use
-//! the generic RNS implementation.
+//! The default modulus is 9721 * 2^22. One witness NTT supplies the base residue
+//! and five paired norm-463 auxiliary streams. Public matrix images and exact
+//! reconstruction second moments are computed at build time, independently of
+//! every fresh table. Other supported prime products use the generic RNS path.
 //!
 //! The timed process reads the fresh table in place, commits without retaining
 //! witness transforms, runs the eighth-table field switch, computes the exact
