@@ -1315,28 +1315,25 @@ pub unsafe fn ntt_bin_batch32_multi_sink<const Q: u16, const H: usize, S: MultiB
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn tail27_out_of_line<const Q: u16>(bp: *const i16, op: *mut i16, t4: *const u32, t5: *const u32, t6: *const u32, cv: *const i16) {
-    if needs_barrett(Q) {
-        tail27_b(bp, op, t4, t5, t6, cv);
+    if Q == 9721 {
+        tail27_mem_b(bp, op, t4, t5, t6, cv);
     } else {
         tail27_p(bp, op, t4, t5, t6, cv);
     }
 }
 
-/// Consumer of `H` lockstep transforms that takes each finished 27-block in row slices, so that
-/// [`ntt_bin_batch32_pipelined`] can interleave a multiply-port-bound consumer with the next
-/// block's transform instead of running the two back to back.
+/// Consumer of the completed row slices of `H` lockstep binary transforms.
 pub trait SliceSink<const H: usize> {
     /// Rows `r0..r1` (of 27) of block `blk`, whose `H` transforms are stored at `w`.
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; H], r0: usize, r1: usize);
 }
 
-/// [`ntt_bin_batch32_multi_sink`] software-pipelined: block `kk`'s `H` tails are followed each by
-/// one of `H` row slices of block `kk - 1` (and the lookup stage of a quarter by the slices of the
-/// previous quarter's last block), so the out-of-order window always holds transform work for
-/// the vector ALU ports beside the consumer's. `wbuf` holds `2 H` 27-vector blocks (64-byte
-/// aligned); the transforms are exactly [`ntt_bin_batch32`]'s.
+/// Transform a quarter of all `H` inputs, then consume its six completed 27-row blocks.
+/// Batching callbacks amortizes the accumulator call boundary and its row-loop setup.
+/// `wbuf` holds `6 H` 27-vector blocks, each aligned to 64 bytes. Every callback receives
+/// rows `0..27`; the transforms and their output representatives match [`ntt_bin_batch32`].
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSink<H>>(
+pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink<H>>(
     ins: [&BinaryIndex32; H],
     wbuf: *mut i16,
     sink: &mut S,
@@ -1350,11 +1347,8 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
     let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
     let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
     let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk & 1) + h))) };
-    let slice = |h: usize| -> (usize, usize) { (27 * h / H, 27 * (h + 1) / H) };
+    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
-    // The block whose consumption is still due.
-    let mut pend: Option<usize> = None;
 
     for k in 0..4 {
         let lut = t.lut.as_ptr().add(12 * k) as *const u8;
@@ -1401,35 +1395,30 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
                 st(bp, i + 108, v0);
                 st(bp, i + 135, v1);
             }
-            if let Some(p) = pend {
-                let (r0, r1) = slice(h);
-                sink.rows(p, ro(buf(p)), r0, r1);
-            }
         }
-        pend = None;
         let cv = t.cv.as_ptr() as *const i16;
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
             let os = buf(kk);
-            let (t4, t5, t6) = (
+            let (t4, t5, t6) = if Q == 9721 {
+                (SMS_TWIDDLES.t4.as_ptr().add(4 * kk).cast::<u32>(),
+                 SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
+                 SMS_TWIDDLES.t6.as_ptr().add(36 * kk).cast::<u32>())
+            } else { (
                 t.tw4.as_ptr().add(kk).cast::<u32>(),
                 t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
                 t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
-            );
+            ) };
             for h in 0..core::hint::black_box(H) {
                 let bpj = bps[h].add(32 * 27 * j);
                 tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
-                if let Some(p) = pend {
-                    let (r0, r1) = slice(h);
-                    sink.rows(p, ro(buf(p)), r0, r1);
-                }
             }
-            pend = Some(kk);
         }
-    }
-    if let Some(p) = pend {
-        sink.rows(p, ro(buf(p)), 0, 27);
+        for j in 0..6 {
+            let kk = 6 * k + j;
+            sink.rows(kk, ro(buf(kk)), 0, 27);
+        }
     }
 }
 
@@ -1560,3 +1549,5 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         }
     }
 }
+
+include!("twiddle_expanded.rs");
