@@ -36,7 +36,7 @@ jobs:
     # The organization runner group is a separate admission boundary and must
     # allow this workflow.
     runs-on:
-      group: labinius-graviton4-neoverse-v2-sve2-c8g
+      group: labinius-prod-graviton4-neoverse-v2-sve2-c8g
       labels: [ARM64, sve2]
     # Five sequential runs share the previous per-run 15 minute prover cap.
     timeout-minutes: 120

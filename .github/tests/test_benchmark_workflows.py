@@ -25,7 +25,7 @@ PINNED_WORKFLOWS = {
     ),
     "arm": (
         "Layr-Labs/labinius-fast-challenge",
-        "2cafc0d1250dcc0e895651c59646349fd8d3e4a8",
+        "2a5364133ce0a446a3764dda26fb521217a41e5c",
     ),
 }
 
@@ -205,7 +205,7 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         prove, verify = workflow["jobs"]["prove"], workflow["jobs"]["verify"]
         self.assertEqual(
             prove["runs-on"],
-            {"group": "labinius-graviton4-neoverse-v2-sve2-c8g", "labels": ["ARM64", "sve2"]},
+            {"group": "labinius-prod-graviton4-neoverse-v2-sve2-c8g", "labels": ["ARM64", "sve2"]},
         )
         self.assertIn(
             "/usr/local/bin/validate-graviton4-cpu",
