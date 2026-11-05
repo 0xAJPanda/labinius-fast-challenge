@@ -16,12 +16,14 @@ groups before either dispatcher can use them. Retain the previous admission
 entries while existing runs still need them. A passing local test does not prove
 GitHub dispatch or runner admission.
 
-Before production conversion, exercise the transition on dev with a standalone
-x86 board, representative historical x86 submissions, and an ARM import. Confirm
-that both workflows complete all five runs, verify every proof, and that Yukon
-ingests the resulting scores. Recheck the current production x86 solution before
-merging so a newer promotion is not overwritten. Pause production intake and
-drain jobs before merging and converting; verify both tracks before reopening.
+Validate each new executor with a GitHub Actions run that completes all five
+proofs and publishes its score. This does not require a Yukon DEV board.
+Conversion and historical-submission preservation can be tested separately with
+an isolated standalone x86 fixture; an existing multitrack DEV board does not
+exercise standalone conversion. Live Yukon score ingestion requires its own
+end-to-end check. Recheck the current production x86 solution before merging so
+a newer promotion is not overwritten. Pause production intake and drain jobs
+before merging and converting; verify both tracks before reopening.
 
 Local regression checks (Python 3 with PyYAML, Bash 4.3 or newer on `PATH`):
 
@@ -29,6 +31,11 @@ Local regression checks (Python 3 with PyYAML, Bash 4.3 or newer on `PATH`):
 python3 -m unittest discover -s .github/tests -v
 python3 -m unittest discover -s .yukon/tests -v
 ```
+
+Both tracks use the timer fixed in PR #260: GNU `timeout` enforces the 900-second
+SIGKILL deadline while Python waits directly for process exit, avoiding its
+timeout polling. The timing tests require Linux with `/usr/bin/timeout` and run
+in `benchmark-regressions.yml` alongside scoring, track, and workflow checks.
 
 The track compatibility tests use a stub verifier and capture sandbox arguments.
 They test path selection, score publication, and failure cleanup; they do not
@@ -45,7 +52,7 @@ Repository labels alone do not prevent another workflow from requesting a
 self-hosted runner.
 
 The `arm` track's workflow, `benchmark-arm.yml`, has two jobs. The `prove` job
-targets the admission-controlled group `labinius-graviton4-neoverse-v2-sve2-c8g` (labels
+targets the production group `labinius-prod-graviton4-neoverse-v2-sve2-c8g` (group 28; labels
 `ARM64`, `sve2`). That group's restriction must admit the `arm` workflow. The image ships the same
 toolchain paths, `gcc-13`, and bubblewrap as the x86 host, and the job checks
 the CPU with `/usr/local/bin/validate-graviton4-cpu`. The pinned `verifier/labinius` builds only on

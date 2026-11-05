@@ -55,11 +55,12 @@ class BenchmarkWorkflowTest(unittest.TestCase):
         with (ROOT / "benchmark.json").open(encoding="utf-8") as manifest_file:
             self.manifest = json.load(manifest_file)
 
-    def test_only_the_track_workflows_and_dispatchers_exist(self) -> None:
+    def test_only_expected_workflows_exist(self) -> None:
         self.assertEqual(
             sorted(path.name for path in WORKFLOWS.glob("*.yml")),
             [
                 "benchmark-arm.yml",
+                "benchmark-regressions.yml",
                 "benchmark-x86.yml",
                 "benchmark.yml",
                 "dispatch-arm.yml",

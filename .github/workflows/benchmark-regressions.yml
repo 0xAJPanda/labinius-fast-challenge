@@ -1,0 +1,28 @@
+name: Benchmark regressions
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  timing-and-scoring:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout regression tests and harness
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      # These tests exercise this checkout's timer with harmless stand-in
+      # provers; real benchmarks use the separately admitted track executors.
+      - name: Test timing and score publication
+        run: python3 -m unittest discover -s .yukon/tests -v
+
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Test workflow routing and compatibility
+        run: python3 -m unittest discover -s .github/tests -v
