@@ -7,8 +7,8 @@
 
 /// The primes the library has opening arithmetic for.
 pub const HYBRID_MODULUS:u128=3889u128*9721*1024;
-/// The single-transform modulus 9721 * 2^22: one witness NTT modulo 9721 whose nine
-/// accumulation streams give the 9721 residue and, digit by digit, the 2^22 residue
+/// The single-transform modulus 9721*55*2^16: one witness NTT modulo 9721 whose seven
+/// accumulation streams give the 9721 residue and, digit by digit, the 55*2^16 residue
 /// (`labinius::simd::commit::sms`).
 pub const SMS_MODULUS:u128=labinius::simd::commit::sms::MODULUS;
 
