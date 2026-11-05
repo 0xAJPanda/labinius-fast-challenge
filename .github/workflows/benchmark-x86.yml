@@ -105,17 +105,17 @@ jobs:
 
       - name: Setup
         shell: bash
-        run: bash "$TRUSTED_CHECKOUT/.yukon/setup.sh" --track x86
+        run: bash "$TRUSTED_CHECKOUT/.yukon/setup.sh"
 
       - name: Benchmark
         shell: bash
-        run: bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh" --track x86
+        run: bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh"
 
       - name: Upload score
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: benchmark-score-x86
-          path: ${{ github.workspace }}/.trusted-src/.yukon/labinius-fast-x86-score.json
+          path: ${{ github.workspace }}/.trusted-src/.yukon/labinius-fast-score.json
           include-hidden-files: true
           if-no-files-found: error

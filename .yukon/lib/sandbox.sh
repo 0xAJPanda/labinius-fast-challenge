@@ -5,8 +5,8 @@ if [[ -n "${LABINIUS_SANDBOX_SH_LOADED:-}" ]]; then
 fi
 readonly LABINIUS_SANDBOX_SH_LOADED=1
 
-# The solution track: `solution/x86` (the AVX-512 track) or `solution/arm`. The manifest's commands
-# pass `--track`, which sets LABINIUS_TRACK; without either, the host architecture decides.
+# Keep legacy no-flag commands on x86, regardless of the host architecture.
+# ARM must be selected explicitly so an existing x86 checkout never changes tracks silently.
 labinius_parse_track_args() {
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -28,13 +28,31 @@ labinius_parse_track_args() {
 }
 
 labinius_track() {
-  case "${LABINIUS_TRACK:-$(uname -m)}" in
+  case "${LABINIUS_TRACK:-x86}" in
     x86 | x86_64) echo x86 ;;
     arm | aarch64 | arm64) echo arm ;;
     *)
-      echo "unsupported solution track: ${LABINIUS_TRACK:-$(uname -m)}" >&2
+      echo "unsupported solution track: ${LABINIUS_TRACK}" >&2
       return 1
       ;;
+  esac
+}
+
+labinius_solution_path() {
+  local track
+  track=$(labinius_track) || return 1
+  case "$track" in
+    x86) echo solution ;;
+    arm) echo solution-arm ;;
+  esac
+}
+
+labinius_score_file() {
+  local track
+  track=$(labinius_track) || return 1
+  case "$track" in
+    x86) echo labinius-fast-score.json ;;
+    arm) echo labinius-fast-arm-score.json ;;
   esac
 }
 
@@ -129,9 +147,8 @@ run_contestant_build() {
   local cargo_home=$3
   local network_mode=$4
   shift 4
-  local track
-  track=$(labinius_track) || return 1
-  local prover_dir=/workspace/solution/$track/proof_generate
+  # Both tracks are staged separately at this fixed sandbox path.
+  local prover_dir=/workspace/solution/proof_generate
 
   require_runner_temp_path "$solution_root"
   require_runner_temp_path "$target_dir"

@@ -2,14 +2,14 @@
 set -euo pipefail
 umask 077
 
-# usage: setup.sh --track x86|arm [--verifier-only]
+# usage: setup.sh [--track x86|arm] [--verifier-only] (default: x86)
 #
 # Every proof is checked by the pinned verifier, which builds and runs on x86-64 with AVX-512
 # only. The x86 track builds it here next to the contestant prover. On an ARM host the arm track
 # builds the contestant prover and the BLAKE3-only table writer instead; CI then checks its
 # proofs in a separate x86 job, whose setup is `--track arm --verifier-only`. A local arm setup,
 # which has no x86 host to hand proofs to, also builds a development verifier against the
-# portable library in the trusted checkout's solution/arm/labinius.
+# portable library in the trusted checkout's solution-arm/labinius.
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=.yukon/lib/sandbox.sh
@@ -24,11 +24,13 @@ while [[ "$#" -gt 0 ]]; do
       LABINIUS_TRACK=$2
       shift 2
       ;;
-    *) echo "usage: setup.sh --track x86|arm [--verifier-only]" >&2; exit 2 ;;
+    *) echo "usage: setup.sh [--track x86|arm] [--verifier-only]" >&2; exit 2 ;;
   esac
 done
 export LABINIUS_TRACK
 track=$(labinius_track)
+solution_path=$(labinius_solution_path)
+score_file=$(labinius_score_file)
 if $verifier_only; then
   host_arch=x86_64
 else
@@ -42,7 +44,7 @@ fi
 local_setup=false
 if [[ -z "${RUNNER_TEMP:-}" && -z "${GITHUB_ACTIONS:-}" ]]; then
   local_setup=true
-  rm -f "$script_dir/local-workspace-$track" "$script_dir/labinius-fast-$track-score.json"
+  rm -f "$script_dir/local-workspace-$track" "$script_dir/$score_file"
   if [[ $(uname -s) != Linux || $(uname -m) != "$host_arch" ]]; then
     echo "Local setup of the $track track requires Ubuntu 24.04 on $host_arch, not $(uname -s) $(uname -m)." >&2
     exit 1
@@ -135,8 +137,8 @@ if ! $verifier_only; then
     echo "bubblewrap (bwrap) is required to build the untrusted solution" >&2
     exit 1
   }
-  if [[ ! -d "$UNTRUSTED_CHECKOUT/solution" ]]; then
-    echo "untrusted checkout has no solution directory" >&2
+  if [[ ! -d "$UNTRUSTED_CHECKOUT/$solution_path" ]]; then
+    echo "untrusted checkout has no $solution_path directory" >&2
     exit 1
   fi
 fi
@@ -179,7 +181,7 @@ if $build_portable_verifier; then
   # Local development only: the same checker, linked against the trusted checkout's
   # portable port of the library because the pinned one does not build on ARM.
   verifier_src="$RUNNER_TEMP/labinius-trusted-verifier-src"
-  portable_pcs="$TRUSTED_CHECKOUT/solution/arm/labinius/crates/pcs"
+  portable_pcs="$TRUSTED_CHECKOUT/solution-arm/labinius/crates/pcs"
   require_runner_temp_path "$verifier_src"
   if [[ ! -f "$portable_pcs/Cargo.toml" ]]; then
     echo "trusted checkout is missing the portable labinius library" >&2
@@ -206,15 +208,15 @@ chmod 555 "$trusted"
 
 if ! $verifier_only; then
   # Copy data only: reject symlinks, special files, git control data, and paths
-  # that cannot remain beneath solution/. This private RUNNER_TEMP copy is the
-  # contestant's only writable source tree for native build-system outputs.
+  # that cannot remain beneath the selected track. Stage only that track at a
+  # fixed internal path; the sibling track is never mounted into its sandbox.
   python3 "$script_dir/stage-solution.py" \
-    "$UNTRUSTED_CHECKOUT/solution" \
+    "$UNTRUSTED_CHECKOUT/$solution_path" \
     "$contestant/solution"
 
-  prover_dir="$contestant/solution/$track/proof_generate"
+  prover_dir="$contestant/solution/proof_generate"
   if [[ ! -f "$prover_dir/Cargo.toml" || -L "$prover_dir/Cargo.toml" ]]; then
-    echo "solution has no $track track prover at solution/$track/proof_generate" >&2
+    echo "solution has no $track track prover at $solution_path/proof_generate" >&2
     exit 1
   fi
   mkdir -p "$contestant_cargo" "$prover_dir/target"

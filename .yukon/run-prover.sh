@@ -10,9 +10,9 @@ usage() {
 usage: run-prover.sh PROVER WORKDIR SEED SANDBOX_PROOF_PATH TABLE
          One sandboxed prover run, as benchmark.sh invokes it.
        run-prover.sh --track arm|x86 [--runs N] [--modulus Q] [--no-sandbox]
-         Build solution/TRACK/proof_generate and a checker from verifier/proof_verify, then
-         prove and verify N fresh-seed instances (default 1). The track defaults to the host
-         architecture. The prover runs in the bubblewrap sandbox on Linux when bwrap is
+         Build the selected track's proof_generate crate and a checker from verifier/proof_verify,
+         then prove and verify N fresh-seed instances (default 1). The track defaults to x86.
+         The prover runs in the bubblewrap sandbox on Linux when bwrap is
          installed, and directly otherwise. LABINIUS_LOCAL_WORK sets the scratch directory.
 EOF
   exit 2
@@ -37,6 +37,7 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 track=$(LABINIUS_TRACK=$track labinius_track)
+solution_path=$(LABINIUS_TRACK=$track labinius_solution_path)
 [[ "$runs" =~ ^[1-9][0-9]*$ ]] || usage
 if [[ "$track" == x86 && "$(uname -m)" != x86_64 ]]; then
   echo "the x86 track builds AVX-512 kernels and needs an x86-64 host; use --track arm" >&2
@@ -61,15 +62,15 @@ mkdir -p "$work/input" "$work/out"
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
 
-echo "==> building solution/$track/proof_generate" >&2
-prover_dir="$root/solution/$track/proof_generate"
+echo "==> building $solution_path/proof_generate" >&2
+prover_dir="$root/$solution_path/proof_generate"
 (cd "$prover_dir" && CARGO_TARGET_DIR="$prover_dir/target" cargo build --release --locked)
 prover="$prover_dir/target/release/labinius-fast"
 
 # The pinned verifier/labinius only builds on x86-64; the arm track checks against its portable
 # port of the same library.
 if [[ "$track" == arm ]]; then
-  library="$root/solution/arm/labinius/crates/pcs"
+  library="$root/solution-arm/labinius/crates/pcs"
 else
   library="$root/verifier/labinius/crates/pcs"
 fi

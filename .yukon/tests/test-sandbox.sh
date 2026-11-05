@@ -49,11 +49,11 @@ if require_runner_temp_path "$test_root/state-link"; then
   exit 1
 fi
 
-source_root="$test_root/source/solution"
+source_root="$test_root/source/$(labinius_solution_path)"
 staged_root="$test_root/staged/solution"
 track=$(labinius_track)
-source_solution="$source_root/$track"
-staged_solution="$staged_root/$track"
+source_solution="$source_root"
+staged_solution="$staged_root"
 outside="$test_root/outside-secret"
 mkdir -p "$source_solution/proof_generate/src"
 printf 'host secret\n' > "$outside"
