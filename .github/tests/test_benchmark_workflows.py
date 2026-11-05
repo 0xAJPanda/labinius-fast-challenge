@@ -21,11 +21,11 @@ SOLUTION_INPUTS = {"solution_repository", "solution_ref"}
 PINNED_WORKFLOWS = {
     "x86": (
         "Layr-Labs/labinius-fast-challenge",
-        "6ca90ac0fa5e1c6827141a97e2581ae38046a0c3",
+        "2cafc0d1250dcc0e895651c59646349fd8d3e4a8",
     ),
     "arm": (
         "Layr-Labs/labinius-fast-challenge",
-        "6ca90ac0fa5e1c6827141a97e2581ae38046a0c3",
+        "2cafc0d1250dcc0e895651c59646349fd8d3e4a8",
     ),
 }
 
@@ -260,7 +260,7 @@ class BenchmarkWorkflowTest(unittest.TestCase):
             )
             self.assertEqual(upload["with"]["if-no-files-found"], "error")
 
-    def test_dispatchers_pin_reviewed_executors_and_forward_the_solution(self) -> None:
+    def test_dispatchers_pin_immutable_executors_and_forward_the_solution(self) -> None:
         for track in TRACKS:
             dispatcher = self.dispatchers[track]
             self.assertEqual(dispatcher["on"], {"workflow_dispatch": ""})
