@@ -595,6 +595,11 @@ pub fn _mm512_xor_pd(a: __m512d, b: __m512d) -> __m512d {
 /// Bit `i` of the result is bit `(a_i << 2) | (b_i << 1) | c_i` of `IMM8`.
 #[inline(always)]
 fn ternary(imm: i32, a: u64, b: u64, c: u64) -> u64 {
+    match imm & 0xff {
+        0x96 => return a ^ b ^ c,
+        0xEA => return (a & b) | c,
+        _ => {}
+    }
     let mut r = 0;
     for m in 0..8 {
         if (imm >> m) & 1 == 1 {
@@ -890,6 +895,50 @@ pub fn _mm512_cvtepi16_epi32(a: __m256i) -> __m512i {
 
 /// `vgf2p8affineqb`: bit `i` of each result byte is `parity(x & A.byte[7 - i]) ^ B[i]`, with `A`
 /// the 64-bit lane of `a` holding that byte.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn _mm512_gf2p8affine_epi64_epi8<const B: i32>(x: __m512i, a: __m512i) -> __m512i {
+    use core::arch::aarch64::*;
+    const fn select(k: usize) -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut n = 0;
+        while n < 16 {
+            if (n >> k) & 1 == 1 {
+                m[n] = 0xff;
+            }
+            n += 1;
+        }
+        m
+    }
+    const SELECT: [[u8; 16]; 4] = [select(0), select(1), select(2), select(3)];
+    let (xq, aq) = (u64x8(x), u64x8(a));
+    let mut r = [0u64; 8];
+    unsafe {
+        let low = vdup_n_u8(0x0f);
+        let bias = vdup_n_u8(B as u8);
+        for q in 0..8 {
+            let cols = gf2_columns(aq[q]);
+            let mut lo = vdupq_n_u8(0);
+            let mut hi = vdupq_n_u8(0);
+            for (k, s) in SELECT.iter().enumerate() {
+                let s = vld1q_u8(s.as_ptr());
+                lo = veorq_u8(lo, vandq_u8(s, vdupq_n_u8((cols >> (8 * k)) as u8)));
+                hi = veorq_u8(hi, vandq_u8(s, vdupq_n_u8((cols >> (8 * k + 32)) as u8)));
+            }
+            let v = vcreate_u8(xq[q]);
+            let out = veor_u8(
+                vqtbl1_u8(lo, vand_u8(v, low)),
+                vqtbl1_u8(hi, vshr_n_u8::<4>(v)),
+            );
+            r[q] = vget_lane_u64::<0>(vreinterpret_u64_u8(veor_u8(out, bias)));
+        }
+    }
+    from_u64x8(r)
+}
+
+/// `vgf2p8affineqb`: bit `i` of each result byte is `parity(x & A.byte[7 - i]) ^ B[i]`, with `A`
+/// the 64-bit lane of `a` holding that byte.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 pub fn _mm512_gf2p8affine_epi64_epi8<const B: i32>(x: __m512i, a: __m512i) -> __m512i {
     let (xb, aq) = (u8x64(x), u64x8(a));
@@ -906,6 +955,18 @@ pub fn _mm512_gf2p8affine_epi64_epi8<const B: i32>(x: __m512i, a: __m512i) -> __
         }
     }
     from_u8x64(r)
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+fn gf2_columns(mut a: u64) -> u64 {
+    let t = (a ^ (a >> 7)) & 0x00AA_00AA_00AA_00AA;
+    a ^= t ^ (t << 7);
+    let t = (a ^ (a >> 14)) & 0x0000_CCCC_0000_CCCC;
+    a ^= t ^ (t << 14);
+    let t = (a ^ (a >> 28)) & 0x0000_0000_F0F0_F0F0;
+    a ^= t ^ (t << 28);
+    a.reverse_bits().swap_bytes()
 }
 
 #[inline(always)]
@@ -1140,5 +1201,29 @@ mod tests {
         let x: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(29));
         let r = u8x64(_mm512_gf2p8affine_epi64_epi8::<0>(from_u8x64(x), from_u64x8([id; 8])));
         assert_eq!(r, x);
+    }
+
+    #[test]
+    fn gf2p8affine_matches_the_parity_definition() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..64 {
+            let x: [u64; 8] = core::array::from_fn(|_| next());
+            let a: [u64; 8] = core::array::from_fn(|_| next());
+            let r = u8x64(_mm512_gf2p8affine_epi64_epi8::<0x5B>(from_u64x8(x), from_u64x8(a)));
+            let xb = u8x64(from_u64x8(x));
+            for (p, &got) in r.iter().enumerate() {
+                let m = a[p / 8].to_le_bytes();
+                let want = (0..8).fold(0x5Bu8, |o, i| {
+                    o ^ ((((m[7 - i] & xb[p]).count_ones() & 1) as u8) << i)
+                });
+                assert_eq!(got, want);
+            }
+        }
     }
 }
