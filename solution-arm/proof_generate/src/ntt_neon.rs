@@ -659,3 +659,121 @@ mod tests {
         }
     }
 }
+
+// Inverse butterflies across eight columns, sharing each twiddle broadcast.
+struct Inverse {
+    stages: Vec<(usize,usize,Vec<[[i16;2];3]>)>,
+    eps: [i16;2], split: [i16;2], w: [i16;2],
+}
+fn inverses() -> &'static [Inverse;2] {
+    static I: OnceLock<[Inverse;2]> = OnceLock::new();
+    I.get_or_init(|| core::array::from_fn(|p| {
+        let plan=&primes()[p];
+        let mut stages=Vec::new(); let mut len=1;
+        for level in (0..super::RADICES.len()).rev() {
+            let r=super::RADICES[level];
+            let scales=plan.exps[level].iter().map(|&e| core::array::from_fn(|i| {
+                twiddle(plan.p,plan.root(super::ORDER-(e as usize/r*i)%super::ORDER)*plan.inv_radix[r] as u64%plan.p as u64)
+            })).collect();
+            stages.push((len,r,scales)); len*=r;
+        }
+        Inverse {stages,eps:twiddle(plan.p,plan.root(2*648)),split:twiddle(plan.p,plan.inv_split as u64),w:twiddle(plan.p,plan.root(324))}
+    }))
+}
+#[inline(always)]
+unsafe fn mul_pair(a:int16x8_t,t:[i16;2],k:int16x8_t)->int16x8_t {
+    let q=vqrdmulhq_n_s16(a,t[1]);
+    vmlsq_laneq_s16::<0>(vmulq_n_s16(a,t[0]),q,k)
+}
+unsafe fn inverse_lanes(p:usize,x:&mut [int16x8_t;N]) {
+    let inv=&inverses()[p]; let k=vld1q_s16(kernels()[p].k.as_ptr());
+    for (len,r,scales) in &inv.stages {
+        for (node,scale) in scales.iter().enumerate() {
+            let base=node*len*r;
+            for j in 0..*len {
+                let a=reduce(x[base+j],k);let b=reduce(x[base+j+len],k);
+                if *r==2 {
+                    x[base+j]=reduce(mul_pair(reduce(vaddq_s16(a,b),k),scale[0],k),k);
+                    x[base+j+len]=reduce(mul_pair(reduce(vsubq_s16(a,b),k),scale[1],k),k);
+                } else {
+                    let c=reduce(x[base+j+2*len],k);
+                    let e=mul_pair(vsubq_s16(b,c),inv.eps,k);
+                    let z=[vaddq_s16(a,vaddq_s16(b,c)),vaddq_s16(vsubq_s16(a,c),e),vsubq_s16(vsubq_s16(a,b),e)];
+                    for i in 0..3 {x[base+j+i*len]=reduce(mul_pair(reduce(z[i],k),scale[i],k),k);}
+                }
+            }
+        }
+    }
+    for j in 0..N/2 {
+        let u=reduce(x[j],k);let v=reduce(x[j+N/2],k);
+        let b=reduce(mul_pair(vsubq_s16(u,v),inv.split,k),k);
+        x[j]=reduce(vsubq_s16(u,mul_pair(b,inv.w,k)),k);x[j+N/2]=b;
+    }
+}
+#[inline(always)]
+unsafe fn pass_dual<const P:usize>(x:&mut [int16x8_t;N],row:&[i16],tail:&[i16],base_acc:&mut [int32x4_t],tail_acc:&mut [int32x4_t]) {
+    let kern=&kernels()[P]; let s=schedule(P);let k=vld1q_s16(kern.k.as_ptr());
+    for q in 0..N/6 {
+        let t=vld1q_s16(kern.d[q].as_ptr());let base=6*q;
+        let mut v:[int16x8_t;6]=core::array::from_fn(|i|load(x,base+i));
+        reduce_inputs(&mut v,s.before[6],s.cheap,&[0,3],k);
+        let (y0,y1,y2)=r3!(s,0,1,2,3,v[0],v[1],v[2],t,k);
+        let (y3,y4,y5)=r3!(s,4,5,6,7,v[3],v[4],v[5],t,k);
+        let y=[y0,y1,y2,y3,y4,y5];
+        mac6(base_acc,base,&y,vld1q_s16(row.as_ptr().add(base)));
+        mac6(tail_acc,base,&y,vld1q_s16(tail.as_ptr().add(base)));
+    }
+}
+#[inline(never)]
+unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [int16x8_t;BITS],x:&mut [int16x8_t;N],acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
+    let kern=&kernels()[P];let s=SCHEDULES[P];
+    tail.fill(vdupq_n_s32(0));
+    for e in start..end {
+        let at=core::array::from_fn(|c|words[c].0.add(e*words[c].1));
+        masks(&at,m);pass_a(m,x,kern);pass_b::<P>(x,kern);pass_c::<P>(x,kern);
+        pass_dual::<P>(x,a.row(e,P,0),a.row(e,P,1),acc,tail);
+        if (e-start+1)%s.accumulate==0 {
+            reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+        }
+    }
+    reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+}
+unsafe fn inverse_acc(p:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
+    for j in 0..N {x[j]=vcombine_s16(vmovn_s32(acc[2*j]),vmovn_s32(acc[2*j+1]));}
+    inverse_lanes(p,x);
+}
+pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec<u128> {
+    let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
+    let columns=values.len()/len;let mut out=vec![0u128;columns*N];
+    for_blocks(&mut out,N,8,workers,|first,block|unsafe {
+        let mut m=Box::new([vdupq_n_s16(0);BITS]);
+        let mut x=Box::new([vdupq_n_s16(0);N]);
+        let mut y=Box::new([vdupq_n_s16(0);N]);
+        let mut acc=vec![vdupq_n_s32(0);4*N];let mut tail=acc.clone();
+        let mut low=vec![[0i64;8];N];
+        for (batch,target) in block.chunks_mut(8*N).enumerate() {
+            acc.fill(vdupq_n_s32(0));low.fill([0;8]);let here=target.len()/N;
+            let words=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
+            let (a0,a1)=acc.split_at_mut(2*N);let (t0,t1)=tail.split_at_mut(2*N);
+            for start in (0..a.elements).step_by(crate::hybrid::CHUNK) {
+                let end=(start+crate::hybrid::CHUNK).min(a.elements);
+                hybrid_chunk::<0>(&words,a,start,end,&mut m,&mut x,a0,t0);
+                hybrid_chunk::<1>(&words,a,start,end,&mut m,&mut x,a1,t1);
+                inverse_acc(0,t0,&mut x);inverse_acc(1,t1,&mut y);
+                for j in 0..N {
+                    let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
+                    for c in 0..here {
+                        let z=crate::hybrid::crt_pair((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32);
+                        let z=if z>crate::hybrid::PRODUCT/2 {z-crate::hybrid::PRODUCT} else {z};
+                        low[j][c]=(low[j][c]+z)&1023;
+                    }
+                }
+            }
+            inverse_acc(0,a0,&mut x);inverse_acc(1,a1,&mut y);
+            for j in 0..N {
+                let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
+                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,low[j][c]);}
+            }
+        }
+    });out
+}
