@@ -309,7 +309,7 @@ type F162Word = crate::fields::scalar::B128;
 
 ///
 /// # Safety
-unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162 {
+unsafe fn dot_words<const HINT: i32>(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162 {
     debug_assert!(a.n >= from + n && from % 8 == 0);
     let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
@@ -319,8 +319,8 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
         // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
         // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
         let ahead = b.wrapping_add(8 * (t + 8).min(last)) as *const i8;
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
+        core::arch::x86_64::_mm_prefetch::<HINT>(ahead);
+        core::arch::x86_64::_mm_prefetch::<HINT>(ahead.wrapping_add(64));
         let x = [
             _mm512_loadu_si512(a.w[0].as_ptr().add(from + 8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[1].as_ptr().add(from + 8 * t) as *const __m512i),
@@ -342,10 +342,9 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
 
 /// [`dot_words`] on two columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
 /// 384 KB at `n = 2^14`) is loaded from L2 once per pair of columns while both witness streams
-/// are prefetched 1 KB ahead.
 ///
 /// # Safety
-unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
+unsafe fn dot_words2<const HINT: i32>(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
     debug_assert!(a.n >= from + n && from % 8 == 0);
     let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
@@ -356,11 +355,11 @@ unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162
     for t in 0..blocks {
         let at = 8 * (t + 8).min(last);
         let ahead0 = b0.wrapping_add(at) as *const i8;
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0);
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0.wrapping_add(64));
+        core::arch::x86_64::_mm_prefetch::<HINT>(ahead0);
+        core::arch::x86_64::_mm_prefetch::<HINT>(ahead0.wrapping_add(64));
         let ahead1 = b1.wrapping_add(at) as *const i8;
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1);
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1.wrapping_add(64));
+        core::arch::x86_64::_mm_prefetch::<HINT>(ahead1);
+        core::arch::x86_64::_mm_prefetch::<HINT>(ahead1.wrapping_add(64));
         let x = [
             _mm512_loadu_si512(a.w[0].as_ptr().add(from + 8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[1].as_ptr().add(from + 8 * t) as *const __m512i),
@@ -443,7 +442,15 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     let chunks = columns.div_ceil(chunk);
     let out_addr = out.as_mut_ptr() as usize;
     let split = (wdim - wdim / TAIL_PARTS) & !7;
+    type Dot2 = unsafe fn(&Poly, usize, *const F162Word, *const F162Word, usize) -> [F162; 2];
+    type Dot1 = unsafe fn(&Poly, usize, *const F162Word, usize) -> F162;
+    use core::arch::x86_64::{_MM_HINT_NTA, _MM_HINT_T0};
     for (from, n, add) in [(0, split, false), (split, wdim - split, true)] {
+        let (d2, d1): (Dot2, Dot1) = if add {
+            (dot_words2::<_MM_HINT_T0>, dot_words::<_MM_HINT_T0>)
+        } else {
+            (dot_words2::<_MM_HINT_NTA>, dot_words::<_MM_HINT_NTA>)
+        };
         let next = std::sync::atomic::AtomicUsize::new(0);
         let put = |j: usize, v: F162| unsafe {
             let p = (out_addr as *mut F162).add(j);
@@ -459,7 +466,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
             let mut j = k * chunk;
             while j + 1 < end {
                 let [v0, v1] = unsafe {
-                    dot_words2(
+                    d2(
                         &eq,
                         from,
                         words.as_ptr().add(j * wdim + from),
@@ -472,7 +479,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
                 j += 2;
             }
             if j < end {
-                put(j, unsafe { dot_words(&eq, from, words.as_ptr().add(j * wdim + from), n) });
+                put(j, unsafe { d1(&eq, from, words.as_ptr().add(j * wdim + from), n) });
             }
         });
     }
