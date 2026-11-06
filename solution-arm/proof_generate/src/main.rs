@@ -343,9 +343,7 @@ fn commit_reference(values: &[B128], matrix: &[u128], modulus: u128) -> Vec<u128
 }
 
 fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
-    eq.iter()
-        .zip(column)
-        .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x))
+    cf::dot_lifted(eq, column)
 }
 
 /// `u_j = sum_i eq(p0, i) W[i + COLUMN_LEN j]`, one field element per column.
@@ -382,9 +380,7 @@ fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
 
 fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
     row.absorb(t);
-    (0..COLUMNS)
-        .map(|_| sample_short_challenge(t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-        .collect()
+    labinius::challenge::sample_short_challenges(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND)
 }
 
 /// `v_m = sum_j c_j W_{j,m}` over the integers. A challenge sits in `R_648` as `c(-X^4)`, so each
