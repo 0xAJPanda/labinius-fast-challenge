@@ -693,13 +693,13 @@ unsafe fn inverse_lanes(p:usize,x:&mut [int16x8_t;N]) {
             for j in 0..*len {
                 let a=reduce(x[base+j],k);let b=reduce(x[base+j+len],k);
                 if *r==2 {
-                    x[base+j]=reduce(mul_pair(reduce(vaddq_s16(a,b),k),scale[0],k),k);
-                    x[base+j+len]=reduce(mul_pair(reduce(vsubq_s16(a,b),k),scale[1],k),k);
+                    x[base+j]=mul_pair(vaddq_s16(a,b),scale[0],k);
+                    x[base+j+len]=mul_pair(vsubq_s16(a,b),scale[1],k);
                 } else {
                     let c=reduce(x[base+j+2*len],k);
                     let e=mul_pair(vsubq_s16(b,c),inv.eps,k);
                     let z=[vaddq_s16(a,vaddq_s16(b,c)),vaddq_s16(vsubq_s16(a,c),e),vsubq_s16(vsubq_s16(a,b),e)];
-                    for i in 0..3 {x[base+j+i*len]=reduce(mul_pair(reduce(z[i],k),scale[i],k),k);}
+                    for i in 0..3 {x[base+j+i*len]=mul_pair(z[i],scale[i],k);}
                 }
             }
         }
@@ -800,6 +800,33 @@ unsafe fn sms_inverse(stream:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
     for j in 0..N {let at=2*(j*crate::sms::STREAMS+stream);x[j]=vcombine_s16(vmovn_s32(acc[at]),vmovn_s32(acc[at+1]));}
     inverse_lanes(1,x);
 }
+// Every butterfly starts with reduced inputs. These bounds also cover the
+// un-reduced radix-three output and its Barrett product before the next stage.
+const _: () = {
+    let mut i=0;
+    while i<2 {
+        let p=PRIMES[i];let r=super::reduced_bound(p);
+        let e=super::product_bound(p,2*r);
+        assert!(3*r<32768 && 2*r+e<32768);
+        assert!(super::product_bound(p,2*r+e)<32768);
+        i+=1;
+    }
+};
+#[inline(always)]
+unsafe fn center_lane(x:int16x8_t,k:int16x8_t)->int16x8_t {
+    let r=reduce(x,k);let p=vdupq_laneq_s16::<0>(k);let half=vshrq_n_s16::<1>(p);
+    let r=vsubq_s16(r,vreinterpretq_s16_u16(vandq_u16(vcgtq_s16(r,half),vreinterpretq_u16_s16(p))));
+    vaddq_s16(r,vreinterpretq_s16_u16(vandq_u16(vcltq_s16(r,vnegq_s16(half)),vreinterpretq_u16_s16(p))))
+}
+#[inline(always)]
+unsafe fn sms_lift(residue:int16x8_t,mean:i32,k:int16x8_t)->[int32x4_t;2] {
+    // Center only a small i16 difference, then add the public integer mean.
+    // This is exactly the scalar nearest-residue lift, including negative means.
+    let m=super::centered(mean as i64,crate::sms::P as u32);
+    let delta=center_lane(vsubq_s16(residue,vdupq_n_s16(m)),k);
+    [vaddq_s32(vmovl_s16(vget_low_s16(delta)),vdupq_n_s32(mean)),
+     vaddq_s32(vmovl_high_s16(delta),vdupq_n_s32(mean))]
+}
 pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128> {
     use crate::sms::{CHUNK,DIGITS,STREAMS,TAIL,P};
     let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
@@ -807,9 +834,10 @@ pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128>
     for_blocks(&mut out,N,8,workers,|first,block|unsafe {
         let zero=vdupq_n_s16(0);let z32=vdupq_n_s64(0);
         let mut m=Box::new([zero;BITS]);let mut x=vec![[zero;N];8];
-        let mut inv=Box::new([zero;N]);let mut acc=vec![z32;STREAMS*4*N];let mut low=vec![[0i64;8];N];
+        let mut inv=Box::new([zero;N]);let mut acc=vec![z32;STREAMS*4*N];
+        let mut low=vec![[vdupq_n_s32(0);2];N];let k=vld1q_s16(kernels()[1].k.as_ptr());
         for (batch,target) in block.chunks_mut(8*N).enumerate() {
-            acc.fill(z32);low.fill([0;8]);let here=target.len()/N;
+            acc.fill(z32);low.fill([vdupq_n_s32(0);2]);let here=target.len()/N;
             let words:[(*const u8,usize);8]=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
             for (ci,chunk) in a.chunks.iter().enumerate() {
                 for j in 0..N {for s in 1..STREAMS {let at=4*(j*STREAMS+s);acc[at..at+4].fill(z32);}}
@@ -826,20 +854,53 @@ pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128>
                 for d in 0..DIGITS {
                     sms_dot::inverse(d+1,&acc,&mut inv);
                     for j in 0..N {
-                        let residues:[i16;8]=core::mem::transmute(inv[j]);let mean=chunk.means[d*N+j] as i64;
-                        for c in 0..here {
-                            let delta=(residues[c] as i64-mean+P/2).rem_euclid(P)-P/2;
-                            low[j][c]=(low[j][c]+((mean+delta)<<(4*d)))&(TAIL-1);
+                        let lifted=sms_lift(inv[j],chunk.means[d*N+j],k);
+                        for h in 0..2 {
+                            low[j][h]=vandq_s32(vaddq_s32(low[j][h],vshlq_s32(lifted[h],vdupq_n_s32((4*d) as i32))),vdupq_n_s32((TAIL-1) as i32));
                         }
                     }
                 }
             }
             sms_dot::inverse(0,&acc,&mut inv);
-            for j in 0..N {let r:[i16;8]=core::mem::transmute(inv[j]);for c in 0..here {
-                target[c*N+j]=crate::sms::combine((r[c] as i64).rem_euclid(P),low[j][c]);
+            for j in 0..N {let r:[i16;8]=core::mem::transmute(inv[j]);let tail:[i32;8]=core::mem::transmute(low[j]);for c in 0..here {
+                target[c*N+j]=crate::sms::combine((r[c] as i64).rem_euclid(P),tail[c] as i64);
             }}
         }
     });out
 }
 #[path="sms_dot.rs"]
 mod sms_dot;
+
+#[cfg(test)]
+mod sms_reconstruction_tests {
+    use super::*;
+    #[test]
+    fn sms_lift_reference() {unsafe {
+        let k=vld1q_s16(kernels()[1].k.as_ptr());
+        for mean in [-1000001,-9721,-4861,-4860,-1,0,1,4860,4861,9721,1000001] {
+            for residue in -4900i16..=4900 {
+                let got:[i32;8]=core::mem::transmute(sms_lift(vdupq_n_s16(residue),mean,k));
+                let expected=mean+(residue as i32-mean+4860).rem_euclid(9721)-4860;
+                assert_eq!(got,[expected;8]);
+            }
+        }
+    }}
+    #[test]
+    fn sms_inverse_reference() {unsafe {
+        let mut seed=9341;
+        for p in 0..2 {
+            let plan=&primes()[p];
+            let raw:[[i16;8];N]=core::array::from_fn(|_|core::array::from_fn(|_| {
+                seed=super::super::tests::xorshift(&mut seed);seed as i16
+            }));
+            let mut x:[int16x8_t;N]=core::mem::transmute(raw);
+            inverse_lanes(p,&mut x);
+            let got:[[i16;8];N]=core::mem::transmute(x);
+            for c in 0..8 {
+                let mut scalar=core::array::from_fn(|j|(raw[j][c] as i32).rem_euclid(plan.p as i32) as u32);
+                plan.inverse(&mut scalar);
+                for j in 0..N {assert_eq!((got[j][c] as i32).rem_euclid(plan.p as i32) as u32,scalar[j]);}
+            }
+        }
+    }}
+}
