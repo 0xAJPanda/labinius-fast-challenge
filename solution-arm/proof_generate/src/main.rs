@@ -10,7 +10,6 @@
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
 mod hugealloc;
 mod ntt;
-mod hybrid;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -38,7 +37,7 @@ const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 const LIMIT: u64 = 64 * 1024 * 1024;
 const MIN_MODULUS: u128 = 34_816_965_049;
 /// The default commitment modulus: the product of the three transform primes.
-const MODULUS: u128 = hybrid::MODULUS;
+const MODULUS: u128 = ntt::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
 const GROUP: usize = 8;
@@ -268,9 +267,6 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
-    if modulus == hybrid::MODULUS {
-        return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
-    }
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
     }
@@ -510,6 +506,73 @@ fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
 }
 
 fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    // The bit-sliced fold's 16-plane counters hold sums below 2^15.
+    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
+        return fold_bitsliced(values, challenges);
+    }
+    fold_bytes(values, challenges)
+}
+
+/// The fold of the x86 track's bit-sliced kernel (`fold_bits`), on NEON: blocks of 128 ring
+/// elements, each column's 512 words transposed into bit planes and counted per raw row with
+/// carry-save adders; blocks are handed out to the workers dynamically.
+fn fold_bitsliced(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    use labinius::fold_bits as fb;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const _: () = assert!(COLUMN_LEN % fb::LANES == 0 && fb::N == rq::N);
+    let cs: Vec<fb::Challenge> = challenges
+        .iter()
+        .map(|c| fb::Challenge {
+            positions: c.positions,
+            signs: c.signs,
+            weight: c.weight,
+        })
+        .collect();
+    let reach = fb::Reach::of(&cs);
+    let blocks = RING_ELEMENTS / fb::BLOCK_ELEMENTS;
+    let mut out: Vec<[i16; rq::N]> = vec![[0i16; rq::N]; RING_ELEMENTS];
+    let out_addr = out.as_mut_ptr() as usize;
+    let words = values.as_ptr() as usize;
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads().min(blocks) {
+            let (cs, reach, next) = (&cs, &reach, &next);
+            scope.spawn(move || loop {
+                let block = next.fetch_add(1, Ordering::Relaxed);
+                if block >= blocks {
+                    break;
+                }
+                // SAFETY: blocks are disjoint runs of `BLOCK_ELEMENTS` elements of `out`, and
+                // `values` holds `COLUMNS` columns of `COLUMN_LEN` words.
+                unsafe {
+                    let chunk = core::slice::from_raw_parts_mut(
+                        (out_addr as *mut [i16; rq::N]).add(block * fb::BLOCK_ELEMENTS),
+                        fb::BLOCK_ELEMENTS,
+                    );
+                    fb::fold_block::<fb::V, fb::Portable>(
+                        words as *const u128,
+                        COLUMNS,
+                        COLUMN_LEN,
+                        cs,
+                        reach,
+                        block,
+                        &fb::Portable,
+                        chunk,
+                    );
+                }
+            });
+        }
+    });
+    out.into_iter()
+        .map(|v| {
+            let mut e = RingElement648::zero(Representation::Coefficients);
+            e.v.copy_from_slice(&v);
+            e
+        })
+        .collect()
+}
+
+fn fold_bytes(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
     let narrow = challenges.iter().map(|c| c.weight).sum::<usize>() <= i16::MAX as usize;
     let per = RING_ELEMENTS.div_ceil(threads());
     let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
@@ -588,8 +651,15 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     let mut t = transcript(seed, modulus, &commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, &hi);
+    let prefix = cf::PrefixWorkspace::partial_evals(values, &hi);
+    let (partials, prefix, fallback) = match prefix {
+        Some((v, ws)) => (v, Some(ws), None),
+        None => {
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            let v = ws.partial_evals(0, values, &hi);
+            (v, None, Some(ws))
+        }
+    };
     let value = partials
         .iter()
         .zip(cf::eq_expand_b128(&lo))
@@ -597,18 +667,28 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+    let mut prefix = prefix.map(|ws| ws.start(values, &batch));
+    let mut fallback = fallback.map(|ws| cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch));
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
-        let msg = switch.msg();
+        let msg = match &mut prefix {
+            Some(p) => p.msg(),
+            None => fallback.as_mut().unwrap().msg(),
+        };
         t.absorb_f162(&msg);
         let r = t.sample_f162(b"switch-round", 1)[0];
         rounds.push(msg.map(|v| v.0));
         coords.push(r);
-        switch.fold(r);
+        match &mut prefix {
+            Some(p) => p.fold(r),
+            None => fallback.as_mut().unwrap().fold(r),
+        }
     }
-    let opened = switch.final_eval();
+    let opened = match &prefix {
+        Some(p) => p.final_eval(),
+        None => fallback.as_ref().unwrap().final_eval(),
+    };
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);

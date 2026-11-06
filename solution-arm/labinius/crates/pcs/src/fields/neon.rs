@@ -230,7 +230,10 @@ unsafe fn x2(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
 
 #[inline(always)]
 unsafe fn x3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-    veorq_u64(veorq_u64(a, b), c)
+    #[cfg(target_feature = "sha3")]
+    { veor3q_u64(a, b, c) }
+    #[cfg(not(target_feature = "sha3"))]
+    { veorq_u64(veorq_u64(a, b), c) }
 }
 
 /// Two entries' limbs from `j`.
@@ -410,6 +413,79 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
     }
 }
 
+
+/// Directly bind the leading word-block coordinates. Each pair of output rows accumulates
+/// five unreduced limb products per weight (the word has a zero third limb). Eight streams
+/// at a time keep the working set bounded; reduction is linear, so these groups add exactly.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn bind_prefix(
+    words: &[B128], stride: usize, start: usize, weights: &[F162], dst: [&mut [u64]; 3],
+) {
+    let [p0, p1, p2] = dst;
+    let count = p0.len();
+    assert_eq!(p1.len(), count); assert_eq!(p2.len(), count);
+    assert_eq!(words.len(), stride * weights.len());
+    assert!(start + count <= stride);
+    let m17 = vdupq_n_u64((1 << 17) - 1);
+    let m34 = vdupq_n_u64((1 << 34) - 1);
+    for block in (0..count / 2 * 2).step_by(1024) {
+        let end = (block + 1024).min(count / 2 * 2);
+        for (group, ws) in weights.chunks(8).enumerate() {
+            for j in (block..end).step_by(2) {
+                let mut acc = [vdupq_n_u64(0); 10];
+                for (k, &w) in ws.iter().enumerate() {
+                    let q = 8 * group + k;
+                    let b = vld2q_u64(words.as_ptr().add(q * stride + start + j) as *const u64);
+                    let a0 = vdupq_n_u64(w.0[0]);
+                    let a1 = vdupq_n_u64(w.0[1]);
+                    let a2 = vdupq_n_u64(w.0[2]);
+                    for (t, (a, b)) in [(a0, b.0), (a1, b.1),
+                        (x2(a0, a1), x2(b.0, b.1)), (a2, b.0), (a2, b.1)]
+                        .into_iter().enumerate() {
+                        acc[2 * t] = x2(acc[2 * t], pmul_lo(a, b));
+                        acc[2 * t + 1] = x2(acc[2 * t + 1], pmul_hi(a, b));
+                    }
+                }
+                let mut lo = [vdupq_n_u64(0); 5];
+                let mut hi = [vdupq_n_u64(0); 5];
+                for t in 0..5 {
+                    lo[t] = vzip1q_u64(acc[2 * t], acc[2 * t + 1]);
+                    hi[t] = vzip2q_u64(acc[2 * t], acc[2 * t + 1]);
+                }
+                let d1l = x3(lo[2], lo[0], lo[1]);
+                let d1h = x3(hi[2], hi[0], hi[1]);
+                let d2l = x2(lo[3], lo[1]);
+                let d2h = x2(hi[3], hi[1]);
+                let v0 = lo[0];
+                let v1 = x2(hi[0], d1l);
+                let v2 = x2(d1h, d2l);
+                let v3 = x2(d2h, lo[4]);
+                let v4 = hi[4];
+                let h00 = vsliq_n_u64::<30>(vshrq_n_u64::<34>(v2), v3);
+                let h01 = vandq_u64(vshrq_n_u64::<34>(v3), m17);
+                let h10 = vsliq_n_u64::<13>(vshrq_n_u64::<51>(v3), v4);
+                let h11 = vshrq_n_u64::<51>(v4);
+                let mut r0 = x3(v0, h00, h10);
+                let mut r1 = x2(x3(v1, h01, h11), vshlq_n_u64::<17>(h00));
+                let mut r2 = x3(vandq_u64(v2, m34), vshlq_n_u64::<17>(h01), vshrq_n_u64::<47>(h00));
+                if group != 0 {
+                    r0 = x2(r0, vld1q_u64(p0.as_ptr().add(j)));
+                    r1 = x2(r1, vld1q_u64(p1.as_ptr().add(j)));
+                    r2 = x2(r2, vld1q_u64(p2.as_ptr().add(j)));
+                }
+                vst1q_u64(p0.as_mut_ptr().add(j), r0);
+                vst1q_u64(p1.as_mut_ptr().add(j), r1);
+                vst1q_u64(p2.as_mut_ptr().add(j), r2);
+            }
+        }
+    }
+    for j in count / 2 * 2..count {
+        let x = weights.iter().enumerate().fold(F162::ZERO, |a, (q, &w)|
+            a + w * F162::from_b128(words[q * stride + start + j]));
+        p0[j] = x.0[0]; p1[j] = x.0[1]; p2[j] = x.0[2];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +569,27 @@ mod tests {
                 poly_from_b128_rows(&p, [&mut w0[..], &mut w1[..], &mut w2[..]]);
                 for j in 0..n {
                     assert_eq!(F162([w[0][j], w[1][j], w[2][j]]), F162::from_b128(p[j]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_binding_matches_scalar_products() {
+        if !pmull() { return; }
+        let mut rng = Rng(0x5555_AAAA_1234_9876_FEDC_BA98_7654_3210);
+        for n in [1usize, 2, 3, 17, 1025] {
+            for groups in [2usize, 8, 16, 64] {
+                let words: Vec<_> = (0..n * groups).map(|_| B128(rng.next())).collect();
+                let weights: Vec<_> = (0..groups).map(|_| rng.f162()).collect();
+                let mut dst = [vec![7u64; n], vec![7u64; n], vec![7u64; n]];
+                let [a, b, c] = &mut dst;
+                unsafe { bind_prefix(&words, n, 0, &weights, [a, b, c]); }
+                for j in 0..n {
+                    let want = weights.iter().enumerate().fold(F162::ZERO, |a, (q, &w)|
+                        a + w * F162::from_b128(words[q * n + j]));
+                    assert_eq!(F162([dst[0][j], dst[1][j], dst[2][j]]), want,
+                        "n={n} groups={groups} j={j}");
                 }
             }
         }
