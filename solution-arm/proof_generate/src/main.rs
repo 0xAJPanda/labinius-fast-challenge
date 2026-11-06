@@ -104,6 +104,26 @@ fn parse_modulus(text: &str) -> Result<u128, String> {
     Ok(q)
 }
 
+/// The precomputed key of the default modulus (`build.rs`), 64-byte aligned images.
+#[repr(C, align(64))]
+struct Aligned<T: ?Sized>(T);
+static SMS_DATA: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/sms-data.bin")));
+static SMS_MEANS: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/sms-means.bin")));
+static SMS_MARGINS: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/sms-margins.bin")));
+
+/// `bytes` as the little-endian `T`s it encodes.
+fn view<T>(bytes: &'static [u8]) -> &'static [T] {
+    assert!(cfg!(target_endian = "little") || bytes.is_empty());
+    assert_eq!(bytes.as_ptr() as usize % core::mem::align_of::<T>(), 0);
+    // SAFETY: aligned bytes of `T`s (integers or floats: every bit pattern is valid).
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / core::mem::size_of::<T>()) }
+}
+
+/// The embedded key of [`sms::MODULUS`], if the build host produced one.
+fn embedded_sms() -> Option<sms::Matrix> {
+    sms::from_image(view(&SMS_DATA.0), view(&SMS_MEANS.0), view(&SMS_MARGINS.0), RING_ELEMENTS)
+}
+
 fn threads() -> usize {
     labinius::par::threads()
 }
@@ -262,45 +282,6 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
     r[..rq::N].iter().map(|&x| x as u128).collect()
 }
 
-include!(concat!(env!("OUT_DIR"), "/matrix_params.rs"));
-#[repr(align(2097152))]
-struct AlignedKey([u8; KEY_BYTES]);
-static KEY: AlignedKey = AlignedKey(*include_bytes!(concat!(env!("OUT_DIR"), "/matrix.bin")));
-const _: () = {
-    assert!(KEY_MODULUS == sms::MODULUS && KEY_ELEMENTS == RING_ELEMENTS && KEY_N == ntt::N);
-    assert!(KEY_CHUNK == sms::CHUNK && KEY_DIGITS == sms::DIGITS && KEY_STREAMS == sms::STREAMS);
-    let mut i = 0;
-    while i < 3 { assert!(KEY_PRIMES[i] == ntt::PRIMES[i]); i += 1; }
-};
-
-/// Copy the public image into the existing owned matrix, without changing its arithmetic.
-fn precomputed_matrix() -> sms::Matrix {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        extern "C" { fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; }
-        madvise(KEY.0.as_ptr() as *mut u8, KEY_BYTES, 14);
-    }
-    let groups = labinius::par::map_blocks(KEY_LAYOUT.len(), threads().min(KEY_LAYOUT.len()), 1, |_, start, end| {
-        KEY_LAYOUT[start..end].iter().map(|&(elements, offset, len, mean_offset, mean_len, margin)| {
-            #[cfg(target_endian = "little")]
-            let (data, means) = unsafe {
-                // The build script aligns offsets; integer types accept every bit pattern.
-                assert!(offset % 2 == 0 && offset + len * 2 <= KEY_BYTES);
-                assert!(mean_offset % 4 == 0 && mean_offset + mean_len * 4 <= KEY_BYTES);
-                (std::slice::from_raw_parts(KEY.0.as_ptr().add(offset).cast::<i16>(), len).to_vec(),
-                 std::slice::from_raw_parts(KEY.0.as_ptr().add(mean_offset).cast::<i32>(), mean_len).to_vec())
-            };
-            #[cfg(target_endian = "big")]
-            let (data, means) = (
-                KEY.0[offset..offset + len * 2].chunks_exact(2).map(|b| i16::from_le_bytes(b.try_into().unwrap())).collect(),
-                KEY.0[mean_offset..mean_offset + mean_len * 4].chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect(),
-            );
-            sms::Chunk { elements, data, means, margin: f64::from_bits(margin) }
-        }).collect::<Vec<_>>()
-    });
-    sms::Matrix { elements: RING_ELEMENTS, chunks: groups.into_iter().flatten().collect() }
-}
-
 /// Every column's commitment, flattened. Columns go out over the cores; each worker walks the
 /// ring elements once, building that element's table and applying it to all of its columns.
 /// Per column the raw product is summed block by block: each `BLOCK` of output coefficients
@@ -310,7 +291,8 @@ fn precomputed_matrix() -> sms::Matrix {
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     if modulus == sms::MODULUS {
-        return sms::commit(values, &precomputed_matrix(), threads());
+        let m = embedded_sms().unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        return sms::commit(values, &m, threads());
     }
     if modulus == hybrid::MODULUS {
         return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
@@ -782,6 +764,19 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// The key `build.rs` embeds is the matrix `sms::matrix` computes at run time.
+    #[test]
+    fn embedded_key_matches_runtime_matrix() {
+        let embedded = embedded_sms().expect("embedded key");
+        let built = sms::matrix(RING_ELEMENTS, 8);
+        assert_eq!(embedded.chunks.len(), built.chunks.len());
+        for (a, b) in embedded.chunks.iter().zip(&built.chunks) {
+            assert_eq!(a.elements, b.elements);
+            assert!(a.data[..] == b.data[..] && a.means[..] == b.means[..]);
+            assert_eq!(a.margin.to_bits(), b.margin.to_bits());
+        }
+    }
+
     fn column(seed: u64) -> Vec<B128> {
         let mut state = seed;
         (0..COLUMN_LEN)
@@ -799,24 +794,6 @@ mod tests {
     }
 
     /// The direct encoding is byte for byte bincode's under the proof codec.
-    #[test]
-    fn precomputed_matrix_matches_runtime() {
-        let start = std::time::Instant::now();
-        let actual = precomputed_matrix();
-        eprintln!("precomputed_matrix_us={}", start.elapsed().as_micros());
-        let start = std::time::Instant::now();
-        let expected = sms::matrix(RING_ELEMENTS, threads());
-        eprintln!("runtime_matrix_us={}", start.elapsed().as_micros());
-        assert_eq!(actual.elements, expected.elements);
-        assert_eq!(actual.chunks.len(), expected.chunks.len());
-        for (a, b) in actual.chunks.iter().zip(&expected.chunks) {
-            assert_eq!(a.elements, b.elements);
-            assert_eq!(a.data, b.data);
-            assert_eq!(a.means, b.means);
-            assert_eq!(a.margin.to_bits(), b.margin.to_bits());
-        }
-    }
-
     #[test]
     fn encoding_matches_bincode() {
         use bincode::Options;

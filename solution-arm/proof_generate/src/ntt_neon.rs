@@ -804,12 +804,23 @@ pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128>
     use crate::sms::{CHUNK,DIGITS,STREAMS,TAIL,P};
     let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
     let columns=values.len()/len;let mut out=vec![0u128;columns*N];
+    // Per chunk, from the public means: each digit mean centered modulo p (the lift target as a
+    // residue), and sum_d mean_d 2^(4d) modulo 2^32 (the means' share of the tail, added once).
+    let prep:Vec<(Vec<i16>,Vec<u32>)>=a.chunks.iter().map(|ch| {
+        let mm=(0..DIGITS*N).map(|i|(((ch.means[i] as i64)+P/2).rem_euclid(P)-P/2) as i16).collect();
+        let cj=(0..N).map(|j|(0..DIGITS).fold(0u32,|t,d|t.wrapping_add((ch.means[d*N+j] as i64 as u32).wrapping_shl(4*d as u32)))).collect();
+        (mm,cj)
+    }).collect();
+    let prep=&prep;
     for_blocks(&mut out,N,8,workers,|first,block|unsafe {
         let zero=vdupq_n_s16(0);let z32=vdupq_n_s64(0);
         let mut m=Box::new([zero;BITS]);let mut x=vec![[zero;N];8];
-        let mut inv=Box::new([zero;N]);let mut acc=vec![z32;STREAMS*4*N];let mut low=vec![[0i64;8];N];
+        let mut inv=Box::new([zero;N]);let mut acc=vec![z32;STREAMS*4*N];
+        // The tail of every slot and column modulo 2^32 (so modulo 2^22), columns 0..4 and 4..8.
+        let mut low=vec![vdupq_n_u32(0);2*N];
+        let pv=vdupq_n_s16(P as i16);let half=vdupq_n_s16((P/2) as i16);let nhalf=vnegq_s16(half);
         for (batch,target) in block.chunks_mut(8*N).enumerate() {
-            acc.fill(z32);low.fill([0;8]);let here=target.len()/N;
+            acc.fill(z32);low.fill(vdupq_n_u32(0));let here=target.len()/N;
             let words:[(*const u8,usize);8]=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
             for (ci,chunk) in a.chunks.iter().enumerate() {
                 for j in 0..N {for s in 1..STREAMS {let at=4*(j*STREAMS+s);acc[at..at+4].fill(z32);}}
@@ -823,21 +834,35 @@ pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128>
                     for e in count..8 {x[e].fill(zero);}
                     sms_dot::tile(chunk,base/8,&x,&mut acc);
                 }
+                let (mm,cj)=&prep[ci];
+                for j in 0..N {
+                    let c=vdupq_n_u32(cj[j]);
+                    low[2*j]=vaddq_u32(low[2*j],c);low[2*j+1]=vaddq_u32(low[2*j+1],c);
+                }
                 for d in 0..DIGITS {
                     sms_dot::inverse(d+1,&acc,&mut inv);
+                    let shift=vdupq_n_s32(4*d as i32);
                     for j in 0..N {
-                        let residues:[i16;8]=core::mem::transmute(inv[j]);let mean=chunk.means[d*N+j] as i64;
-                        for c in 0..here {
-                            let delta=(residues[c] as i64-mean+P/2).rem_euclid(P)-P/2;
-                            low[j][c]=(low[j][c]+((mean+delta)<<(4*d)))&(TAIL-1);
-                        }
+                        // The lift nearest the mean: mean + delta with delta the centered residue of
+                        // (chunk sum - mean); |inv| <= reduced_bound(p) and |mean mod p| <= (p-1)/2,
+                        // so one correction each way makes delta canonical.
+                        let t=vsubq_s16(inv[j],vdupq_n_s16(*mm.get_unchecked(d*N+j)));
+                        let t=vsubq_s16(t,vandq_s16(vreinterpretq_s16_u16(vcgtq_s16(t,half)),pv));
+                        let t=vaddq_s16(t,vandq_s16(vreinterpretq_s16_u16(vcltq_s16(t,nhalf)),pv));
+                        let lo=vreinterpretq_u32_s32(vshlq_s32(vmovl_s16(vget_low_s16(t)),shift));
+                        let hi=vreinterpretq_u32_s32(vshlq_s32(vmovl_high_s16(t),shift));
+                        low[2*j]=vaddq_u32(low[2*j],lo);low[2*j+1]=vaddq_u32(low[2*j+1],hi);
                     }
                 }
             }
             sms_dot::inverse(0,&acc,&mut inv);
-            for j in 0..N {let r:[i16;8]=core::mem::transmute(inv[j]);for c in 0..here {
-                target[c*N+j]=crate::sms::combine((r[c] as i64).rem_euclid(P),low[j][c]);
-            }}
+            for j in 0..N {
+                let r:[i16;8]=core::mem::transmute(inv[j]);
+                let l:[u32;8]=core::mem::transmute([low[2*j],low[2*j+1]]);
+                for c in 0..here {
+                    target[c*N+j]=crate::sms::combine((r[c] as i64).rem_euclid(P),(l[c] as i64)&(TAIL-1));
+                }
+            }
         }
     });out
 }

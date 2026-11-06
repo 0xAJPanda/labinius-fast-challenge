@@ -9,6 +9,21 @@ unsafe fn pack(a:int16x8_t,b:int16x8_t,c:int16x8_t,d:int16x8_t)->[int16x8_t;4] {
     [vreinterpretq_s16_s32(vzip1q_s32(ab0,cd0)),vreinterpretq_s16_s32(vzip2q_s32(ab0,cd0)),
      vreinterpretq_s16_s32(vzip1q_s32(ab1,cd1)),vreinterpretq_s16_s32(vzip2q_s32(ab1,cd1))]
 }
+/// Without SVE (development hosts): the same four-term halfword dot products per i64 lane.
+#[cfg(not(target_feature="sve"))]
+#[inline(always)]
+unsafe fn dot(acc:&mut [int64x2_t],a:[int16x8_t;4],b:[int16x8_t;4],key:int16x8_t) {
+    let key:[i16;8]=core::mem::transmute(vnegq_s16(key));
+    for (i,(va,vb)) in a.iter().zip(&b).enumerate() {
+        let (va,vb):([i16;8],[i16;8])=(core::mem::transmute(*va),core::mem::transmute(*vb));
+        let mut s:[i64;2]=core::mem::transmute(acc[i]);
+        for l in 0..2 {for t in 0..4 {
+            s[l]+=va[4*l+t] as i64*key[t] as i64+vb[4*l+t] as i64*key[4+t] as i64;
+        }}
+        acc[i]=core::mem::transmute(s);
+    }
+}
+#[cfg(target_feature="sve")]
 #[inline(always)]
 unsafe fn dot(acc:&mut [int64x2_t],a:[int16x8_t;4],b:[int16x8_t;4],key:int16x8_t) {
     let key=vnegq_s16(key);
@@ -58,7 +73,7 @@ pub(super) unsafe fn inverse(stream:usize,acc:&[int64x2_t],x:&mut [int16x8_t;N])
         use std::hint::black_box;
         let s=crate::sms::STREAMS;
         let key:Vec<i16>=(0..N*s*8).map(|i|((i*1337+7)%9721)as i16-4860).collect();
-        let chunk=crate::sms::Chunk{elements:8,data:key,means:vec![],margin:0.0};
+        let chunk=crate::sms::Chunk{elements:8,data:key.into(),means:vec![].into(),margin:0.0};
         let x:Vec<[int16x8_t;N]>=(0..8).map(|e|core::array::from_fn(|j| {
             let v:[i16;8]=core::array::from_fn(|c|((j*199+c*117+e*31)%9721)as i16-4860);vld1q_s16(v.as_ptr())
         })).collect();

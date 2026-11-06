@@ -9,7 +9,7 @@ pub const MODULUS:u128=P as u128*TAIL as u128;
 pub const DIGITS:usize=6;
 pub const STREAMS:usize=DIGITS+1;
 pub const CHUNK:usize=64;
-pub struct Chunk {pub elements:usize,pub data:Vec<i16>,pub means:Vec<i32>,pub margin:f64}
+pub struct Chunk {pub elements:usize,pub data:std::borrow::Cow<'static,[i16]>,pub means:std::borrow::Cow<'static,[i32]>,pub margin:f64}
 impl Chunk {pub fn key(&self,b:usize,j:usize,s:usize)->&[i16] {&self.data[((b*N+j)*STREAMS+s)*8..][..8]}}
 pub struct Matrix {pub elements:usize,pub chunks:Vec<Chunk>}
 pub fn digits(mut x:i64)->[i8;DIGITS] {
@@ -33,11 +33,11 @@ fn moments(l:&[i8;N],s1:&mut [i64;N],s2:&mut [i64;N]) {
     }
 }
 pub fn matrix(elements:usize,workers:usize)->Matrix {
-    let mut chunks:Vec<Chunk>=(0..elements.div_ceil(CHUNK)).map(|c|Chunk {elements:(elements-c*CHUNK).min(CHUNK),data:Vec::new(),means:Vec::new(),margin:f64::INFINITY}).collect();
+    let mut chunks:Vec<Chunk>=(0..elements.div_ceil(CHUNK)).map(|c|Chunk {elements:(elements-c*CHUNK).min(CHUNK),data:Vec::new().into(),means:Vec::new().into(),margin:f64::INFINITY}).collect();
     for_blocks(&mut chunks,1,1,workers,|first,blocks| {
         for (ci,chunk) in blocks.iter_mut().enumerate() {
             let start=(first+ci)*CHUNK;
-            chunk.data=vec![0i16;chunk.elements.div_ceil(8)*N*STREAMS*8];
+            let mut data=vec![0i16;chunk.elements.div_ceil(8)*N*STREAMS*8];
             let mut s1=vec![[0i64;N];DIGITS];let mut s2=s1.clone();
             let mut coeff=vec![[0u128;N];8];let mut ds=vec![[[0i8;DIGITS];N];8];
             for base in (0..chunk.elements).step_by(8) {
@@ -55,19 +55,37 @@ pub fn matrix(elements:usize,workers:usize)->Matrix {
                         lanes[j][e]=if stream==0 {centered((coeff[e][j]%P as u128) as i64,P as u32)} else {ds[e][j][stream-1] as i16};
                     }}
                     ntt::transform_lanes(1,lanes.as_mut_slice().try_into().unwrap(),count);
-                    for e in 0..count {for j in 0..N {chunk.data[((base/8*N+j)*STREAMS+stream)*8+e]=centered(lanes[j][e] as i64,P as u32);}}
+                    for e in 0..count {for j in 0..N {data[((base/8*N+j)*STREAMS+stream)*8+e]=centered(lanes[j][e] as i64,P as u32);}}
                 }
             }
-            chunk.means=vec![0i32;DIGITS*N];
+            chunk.data=data.into();
+            let mut means=vec![0i32;DIGITS*N];
             for d in 0..DIGITS {for j in 0..N {
-                let mean=s1[d][j].div_euclid(2);chunk.means[d*N+j]=mean as i32;
+                let mean=s1[d][j].div_euclid(2);means[d*N+j]=mean as i32;
                 if s2[d][j]!=0 {chunk.margin=chunk.margin.min(4859.0/(s2[d][j] as f64/4.0).sqrt());}
             }}
+            chunk.means=means.into();
             assert!(chunk.margin>=8.5,"insufficient reconstruction margin: {}",chunk.margin);
         }
     });
     eprintln!("sms digits={DIGITS} chunk={CHUNK} min_margin={:.3}",chunks.iter().map(|c|c.margin).fold(f64::INFINITY,f64::min));
     Matrix {elements,chunks}
+}
+/// [`matrix`] over `elements` elements from its precomputed image (`build.rs`): the chunks' key
+/// data and means concatenated, and their margins; `None` if the image has another shape.
+pub fn from_image(data:&'static [i16],means:&'static [i32],margins:&'static [f64],elements:usize)->Option<Matrix> {
+    let count=elements.div_ceil(CHUNK);
+    let sizes:Vec<usize>=(0..count).map(|c|(elements-c*CHUNK).min(CHUNK)).collect();
+    let total:usize=sizes.iter().map(|e|e.div_ceil(8)*N*STREAMS*8).sum();
+    if data.len()!=total || means.len()!=count*DIGITS*N || margins.len()!=count {return None;}
+    let (mut d,mut m)=(data,means);
+    let chunks=sizes.iter().zip(margins).map(|(&e,&margin)| {
+        let (a,rest)=d.split_at(e.div_ceil(8)*N*STREAMS*8);d=rest;
+        let (b,rest)=m.split_at(DIGITS*N);m=rest;
+        assert!(margin>=8.5,"insufficient reconstruction margin: {margin}");
+        Chunk {elements:e,data:a.into(),means:b.into(),margin}
+    }).collect();
+    Some(Matrix {elements,chunks})
 }
 #[inline]
 pub fn combine(base:i64,tail:i64)->u128 {
