@@ -8,6 +8,8 @@
 //! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
 //! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
+#[cfg(target_arch = "aarch64")]
+mod fold_neon;
 mod hugealloc;
 mod ntt;
 mod hybrid;
@@ -378,7 +380,9 @@ fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
 
 fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
     row.absorb(t);
-    labinius::challenge::sample_short_challenges(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND)
+    (0..COLUMNS)
+        .map(|_| sample_short_challenge(t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+        .collect()
 }
 
 /// `v_m = sum_j c_j W_{j,m}` over the integers. A challenge sits in `R_648` as `c(-X^4)`, so each
@@ -509,74 +513,13 @@ fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
 }
 
 fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    // The bit-sliced fold's 16-plane counters hold sums below 2^15.
-    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
-        return fold_bitsliced(values, challenges);
-    }
-    fold_bytes(values, challenges)
-}
-
-/// The fold of the x86 track's bit-sliced kernel (`fold_bits`), on NEON: blocks of 128 ring
-/// elements, each column's 512 words transposed into bit planes and counted per raw row with
-/// carry-save adders; blocks are handed out to the workers dynamically.
-fn fold_bitsliced(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    use labinius::fold_bits as fb;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    const _: () = assert!(COLUMN_LEN % fb::LANES == 0 && fb::N == rq::N);
-    let cs: Vec<fb::Challenge> = challenges
-        .iter()
-        .map(|c| fb::Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    let reach = fb::Reach::of(&cs);
-    let blocks = RING_ELEMENTS / fb::BLOCK_ELEMENTS;
-    let mut out: Vec<[i16; rq::N]> = vec![[0i16; rq::N]; RING_ELEMENTS];
-    let out_addr = out.as_mut_ptr() as usize;
-    let words = values.as_ptr() as usize;
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads().min(blocks) {
-            let (cs, reach, next) = (&cs, &reach, &next);
-            scope.spawn(move || loop {
-                let block = next.fetch_add(1, Ordering::Relaxed);
-                if block >= blocks {
-                    break;
-                }
-                // SAFETY: blocks are disjoint runs of `BLOCK_ELEMENTS` elements of `out`, and
-                // `values` holds `COLUMNS` columns of `COLUMN_LEN` words.
-                unsafe {
-                    let chunk = core::slice::from_raw_parts_mut(
-                        (out_addr as *mut [i16; rq::N]).add(block * fb::BLOCK_ELEMENTS),
-                        fb::BLOCK_ELEMENTS,
-                    );
-                    fb::fold_block::<fb::V, fb::Portable>(
-                        words as *const u128,
-                        COLUMNS,
-                        COLUMN_LEN,
-                        cs,
-                        reach,
-                        block,
-                        &fb::Portable,
-                        chunk,
-                    );
-                }
-            });
-        }
-    });
-    out.into_iter()
-        .map(|v| {
-            let mut e = RingElement648::zero(Representation::Coefficients);
-            e.v.copy_from_slice(&v);
-            e
-        })
-        .collect()
-}
-
-fn fold_bytes(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
     let narrow = challenges.iter().map(|c| c.weight).sum::<usize>() <= i16::MAX as usize;
+    #[cfg(target_arch = "aarch64")]
+    if narrow {
+        if let Some(buckets) = fold_neon::Buckets::of(challenges) {
+            return fold_sliced(values, &buckets);
+        }
+    }
     let per = RING_ELEMENTS.div_ceil(threads());
     let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
         .map(|_| RingElement648::zero(Representation::Coefficients))
@@ -590,6 +533,27 @@ fn fold_bytes(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement
                     } else {
                         fold_element(values, challenges, base + i)
                     };
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The fold through [`fold_neon`]: ring elements in contiguous runs over the workers.
+#[cfg(target_arch = "aarch64")]
+fn fold_sliced(values: &[B128], buckets: &fold_neon::Buckets) -> Vec<RingElement648> {
+    let per = RING_ELEMENTS.div_ceil(threads());
+    let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
+        .map(|_| RingElement648::zero(Representation::Coefficients))
+        .collect();
+    std::thread::scope(|scope| {
+        for (block, base) in out.chunks_mut(per).zip((0..).step_by(per)) {
+            scope.spawn(move || {
+                let mut scratch = fold_neon::Scratch::new(buckets);
+                for (i, run) in block.chunks_mut(fold_neon::BLOCK).enumerate() {
+                    let m0 = base + i * fold_neon::BLOCK;
+                    fold_neon::fold_elements(values, buckets, &mut scratch, m0, run);
                 }
             });
         }
@@ -781,6 +745,77 @@ mod tests {
         }
     }
 
+    /// The bit-sliced NEON fold agrees with the `i32` fold on random, all-ones and zero columns.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn sliced_fold_matches_wide() {
+        let mut t = Transcript::new(b"labinius-fast/test-sliced");
+        let challenges: Vec<ShortChallenge> = (0..COLUMNS)
+            .map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+            .collect();
+        let buckets = fold_neon::Buckets::of(&challenges).expect("default challenges bucket");
+        let mut values = vec![B128::ZERO; COLUMNS * COLUMN_LEN];
+        let elements = [0usize, 1, 17, 2048, 3000, RING_ELEMENTS - 1];
+        for (e, &m) in elements.iter().enumerate() {
+            for j in 0..COLUMNS {
+                let col = column((e * COLUMNS + j) as u64 + 5);
+                for k in 0..4 {
+                    values[j * COLUMN_LEN + 4 * m + k] = match m {
+                        2048 => B128(u128::MAX),
+                        3000 => B128::ZERO,
+                        _ => col[k],
+                    };
+                }
+            }
+        }
+        let mut scratch = fold_neon::Scratch::new(&buckets);
+        for m in elements {
+            assert_eq!(
+                fold_neon::fold_element(&values, &buckets, &mut scratch, m).v,
+                fold_element(&values, &challenges, m).v,
+                "element {m}"
+            );
+        }
+    }
+
+    /// Every column on the same 28 positions: each position's list holds all 1024 columns, so
+    /// the sliced fold takes its eleven-plane counters.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn sliced_fold_matches_wide_on_full_buckets() {
+        let mut t = Transcript::new(b"labinius-fast/test-full");
+        let base = sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0;
+        let challenges: Vec<ShortChallenge> = (0..COLUMNS)
+            .map(|j| {
+                let mut c = base;
+                for i in 0..c.weight {
+                    c.positions[i] = (5 * i + (i % 3)) as u8;
+                }
+                c.signs = (j as u32).wrapping_mul(0x9E37_79B9) ^ (j as u32 >> 3);
+                c
+            })
+            .collect();
+        let buckets = fold_neon::Buckets::of(&challenges).expect("full buckets fit 11 planes");
+        let mut values = vec![B128::ZERO; COLUMNS * COLUMN_LEN];
+        let elements = [0usize, 9, RING_ELEMENTS - 1];
+        for (e, &m) in elements.iter().enumerate() {
+            for j in 0..COLUMNS {
+                let col = column((e * COLUMNS + j) as u64 + 77);
+                for k in 0..4 {
+                    values[j * COLUMN_LEN + 4 * m + k] = if m == 9 { B128(u128::MAX) } else { col[k] };
+                }
+            }
+        }
+        let mut scratch = fold_neon::Scratch::new(&buckets);
+        for m in elements {
+            assert_eq!(
+                fold_neon::fold_element(&values, &buckets, &mut scratch, m).v,
+                fold_element(&values, &challenges, m).v,
+                "element {m}"
+            );
+        }
+    }
+
     /// The narrow fold agrees with the `i32` fold, on dense random columns and on all-ones
     /// columns (every coefficient takes every term).
     #[test]
@@ -904,6 +939,20 @@ mod tests {
         let full = ntt::matrix(RING_ELEMENTS, 8);
         let want = ntt::transform_matrix(&rq::ajtai_matrix(ntt::MODULUS, RING_ELEMENTS), 8);
         assert!(full.data == want.data);
+    }
+
+    /// The hybrid commitment agrees with the checker's schoolbook commitment at full size (16
+    /// certified chunks per column), on one, three and eight workers, edge columns included.
+    #[test]
+    fn hybrid_commit_matches_reference() {
+        let values = edge_columns(RING_ELEMENTS, 11);
+        let matrix = rq::ajtai_matrix(hybrid::MODULUS, RING_ELEMENTS);
+        let want = commit_reference(&values, &matrix, hybrid::MODULUS);
+        assert!(want.iter().all(|&x| x < hybrid::MODULUS));
+        for workers in [1, 3, 8] {
+            let transformed = hybrid::matrix(RING_ELEMENTS, workers);
+            assert_eq!(hybrid::commit(&values, &transformed, workers), want, "workers {workers}");
+        }
     }
 
     /// The same on short columns, many cases, column counts around the batch width.

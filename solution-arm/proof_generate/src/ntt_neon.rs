@@ -725,6 +725,7 @@ unsafe fn pass_dual<const P:usize>(x:&mut [int16x8_t;N],row:&[i16],tail:&[i16],b
     }
 }
 #[inline(never)]
+#[allow(dead_code)]
 unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [int16x8_t;BITS],x:&mut [int16x8_t;N],acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
     let kern=&kernels()[P];let s=SCHEDULES[P];
     tail.fill(vdupq_n_s32(0));
@@ -738,6 +739,40 @@ unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hyb
     }
     reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
 }
+/// Elements whose masks are built once for both primes' transforms: a block's masks (8 KB per
+/// element) and one prime's two slot sums (40 KB) stay in L1 while the block goes through it.
+const MASK_BLOCK: usize = 2;
+
+/// One element of one prime: its transform multiplied into both slot sums, which are reduced
+/// every [`Schedule::accumulate`] elements of the chunk.
+#[inline(always)]
+unsafe fn hybrid_element<const P:usize>(m:&[int16x8_t;BITS],x:&mut [int16x8_t;N],a:&crate::hybrid::Matrix,start:usize,e:usize,acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
+    let kern=&kernels()[P];let s=SCHEDULES[P];
+    pass_a(m,x,kern);pass_b::<P>(x,kern);pass_c::<P>(x,kern);
+    pass_dual::<P>(x,a.row(e,P,0),a.row(e,P,1),acc,tail);
+    if (e-start+1)%s.accumulate==0 {
+        reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+    }
+}
+
+/// [`hybrid_chunk`] for both primes at once: every element's masks are built once
+/// ([`masks`], [`MASK_BLOCK`] elements at a time) and go through both primes' transforms.
+#[inline(never)]
+unsafe fn hybrid_chunk_both(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [[int16x8_t;BITS];MASK_BLOCK],x:&mut [int16x8_t;N],a0:&mut [int32x4_t],t0:&mut [int32x4_t],a1:&mut [int32x4_t],t1:&mut [int32x4_t]) {
+    t0.fill(vdupq_n_s32(0));t1.fill(vdupq_n_s32(0));
+    for e0 in (start..end).step_by(MASK_BLOCK) {
+        let n=(end-e0).min(MASK_BLOCK);
+        for (i,mi) in m.iter_mut().enumerate().take(n) {
+            let at=core::array::from_fn(|c|words[c].0.add((e0+i)*words[c].1));
+            masks(&at,mi);
+        }
+        for (i,mi) in m.iter().enumerate().take(n) {hybrid_element::<0>(mi,x,a,start,e0+i,a0,t0);}
+        for (i,mi) in m.iter().enumerate().take(n) {hybrid_element::<1>(mi,x,a,start,e0+i,a1,t1);}
+    }
+    for (acc,p) in [(&mut *a0,0usize),(&mut *t0,0),(&mut *a1,1),(&mut *t1,1)] {
+        reduce_sums(acc,PRIMES[p] as i32,kernels()[p].v32);
+    }
+}
 unsafe fn inverse_acc(p:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
     for j in 0..N {x[j]=vcombine_s16(vmovn_s32(acc[2*j]),vmovn_s32(acc[2*j+1]));}
     inverse_lanes(p,x);
@@ -746,7 +781,7 @@ pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec
     let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
     let columns=values.len()/len;let mut out=vec![0u128;columns*N];
     for_blocks(&mut out,N,8,workers,|first,block|unsafe {
-        let mut m=Box::new([vdupq_n_s16(0);BITS]);
+        let mut m=Box::new([[vdupq_n_s16(0);BITS];MASK_BLOCK]);
         let mut x=Box::new([vdupq_n_s16(0);N]);
         let mut y=Box::new([vdupq_n_s16(0);N]);
         let mut acc=vec![vdupq_n_s32(0);4*N];let mut tail=acc.clone();
@@ -757,8 +792,7 @@ pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec
             let (a0,a1)=acc.split_at_mut(2*N);let (t0,t1)=tail.split_at_mut(2*N);
             for start in (0..a.elements).step_by(crate::hybrid::CHUNK) {
                 let end=(start+crate::hybrid::CHUNK).min(a.elements);
-                hybrid_chunk::<0>(&words,a,start,end,&mut m,&mut x,a0,t0);
-                hybrid_chunk::<1>(&words,a,start,end,&mut m,&mut x,a1,t1);
+                hybrid_chunk_both(&words,a,start,end,&mut m,&mut x,a0,t0,a1,t1);
                 inverse_acc(0,t0,&mut x);inverse_acc(1,t1,&mut y);
                 for j in 0..N {
                     let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
