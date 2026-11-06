@@ -35,9 +35,7 @@ macro_rules! level4_mem {
      $o0:literal, $o1:literal, $o2:literal, $t:literal) => {
         concat!(
             level4_mem!(plain $a0, $a1, $a2, $o0, $o1, $o2, $t),
-            // logical a >> 11 is the window (a >> 11) & 31 (bits 11..15 of the lane), and
-            // vpermw only reads the low 5 bits of each word index anyway.
-            "vpsrlw zmm30, zmm", $a0, ", 11\n",
+            "vpmultishiftqb zmm30, zmm31, zmm", $a0, "\n",
             "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
             "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
         )
@@ -142,6 +140,7 @@ const fn expanded<const Q:u16>()->ExpandedTwiddles{
  i=0;while i<864{t.t6[i]=[old.tw6[i/4][i%4]as i16;32];i+=1;}t
 }
 static SMS_TWIDDLES:ExpandedTwiddles=expanded::<9721>();
+static WINDOW_SHIFT: u64 = 11 | 27 << 16 | 43 << 32 | 59 << 48;
 #[inline(never)]
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn tail27_mem_b(
@@ -155,6 +154,7 @@ unsafe fn tail27_mem_b(
     core::arch::asm!(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
+            "vpbroadcastq zmm31, qword ptr [{m}]\n",
             tail27_mem!(lut, barrett),
         ),
         i = in(reg) bp,
@@ -163,6 +163,7 @@ unsafe fn tail27_mem_b(
         t5 = in(reg) t5,
         t6 = in(reg) t6,
         c = in(reg) cv,
+        m = in(reg) &WINDOW_SHIFT as *const u64,
         out("zmm0") _,
         out("zmm1") _,
         out("zmm2") _,
@@ -194,6 +195,7 @@ unsafe fn tail27_mem_b(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
+        out("zmm31") _,
         options(nostack)
     );
 }
