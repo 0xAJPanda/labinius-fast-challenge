@@ -268,6 +268,15 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
 
 /// Elements transformed per pass of the slot-wise products over the accumulators.
 const LOCK: usize = 4;
+const AHEAD: usize = 2 * LOCK;
+
+#[inline(always)]
+unsafe fn prefetch_element(words: &[(*const u8, usize); LANES], e: usize) {
+    for &(base, stride) in words {
+        let p = base.wrapping_add(e * stride);
+        core::arch::asm!("prfm pldl2keep, [{p}]", p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
 
 /// The accumulator pair of slot `s`, row `r`: `acc[idx..idx + 2]`, columns 0..4 then 4..8.
 #[inline(always)]
@@ -352,6 +361,9 @@ unsafe fn sums(
         let l = LOCK.min(end - e);
         let mut rows = [core::ptr::null::<i16>(); LOCK];
         for i in 0..l {
+            if e + i + AHEAD < a.elements {
+                prefetch_element(words, e + i + AHEAD);
+            }
             let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e + i) * words[c].1));
             masks(&at, m);
             let x = &mut xs[i];
