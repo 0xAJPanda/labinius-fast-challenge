@@ -1755,12 +1755,12 @@ unsafe fn message_range(
     let mut buf = EqTile([B128::ZERO; TILE]);
     for j0 in range.step_by(TILE) {
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
-        for g in 0..8 {
+        for g in (0..8).step_by(2) {
             let j = j0 + 8 * g;
-            let p0 = load_p(src, j);
-            let p1 = load_p(src, j + half);
-            super::f162::mac_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], p0);
-            super::f162::mac_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(p0, p1));
+            let (p0, r0) = (load_p(src, j), load_p(src, j + 8));
+            let (p1, r1) = (load_p(src, j + half), load_p(src, j + 8 + half));
+            super::f162::mac2_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], p0, [av[0][g + 1], av[1][g + 1], av[2][g + 1]], r0);
+            super::f162::mac2_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(p0, p1), [apv[0][g + 1], apv[1][g + 1], apv[2][g + 1]], xor3p(r0, r1));
         }
     }
     [horiz8(acc0), horiz8(acci)]
@@ -1948,19 +1948,23 @@ unsafe fn fold_message_range(
             }
         }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
-        for g in 0..8 {
-            let j = j0 + 8 * g;
-            let q0 = fold8(rb, load_p(src, j), load_p(src, j + half));
-            let q1 = fold8(rb, load_p(src, j + hh), load_p(src, j + hh + half));
-            if stream {
-                stream_p(dst, j, q0);
-                stream_p(dst, j + hh, q1);
-            } else {
-                store_p(dst, j, q0);
-                store_p(dst, j + hh, q1);
+        for g in (0..8).step_by(2) {
+            let mut q = [[_mm512_setzero_si512(); 3]; 4];
+            for (h, jg) in [j0 + 8 * g, j0 + 8 * g + 8].into_iter().enumerate() {
+                let q0 = fold8(rb, load_p(src, jg), load_p(src, jg + half));
+                let q1 = fold8(rb, load_p(src, jg + hh), load_p(src, jg + hh + half));
+                if stream {
+                    stream_p(dst, jg, q0);
+                    stream_p(dst, jg + hh, q1);
+                } else {
+                    store_p(dst, jg, q0);
+                    store_p(dst, jg + hh, q1);
+                }
+                q[2 * h] = q0;
+                q[2 * h + 1] = q1;
             }
-            super::f162::mac_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], q0);
-            super::f162::mac_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(q0, q1));
+            super::f162::mac2_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], q[0], [av[0][g + 1], av[1][g + 1], av[2][g + 1]], q[2]);
+            super::f162::mac2_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(q[0], q[1]), [apv[0][g + 1], apv[1][g + 1], apv[2][g + 1]], xor3p(q[2], q[3]));
         }
     }
     if stream {

@@ -48,6 +48,15 @@ pub unsafe fn mac_soa8(acc: &mut [__m512i; 12], a: [__m512i; 3], b: [__m512i; 3]
 }
 
 #[inline(always)]
+pub unsafe fn mac2_soa8(acc: &mut [__m512i; 12], a: [__m512i; 3], b: [__m512i; 3], c: [__m512i; 3], d: [__m512i; 3]) {
+    let p = prods_soa8(a, b);
+    let q = prods_soa8(c, d);
+    for i in 0..12 {
+        acc[i] = x3(acc[i], p[i], q[i]);
+    }
+}
+
+#[inline(always)]
 pub unsafe fn reduce_soa8(p: [__m512i; 12]) -> [__m512i; 3] {
     let m17 = _mm512_set1_epi64(((1u64 << 17) - 1) as i64);
     let m34 = _mm512_set1_epi64(((1u64 << 34) - 1) as i64);
