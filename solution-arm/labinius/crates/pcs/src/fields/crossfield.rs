@@ -602,6 +602,21 @@ impl SwitchProver {
     }
 }
 
+pub fn dot_lifted(eq: &[F162], x: &[B128]) -> F162 {
+    assert_eq!(eq.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    if super::neon::pmull() {
+        return unsafe { super::neon::dot_lifted(eq, x) };
+    }
+    dot_lifted_scalar(eq, x)
+}
+
+pub fn dot_lifted_scalar(eq: &[F162], x: &[B128]) -> F162 {
+    eq.iter()
+        .zip(x)
+        .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x))
+}
+
 pub fn slice_sum(v: &[B128], batch: &[F162]) -> F162 {
     let mut u = vec![0u128; PACK];
     for (i, &vi) in v.iter().enumerate() {

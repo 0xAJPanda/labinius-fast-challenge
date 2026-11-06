@@ -410,6 +410,46 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
     }
 }
 
+///
+/// # Safety
+/// The CPU must have PMULL ([`pmull`]).
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn dot_lifted(eq: &[F162], x: &[B128]) -> F162 {
+    assert_eq!(eq.len(), x.len());
+    #[inline(always)]
+    unsafe fn mac(acc: &mut [uint64x2_t; 4], e: &F162, x: &B128) {
+        let e01 = vld1q_u64(e.0.as_ptr());
+        let e22 = vld1q_dup_u64(e.0.as_ptr().add(2));
+        let xs = vld1q_u64(&x.0 as *const u128 as *const u64);
+        let sx = vextq_u64::<1>(xs, xs);
+        acc[0] = x2(acc[0], pmul_lo(e01, xs));
+        acc[1] = x3(acc[1], pmul_lo(e01, sx), pmul_hi(e01, sx));
+        acc[2] = x3(acc[2], pmul_hi(e01, xs), pmul_lo(e22, xs));
+        acc[3] = x2(acc[3], pmul_hi(e22, xs));
+    }
+    let mut a = [vdupq_n_u64(0); 4];
+    let mut b = [vdupq_n_u64(0); 4];
+    let pairs = eq.len() / 2;
+    for i in 0..pairs {
+        mac(&mut a, &eq[2 * i], &x[2 * i]);
+        mac(&mut b, &eq[2 * i + 1], &x[2 * i + 1]);
+    }
+    if eq.len() % 2 == 1 {
+        mac(&mut a, &eq[2 * pairs], &x[2 * pairs]);
+    }
+    let s: [u128; 4] = core::array::from_fn(|k| to_u128(x2(a[k], b[k])));
+    let lo = |v: u128| v as u64;
+    let hi = |v: u128| (v >> 64) as u64;
+    reduce([
+        lo(s[0]),
+        hi(s[0]) ^ lo(s[1]),
+        hi(s[1]) ^ lo(s[2]),
+        hi(s[2]) ^ lo(s[3]),
+        hi(s[3]),
+        0,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +482,24 @@ mod tests {
                 let want = (0..8).fold(0u8, |s, i| s | ((rows[i].bit(k) as u8) << i));
                 assert_eq!(out[16 * t + b], want, "t {t} b {b}");
             }
+        }
+    }
+
+    #[test]
+    fn dot_lifted_matches_full_products() {
+        if !pmull() {
+            return;
+        }
+        let mut rng = Rng(0x0F1E_2D3C_4B5A_6978_8796_A5B4_C3D2_E1F0);
+        for n in [0usize, 1, 2, 3, 17, 1000] {
+            let eq: Vec<F162> = (0..n).map(|_| rng.f162()).collect();
+            let mut x: Vec<B128> = (0..n).map(|_| B128(rng.next())).collect();
+            if n > 2 {
+                x[0] = B128(u128::MAX);
+                x[1] = B128::ZERO;
+            }
+            let want = super::super::crossfield::dot_lifted_scalar(&eq, &x);
+            assert_eq!(unsafe { dot_lifted(&eq, &x) }, want, "n {n}");
         }
     }
 
