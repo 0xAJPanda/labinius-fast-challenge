@@ -1400,6 +1400,7 @@ mod bitsliced {
     /// Entries a group's schedule may add to a slot pair beyond one per term: padding of its
     /// positive and of its negative entries to multiples of 2.
     const PAD_PER_GROUP: usize = 2;
+    const LINES_PER_COLUMN: usize = LANES * 16 / 64;
     // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.
     const _: () = assert!((GUARD + COL_GROUP * STRIDE) * 8 <= u16::MAX as usize);
 
@@ -2268,7 +2269,16 @@ mod bitsliced {
                 if let Some(start) = start { times[0] += start.elapsed(); }
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
+                let ahead = if gi + 1 < range.end { Some(&groups[gi + 1]) } else { None };
+                let lines = ahead.map_or(0, |g| g.columns * LINES_PER_COLUMN);
                 for q in 0..PAIRS {
+                    if let Some(ng) = ahead {
+                        for l in q * lines / PAIRS..(q + 1) * lines / PAIRS {
+                            let (j, at) = (l / LINES_PER_COLUMN, l % LINES_PER_COLUMN);
+                            let p = words.as_ptr().add((ng.first + j) * column_words + block * LANES) as *const i8;
+                            _mm_prefetch::<_MM_HINT_T1>(p.add(64 * at));
+                        }
+                    }
                     accumulate_pair(
                         planes.as_ptr(),
                         &group.terms[group.offsets[q]..group.mid[q]],
