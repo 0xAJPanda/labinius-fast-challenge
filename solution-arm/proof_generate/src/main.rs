@@ -417,38 +417,52 @@ fn fold_element(values: &[B128], challenges: &[ShortChallenge], m: usize) -> Rin
     element
 }
 
+const FOLD_BLOCK: usize = 128;
+const FOLD_BLOCKS: usize = (2 * rq::N).div_ceil(FOLD_BLOCK);
+const FOLD_REACH: usize = WITNESS_COEFFICIENTS / FOLD_BLOCK;
+const FOLD_SPAN: usize = FOLD_BLOCK + WITNESS_COEFFICIENTS + FOLD_BLOCK;
+const FOLD_GROUP: usize = 8;
+const FOLD_TERMS: usize = i8::MAX as usize;
+
 /// [`fold_element`] in narrow lanes: a raw coefficient gains at most one `+-1` per challenge
-/// term, so `sum_j weight_j <= i16::MAX` bounds every `i16` sum, and the latest columns are
-/// summed in `i8` lanes, sixteen to a vector, until their terms could reach `i8::MAX`. A column's
-/// bits become `0 / -1` byte masks in coefficient order; the ring reduction runs in `i32`.
 fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize) -> RingElement648 {
-    let mut raw = [0i16; 2 * rq::N];
-    let mut near = [0i8; 2 * rq::N];
-    let mut pending = 0usize;
-    let mut mask = [0i8; WITNESS_COEFFICIENTS];
+    let mut raw = [0i16; FOLD_BLOCKS * FOLD_BLOCK];
+    let mut masks = [0i8; 2 * FOLD_GROUP * FOLD_SPAN];
+    let mut terms = [(0usize, 0usize); FOLD_TERMS];
+    let mut count = 0usize;
+    let mut columns = 0usize;
     for (j, challenge) in challenges.iter().enumerate() {
-        if pending + challenge.weight > i8::MAX as usize {
-            flush(&mut raw, &mut near);
-            pending = 0;
+        if challenge.weight == 0 {
+            continue;
         }
-        pending += challenge.weight;
-        expand_mask(&values[j * COLUMN_LEN + 4 * m..][..4], &mut mask);
+        if count + challenge.weight > FOLD_TERMS || columns == FOLD_GROUP {
+            fold_group(&masks, &terms[..count], &mut raw);
+            count = 0;
+            columns = 0;
+        }
+        let negative_at = 2 * columns * FOLD_SPAN + FOLD_BLOCK;
+        let positive_at = negative_at + FOLD_SPAN;
+        let (negative_mask, positive_mask) = masks[negative_at..].split_at_mut(FOLD_SPAN);
+        let negative_mask: &mut [i8; WITNESS_COEFFICIENTS] =
+            (&mut negative_mask[..WITNESS_COEFFICIENTS]).try_into().unwrap();
+        expand_mask(&values[j * COLUMN_LEN + 4 * m..][..4], negative_mask);
+        for (p, &n) in positive_mask[..WITNESS_COEFFICIENTS].iter_mut().zip(negative_mask.iter()) {
+            *p = n.wrapping_neg();
+        }
         for t in 0..challenge.weight {
             let position = challenge.positions[t] as usize;
             let negative = ((challenge.signs >> t) & 1 == 1) ^ (position % 2 == 1);
-            let window = &mut near[4 * position..][..WITNESS_COEFFICIENTS];
-            if negative {
-                for (slot, &b) in window.iter_mut().zip(&mask) {
-                    *slot = slot.wrapping_add(b);
-                }
-            } else {
-                for (slot, &b) in window.iter_mut().zip(&mask) {
-                    *slot = slot.wrapping_sub(b);
-                }
-            }
+            let offset = 4 * position;
+            assert!(
+                offset + WITNESS_COEFFICIENTS <= 2 * rq::N,
+                "a challenge position lies outside the ring"
+            );
+            terms[count] = (if negative { negative_at } else { positive_at }, offset);
+            count += 1;
         }
+        columns += 1;
     }
-    flush(&mut raw, &mut near);
+    fold_group(&masks, &terms[..count], &mut raw);
     let mut wide = [0i32; 2 * rq::N];
     for (w, &r) in wide.iter_mut().zip(&raw) {
         *w = r as i32;
@@ -465,12 +479,64 @@ fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize)
     element
 }
 
-/// `raw += near`, then `near = 0`.
+fn fold_group(masks: &[i8], terms: &[(usize, usize)], raw: &mut [i16; FOLD_BLOCKS * FOLD_BLOCK]) {
+    if terms.is_empty() {
+        return;
+    }
+    let mut first = [0usize; FOLD_BLOCKS + 1];
+    for &(_, offset) in terms {
+        first[offset / FOLD_BLOCK + 1] += 1;
+    }
+    for b in 0..FOLD_BLOCKS {
+        first[b + 1] += first[b];
+    }
+    let mut next = first;
+    let mut sorted = [(0usize, 0usize); FOLD_TERMS];
+    for &term in terms {
+        let bucket = term.1 / FOLD_BLOCK;
+        sorted[next[bucket]] = term;
+        next[bucket] += 1;
+    }
+    for b in 0..FOLD_BLOCKS {
+        let (lo, hi) = (first[b.saturating_sub(FOLD_REACH)], first[b + 1]);
+        if lo < hi {
+            let block: &mut [i16; FOLD_BLOCK] =
+                (&mut raw[b * FOLD_BLOCK..][..FOLD_BLOCK]).try_into().unwrap();
+            fold_block(masks, &sorted[lo..hi], b * FOLD_BLOCK, block);
+        }
+    }
+}
+
 #[inline(always)]
-fn flush(raw: &mut [i16; 2 * rq::N], near: &mut [i8; 2 * rq::N]) {
-    for (r, n) in raw.iter_mut().zip(near.iter_mut()) {
-        *r = r.wrapping_add(*n as i16);
-        *n = 0;
+fn fold_block(masks: &[i8], terms: &[(usize, usize)], base: usize, raw: &mut [i16; FOLD_BLOCK]) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let mut acc = [vdupq_n_s8(0); FOLD_BLOCK / 16];
+        for &(start, offset) in terms {
+            let window = &masks[start + base - offset..][..FOLD_BLOCK];
+            for (v, a) in acc.iter_mut().enumerate() {
+                *a = vaddq_s8(*a, vld1q_s8(window.as_ptr().add(16 * v)));
+            }
+        }
+        for (v, a) in acc.iter().enumerate() {
+            let r = raw.as_mut_ptr().add(16 * v);
+            vst1q_s16(r, vaddw_s8(vld1q_s16(r), vget_low_s8(*a)));
+            vst1q_s16(r.add(8), vaddw_high_s8(vld1q_s16(r.add(8)), *a));
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut acc = [0i8; FOLD_BLOCK];
+        for &(start, offset) in terms {
+            let window = &masks[start + base - offset..][..FOLD_BLOCK];
+            for (a, &w) in acc.iter_mut().zip(window) {
+                *a = a.wrapping_add(w);
+            }
+        }
+        for (r, &a) in raw.iter_mut().zip(&acc) {
+            *r = r.wrapping_add(a as i16);
+        }
     }
 }
 
