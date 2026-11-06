@@ -2242,7 +2242,7 @@ mod bitsliced {
                 break;
             }
             ran += 1;
-            let (block, part) = (task / parts, task % parts);
+            let (block, part) = (tasks / parts - 1 - task / parts, task % parts);
             for p in 0..2 * PAIRS * BITS {
                 _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
             }
