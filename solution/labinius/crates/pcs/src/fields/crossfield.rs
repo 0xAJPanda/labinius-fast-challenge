@@ -1550,8 +1550,7 @@ unsafe fn stream_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 /// Fold outputs of at least this many elements (per plane) are written non-temporally: at
 /// 24 bytes per element this is 50 MB, past what stays in the cache between two rounds.
 const STREAM_FROM: usize = 1 << 21;
-/// Words ahead of the current tile that [`fold_message_range`] prefetches in each stream.
-const FOLD_AHEAD: usize = 128;
+const FOLD_AHEAD: usize = TILE;
 
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
