@@ -1223,12 +1223,11 @@ impl ProofLayout {
 
 /// The codec's encoding of `parts`, written into `out` (`layout.len()` bytes): the small
 /// fields on this thread, the commitment and the folded witness (`i32` little-endian per
-/// coefficient) in parallel on the pool.
 ///
 /// # Safety
 /// `out` must be valid for writes of `layout.len()` bytes, and `layout` must be
 /// [`ProofLayout::of_parts`]`(parts)`.
-unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
+unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8, folded_written: bool) {
     let put = |at: &mut usize, bytes: &[u8]| {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
         *at += bytes.len();
@@ -1266,10 +1265,9 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
             .all(|e| e.representation == Representation::Coefficients),
         "a fold is in coefficient form"
     );
-    // A few commitment slices and many folded runs, taken dynamically.
-    let ctasks = 4;
+    let ctasks = if folded_written { threads() } else { 4 };
     let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
-    let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
+    let fruns = if folded_written { Vec::new() } else { labinius::par::ranges(elements.len(), 4 * threads(), 1) };
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
     let avx512 = std::arch::is_x86_feature_detected!("avx512f");
@@ -1320,6 +1318,7 @@ struct Output {
     populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
     /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
     commitment: std::sync::Mutex<Option<Vec<u8>>>,
+    folded_written: std::sync::atomic::AtomicBool,
 }
 
 struct OutputState {
@@ -1455,6 +1454,7 @@ impl Output {
             job,
             populate: std::sync::OnceLock::new(),
             commitment: std::sync::Mutex::new(Some(commitment)),
+            folded_written: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1462,6 +1462,14 @@ impl Output {
     fn commitment_buffer(&self) -> Option<Vec<u8>> {
         labinius::par::pool().quiesce(self.job);
         self.commitment.lock().unwrap().take()
+    }
+
+    fn folded_wire(&self) -> Option<usize> {
+        labinius::par::pool().quiesce(self.job);
+        let Some(Some(m)) = self.state.map.get() else { return None };
+        let layout = &self.state.layout;
+        (layout.folded_bytes == FOLDED_BYTES * N * RING_ELEMENTS && RING_ELEMENTS == COLUMN_LEN / 4)
+            .then(|| m.addr + layout.folded_at())
     }
 
     /// Fault the file's pages in on the idle workers, 2 MB per chunk. Called where the main
@@ -1496,7 +1504,8 @@ impl Output {
         let layout = ProofLayout::of_parts(&parts);
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
-                unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
+                let folded_written = self.folded_written.load(std::sync::atomic::Ordering::Acquire);
+                unsafe { encode_into(&parts, &layout, m.addr as *mut u8, folded_written) };
                 // The pages are the file's; the exit unmaps them.
                 return;
             }
@@ -1774,9 +1783,14 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
-    ));
+    let wire = output.and_then(|o| o.folded_wire());
+    let (folded, wired) = labinius::fold::fold_witness_bitsliced(
+        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers, wire,
+    );
+    if let Some(output) = output {
+        output.folded_written.store(wired, std::sync::atomic::Ordering::Release);
+    }
+    let folded = FoldedWitness::of(folded);
     let fold_time = clock.elapsed();
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
     // now, a slice per core, instead of in the exit's teardown on one core after the proof is
@@ -2129,7 +2143,7 @@ mod tests {
             };
             let layout = ProofLayout::of_parts(&parts);
             let mut out = vec![0xA5u8; layout.len()];
-            unsafe { encode_into(&parts, &layout, out.as_mut_ptr()) };
+            unsafe { encode_into(&parts, &layout, out.as_mut_ptr(), false) };
             assert_eq!(out, codec().serialize(&parts.into_proof()).unwrap());
         }
         assert_eq!(ProofLayout::of_instance(MODULUS).len(), 13_958_612, "the default proof's length");
