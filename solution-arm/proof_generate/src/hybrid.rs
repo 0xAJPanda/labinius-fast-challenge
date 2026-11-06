@@ -4,7 +4,7 @@ use crate::ntt::{self, N, ROW, for_blocks, centered, primes};
 use labinius::fields::scalar::B128;
 pub const PRODUCT: i64 = 3889 * 9721;
 pub const MODULUS: u128 = PRODUCT as u128 * 1024;
-pub const CHUNK: usize = 256;
+pub const CHUNK: usize = 224;
 const _: () = assert!(MODULUS >= 34_816_965_049 && MODULUS < (1u128 << 96));
 
 pub struct Matrix { pub elements: usize, pub data: Vec<i16> }
@@ -46,27 +46,6 @@ pub fn certificate(raw: &[[i16; N]]) -> i64 {
     worst
 }
 
-/// Lifts of each coefficient pair `(a, b)` an `X^324` apart, congruent modulo 1024, that
-/// minimize `|a| + |b| + |a + b|`, the entries the reduction by `X^648 - X^324 + 1` makes of them
-/// (see [`certificate`]); ties keep the centered pair. From the x86 track's `lift_tail_pair`
-/// (submission ba664a0c). The smaller extrema certify chunks of 256 elements instead of 192.
-fn lift_pairs(t: &mut [i16; N]) {
-    let norm = |a: i32, b: i32| a.abs() + b.abs() + (a + b).abs();
-    for j in 0..N / 2 {
-        let (a, b) = (t[j] as i32, t[j + N / 2] as i32);
-        let mut best = (a, b);
-        for u in -1..=1 {
-            for v in -1..=1 {
-                let (x, y) = (a + 1024 * u, b + 1024 * v);
-                if norm(x, y) < norm(best.0, best.1) {
-                    best = (x, y);
-                }
-            }
-        }
-        (t[j], t[j + N / 2]) = (best.0 as i16, best.1 as i16);
-    }
-}
-
 pub fn matrix(elements: usize, workers: usize) -> Matrix {
     let mut data = vec![0i16; 4*elements*ROW];
     // Block boundaries coincide with the certified reconstruction boundaries.
@@ -82,7 +61,6 @@ pub fn matrix(elements: usize, workers: usize) -> Matrix {
                     crate::rq::ajtai_element(MODULUS,elements,start+base+e,&mut coefficients[e]);
                     // Center residues: map 512..1023 to -512..-1, leave 0..511.
                     for j in 0..N {raw[base+e][j] = (((coefficients[e][j] as i64+512)&1023)-512) as i16;}
-                    lift_pairs(&mut raw[base+e]);
                 }
                 for p in 0..2 { for tail in 0..2 {
                     let prime=primes()[p].p;
@@ -123,27 +101,6 @@ pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn lifted_pairs_keep_residues_and_minimize() {
-        let norm = |a: i32, b: i32| a.abs() + b.abs() + (a + b).abs();
-        let mut t = [0i16; N];
-        for a in (-512i32..512).step_by(3) {
-            for b in (-512i32..512).step_by(5) {
-                t[7] = a as i16; t[7 + N / 2] = b as i16;
-                let mut l = t; lift_pairs(&mut l);
-                let (x, y) = (l[7] as i32, l[7 + N / 2] as i32);
-                assert_eq!((x - a).rem_euclid(1024), 0); assert_eq!((y - b).rem_euclid(1024), 0);
-                for u in -2..=2 { for v in -2..=2 {
-                    assert!(norm(x, y) <= norm(a + 1024 * u, b + 1024 * v));
-                }}
-            }
-        }
-    }
-    /// Every chunk of the default matrix passes the certificate (it is also checked while the
-    /// matrix is built).
-    #[test] fn default_chunks_are_certified() {
-        let a = matrix(crate::RING_ELEMENTS, 8);
-        assert_eq!(a.elements, crate::RING_ELEMENTS);
-    }
     #[test] fn crt_boundaries() {
         assert_eq!(3889*3242%9721,1); assert_eq!(PRODUCT*153%1024,1);
         for x in [0,1,3888,3889,PRODUCT/2,PRODUCT-1,MODULUS as i64-1] {
@@ -162,7 +119,7 @@ mod tests {
         assert_eq!(certificate(&[a]),pos.into_iter().chain(neg).max().unwrap());
     }
     #[test] fn commitment_matches_schoolbook() {
-        for elements in [1,3,193,257] {
+        for elements in [1,3,225] {
             let a=matrix(elements,2);
             let mut s=19u64;
             let values:Vec<B128>=(0..4*elements*9).map(|_| {

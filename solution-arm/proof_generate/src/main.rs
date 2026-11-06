@@ -8,8 +8,6 @@
 //! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
 //! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
-#[cfg(target_arch = "aarch64")]
-mod fold_neon;
 mod hugealloc;
 mod ntt;
 mod hybrid;
@@ -21,7 +19,6 @@ mod rq;
 
 use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
-use labinius::fields::lean::LeanSwitch;
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
@@ -272,7 +269,19 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     if modulus == hybrid::MODULUS {
-        return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
+        const BYTES: usize = 4 * RING_ELEMENTS * ntt::ROW * 2;
+        #[repr(C, align(64))]
+        struct Aligned([u8; BYTES]);
+        static IMAGE: Aligned = Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-matrix.bin")));
+        #[cfg(target_endian = "little")]
+        let data = unsafe {
+            std::slice::from_raw_parts(IMAGE.0.as_ptr().cast::<i16>(), BYTES / 2)
+        }.to_vec();
+        #[cfg(target_endian = "big")]
+        let data = IMAGE.0.chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]])).collect::<Vec<_>>();
+        let matrix = hybrid::Matrix { elements: RING_ELEMENTS, data };
+        return hybrid::commit(values, &matrix, threads());
     }
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
@@ -513,13 +522,74 @@ fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
 }
 
 fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    let narrow = challenges.iter().map(|c| c.weight).sum::<usize>() <= i16::MAX as usize;
-    #[cfg(target_arch = "aarch64")]
-    if narrow {
-        if let Some(buckets) = fold_neon::Buckets::of(challenges) {
-            return fold_sliced(values, &buckets);
-        }
+    // The bit-sliced fold's 16-plane counters hold sums below 2^15.
+    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
+        return fold_bitsliced(values, challenges);
     }
+    fold_bytes(values, challenges)
+}
+
+/// The fold of the x86 track's bit-sliced kernel (`fold_bits`), on NEON: blocks of 128 ring
+/// elements, each column's 512 words transposed into bit planes and counted per raw row with
+/// carry-save adders; blocks are handed out to the workers dynamically.
+fn fold_bitsliced(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    use labinius::fold_bits as fb;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const _: () = assert!(COLUMN_LEN % fb::LANES == 0 && fb::N == rq::N);
+    let cs: Vec<fb::Challenge> = challenges
+        .iter()
+        .map(|c| fb::Challenge {
+            positions: c.positions,
+            signs: c.signs,
+            weight: c.weight,
+        })
+        .collect();
+    let reach = fb::Reach::of(&cs);
+    let blocks = RING_ELEMENTS / fb::BLOCK_ELEMENTS;
+    let mut out: Vec<[i16; rq::N]> = vec![[0i16; rq::N]; RING_ELEMENTS];
+    let out_addr = out.as_mut_ptr() as usize;
+    let words = values.as_ptr() as usize;
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads().min(blocks) {
+            let (cs, reach, next) = (&cs, &reach, &next);
+            scope.spawn(move || loop {
+                let block = next.fetch_add(1, Ordering::Relaxed);
+                if block >= blocks {
+                    break;
+                }
+                // SAFETY: blocks are disjoint runs of `BLOCK_ELEMENTS` elements of `out`, and
+                // `values` holds `COLUMNS` columns of `COLUMN_LEN` words.
+                unsafe {
+                    let chunk = core::slice::from_raw_parts_mut(
+                        (out_addr as *mut [i16; rq::N]).add(block * fb::BLOCK_ELEMENTS),
+                        fb::BLOCK_ELEMENTS,
+                    );
+                    fb::fold_block::<fb::V, fb::Portable>(
+                        words as *const u128,
+                        COLUMNS,
+                        COLUMN_LEN,
+                        cs,
+                        reach,
+                        block,
+                        &fb::Portable,
+                        chunk,
+                    );
+                }
+            });
+        }
+    });
+    out.into_iter()
+        .map(|v| {
+            let mut e = RingElement648::zero(Representation::Coefficients);
+            e.v.copy_from_slice(&v);
+            e
+        })
+        .collect()
+}
+
+fn fold_bytes(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    let narrow = challenges.iter().map(|c| c.weight).sum::<usize>() <= i16::MAX as usize;
     let per = RING_ELEMENTS.div_ceil(threads());
     let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
         .map(|_| RingElement648::zero(Representation::Coefficients))
@@ -533,27 +603,6 @@ fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
                     } else {
                         fold_element(values, challenges, base + i)
                     };
-                }
-            });
-        }
-    });
-    out
-}
-
-/// The fold through [`fold_neon`]: ring elements in contiguous runs over the workers.
-#[cfg(target_arch = "aarch64")]
-fn fold_sliced(values: &[B128], buckets: &fold_neon::Buckets) -> Vec<RingElement648> {
-    let per = RING_ELEMENTS.div_ceil(threads());
-    let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
-        .map(|_| RingElement648::zero(Representation::Coefficients))
-        .collect();
-    std::thread::scope(|scope| {
-        for (block, base) in out.chunks_mut(per).zip((0..).step_by(per)) {
-            scope.spawn(move || {
-                let mut scratch = fold_neon::Scratch::new(buckets);
-                for (i, run) in block.chunks_mut(fold_neon::BLOCK).enumerate() {
-                    let m0 = base + i * fold_neon::BLOCK;
-                    fold_neon::fold_elements(values, buckets, &mut scratch, m0, run);
                 }
             });
         }
@@ -612,23 +661,38 @@ impl Proof {
     }
 }
 
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
-    timer.lap("commit");
-    let mut t = transcript(seed, modulus, &commitment);
-    let lo = t.sample_b128(b"r-lo", 7);
-    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let (mut switch, partials) = LeanSwitch::partials(values, &hi);
-    timer.lap("sw_partials");
+fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
+    #[cfg(target_arch = "aarch64")]
+    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
+        let partials = prepared.partials();
+        let value = partials.iter().zip(cf::eq_expand_b128(lo))
+            .fold(B128::ZERO, |a, (&v, e)| a + v * e);
+        t.absorb_b128(&[value]);
+        t.absorb_b128(&partials);
+        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
+        let mut rounds = Vec::with_capacity(LOG_PACKED);
+        let mut coords = Vec::with_capacity(LOG_PACKED);
+        for _ in 0..LOG_PACKED {
+            let msg = switch.msg();
+            t.absorb_f162(&msg);
+            let r = t.sample_f162(b"switch-round", 1)[0];
+            rounds.push(msg.map(|v| v.0));
+            coords.push(r);
+            switch.fold(r);
+        }
+        return (partials, rounds, coords, switch.final_eval());
+    }
+    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+    let partials = ws.partial_evals(0, values, hi);
     let value = partials
         .iter()
-        .zip(cf::eq_expand_b128(&lo))
+        .zip(cf::eq_expand_b128(lo))
         .fold(B128::ZERO, |a, (&v, e)| a + v * e);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    switch.start(&batch);
-    timer.lap("sw_setup");
+    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
@@ -640,6 +704,16 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
         switch.fold(r);
     }
     let opened = switch.final_eval();
+    (partials, rounds, coords, opened)
+}
+
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
+    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+    timer.lap("commit");
+    let mut t = transcript(seed, modulus, &commitment);
+    let lo = t.sample_b128(b"r-lo", 7);
+    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
+    let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);
@@ -690,7 +764,6 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
-    timer.lap("drop");
     let bytes = proof.encode();
     std::fs::write(&args[2], bytes).expect("write proof");
     timer.lap("write");
@@ -742,77 +815,6 @@ mod tests {
                 folded: (0..3 * n + 1).map(|_| next() as u8).collect(),
             };
             assert_eq!(proof.encode(), codec().serialize(&proof).unwrap(), "n {n}");
-        }
-    }
-
-    /// The bit-sliced NEON fold agrees with the `i32` fold on random, all-ones and zero columns.
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn sliced_fold_matches_wide() {
-        let mut t = Transcript::new(b"labinius-fast/test-sliced");
-        let challenges: Vec<ShortChallenge> = (0..COLUMNS)
-            .map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-            .collect();
-        let buckets = fold_neon::Buckets::of(&challenges).expect("default challenges bucket");
-        let mut values = vec![B128::ZERO; COLUMNS * COLUMN_LEN];
-        let elements = [0usize, 1, 17, 2048, 3000, RING_ELEMENTS - 1];
-        for (e, &m) in elements.iter().enumerate() {
-            for j in 0..COLUMNS {
-                let col = column((e * COLUMNS + j) as u64 + 5);
-                for k in 0..4 {
-                    values[j * COLUMN_LEN + 4 * m + k] = match m {
-                        2048 => B128(u128::MAX),
-                        3000 => B128::ZERO,
-                        _ => col[k],
-                    };
-                }
-            }
-        }
-        let mut scratch = fold_neon::Scratch::new(&buckets);
-        for m in elements {
-            assert_eq!(
-                fold_neon::fold_element(&values, &buckets, &mut scratch, m).v,
-                fold_element(&values, &challenges, m).v,
-                "element {m}"
-            );
-        }
-    }
-
-    /// Every column on the same 28 positions: each position's list holds all 1024 columns, so
-    /// the sliced fold takes its eleven-plane counters.
-    #[test]
-    #[cfg(target_arch = "aarch64")]
-    fn sliced_fold_matches_wide_on_full_buckets() {
-        let mut t = Transcript::new(b"labinius-fast/test-full");
-        let base = sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0;
-        let challenges: Vec<ShortChallenge> = (0..COLUMNS)
-            .map(|j| {
-                let mut c = base;
-                for i in 0..c.weight {
-                    c.positions[i] = (5 * i + (i % 3)) as u8;
-                }
-                c.signs = (j as u32).wrapping_mul(0x9E37_79B9) ^ (j as u32 >> 3);
-                c
-            })
-            .collect();
-        let buckets = fold_neon::Buckets::of(&challenges).expect("full buckets fit 11 planes");
-        let mut values = vec![B128::ZERO; COLUMNS * COLUMN_LEN];
-        let elements = [0usize, 9, RING_ELEMENTS - 1];
-        for (e, &m) in elements.iter().enumerate() {
-            for j in 0..COLUMNS {
-                let col = column((e * COLUMNS + j) as u64 + 77);
-                for k in 0..4 {
-                    values[j * COLUMN_LEN + 4 * m + k] = if m == 9 { B128(u128::MAX) } else { col[k] };
-                }
-            }
-        }
-        let mut scratch = fold_neon::Scratch::new(&buckets);
-        for m in elements {
-            assert_eq!(
-                fold_neon::fold_element(&values, &buckets, &mut scratch, m).v,
-                fold_element(&values, &challenges, m).v,
-                "element {m}"
-            );
         }
     }
 
@@ -906,6 +908,14 @@ mod tests {
         out
     }
 
+    #[test]
+    fn embedded_hybrid_commit_matches_reference() {
+        let values = edge_columns(RING_ELEMENTS, 11);
+        let matrix = rq::ajtai_matrix(hybrid::MODULUS, RING_ELEMENTS);
+        let want = commit_reference(&values, &matrix, hybrid::MODULUS);
+        assert_eq!(commit(&values, hybrid::MODULUS), want);
+    }
+
     /// The transform commitment agrees with the checker's schoolbook commitment at full size, on
     /// one, three and eight workers, through the matrix transformed on as many.
     #[test]
@@ -939,20 +949,6 @@ mod tests {
         let full = ntt::matrix(RING_ELEMENTS, 8);
         let want = ntt::transform_matrix(&rq::ajtai_matrix(ntt::MODULUS, RING_ELEMENTS), 8);
         assert!(full.data == want.data);
-    }
-
-    /// The hybrid commitment agrees with the checker's schoolbook commitment at full size (16
-    /// certified chunks per column), on one, three and eight workers, edge columns included.
-    #[test]
-    fn hybrid_commit_matches_reference() {
-        let values = edge_columns(RING_ELEMENTS, 11);
-        let matrix = rq::ajtai_matrix(hybrid::MODULUS, RING_ELEMENTS);
-        let want = commit_reference(&values, &matrix, hybrid::MODULUS);
-        assert!(want.iter().all(|&x| x < hybrid::MODULUS));
-        for workers in [1, 3, 8] {
-            let transformed = hybrid::matrix(RING_ELEMENTS, workers);
-            assert_eq!(hybrid::commit(&values, &transformed, workers), want, "workers {workers}");
-        }
     }
 
     /// The same on short columns, many cases, column counts around the batch width.

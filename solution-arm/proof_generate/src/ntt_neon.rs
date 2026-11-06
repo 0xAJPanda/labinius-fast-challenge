@@ -693,13 +693,13 @@ unsafe fn inverse_lanes(p:usize,x:&mut [int16x8_t;N]) {
             for j in 0..*len {
                 let a=reduce(x[base+j],k);let b=reduce(x[base+j+len],k);
                 if *r==2 {
-                    x[base+j]=reduce(mul_pair(reduce(vaddq_s16(a,b),k),scale[0],k),k);
-                    x[base+j+len]=reduce(mul_pair(reduce(vsubq_s16(a,b),k),scale[1],k),k);
+                    x[base+j]=mul_pair(vaddq_s16(a,b),scale[0],k);
+                    x[base+j+len]=mul_pair(vsubq_s16(a,b),scale[1],k);
                 } else {
                     let c=reduce(x[base+j+2*len],k);
                     let e=mul_pair(vsubq_s16(b,c),inv.eps,k);
                     let z=[vaddq_s16(a,vaddq_s16(b,c)),vaddq_s16(vsubq_s16(a,c),e),vsubq_s16(vsubq_s16(a,b),e)];
-                    for i in 0..3 {x[base+j+i*len]=reduce(mul_pair(reduce(z[i],k),scale[i],k),k);}
+                    for i in 0..3 {x[base+j+i*len]=mul_pair(z[i],scale[i],k);}
                 }
             }
         }
@@ -725,7 +725,6 @@ unsafe fn pass_dual<const P:usize>(x:&mut [int16x8_t;N],row:&[i16],tail:&[i16],b
     }
 }
 #[inline(never)]
-#[allow(dead_code)]
 unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [int16x8_t;BITS],x:&mut [int16x8_t;N],acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
     let kern=&kernels()[P];let s=SCHEDULES[P];
     tail.fill(vdupq_n_s32(0));
@@ -739,74 +738,63 @@ unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hyb
     }
     reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
 }
-/// Elements whose masks are built once for both primes' transforms: a block's masks (8 KB per
-/// element) and one prime's two slot sums (40 KB) stay in L1 while the block goes through it.
-const MASK_BLOCK: usize = 2;
-
-/// One element of one prime: its transform multiplied into both slot sums, which are reduced
-/// every [`Schedule::accumulate`] elements of the chunk.
-#[inline(always)]
-unsafe fn hybrid_element<const P:usize>(m:&[int16x8_t;BITS],x:&mut [int16x8_t;N],a:&crate::hybrid::Matrix,start:usize,e:usize,acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
-    let kern=&kernels()[P];let s=SCHEDULES[P];
-    pass_a(m,x,kern);pass_b::<P>(x,kern);pass_c::<P>(x,kern);
-    pass_dual::<P>(x,a.row(e,P,0),a.row(e,P,1),acc,tail);
-    if (e-start+1)%s.accumulate==0 {
-        reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
-    }
-}
-
-/// [`hybrid_chunk`] for both primes at once: every element's masks are built once
-/// ([`masks`], [`MASK_BLOCK`] elements at a time) and go through both primes' transforms.
-#[inline(never)]
-unsafe fn hybrid_chunk_both(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [[int16x8_t;BITS];MASK_BLOCK],x:&mut [int16x8_t;N],a0:&mut [int32x4_t],t0:&mut [int32x4_t],a1:&mut [int32x4_t],t1:&mut [int32x4_t]) {
-    t0.fill(vdupq_n_s32(0));t1.fill(vdupq_n_s32(0));
-    for e0 in (start..end).step_by(MASK_BLOCK) {
-        let n=(end-e0).min(MASK_BLOCK);
-        for (i,mi) in m.iter_mut().enumerate().take(n) {
-            let at=core::array::from_fn(|c|words[c].0.add((e0+i)*words[c].1));
-            masks(&at,mi);
-        }
-        for (i,mi) in m.iter().enumerate().take(n) {hybrid_element::<0>(mi,x,a,start,e0+i,a0,t0);}
-        for (i,mi) in m.iter().enumerate().take(n) {hybrid_element::<1>(mi,x,a,start,e0+i,a1,t1);}
-    }
-    for (acc,p) in [(&mut *a0,0usize),(&mut *t0,0),(&mut *a1,1),(&mut *t1,1)] {
-        reduce_sums(acc,PRIMES[p] as i32,kernels()[p].v32);
-    }
-}
 unsafe fn inverse_acc(p:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
     for j in 0..N {x[j]=vcombine_s16(vmovn_s32(acc[2*j]),vmovn_s32(acc[2*j+1]));}
     inverse_lanes(p,x);
 }
+const _: () = {
+    let mut i = 0;
+    while i < 2 {
+        let p = PRIMES[i];
+        let r = super::reduced_bound(p);
+        let e = super::product_bound(p, 2 * r);
+        assert!(3 * r < 32768 && 2 * r + e < 32768);
+        assert!(super::product_bound(p, 2 * r + e) < 32768);
+        i += 1;
+    }
+};
+
+#[inline(always)]
+unsafe fn center_lane(x: int16x8_t, k: int16x8_t) -> int16x8_t {
+    let r = reduce(x, k);
+    let p = vdupq_laneq_s16::<0>(k);
+    let half = vshrq_n_s16::<1>(p);
+    let r = vsubq_s16(r, vreinterpretq_s16_u16(vandq_u16(vcgtq_s16(r, half), vreinterpretq_u16_s16(p))));
+    vaddq_s16(r, vreinterpretq_s16_u16(vandq_u16(vcltq_s16(r, vnegq_s16(half)), vreinterpretq_u16_s16(p))))
+}
+
 pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec<u128> {
     let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
     let columns=values.len()/len;let mut out=vec![0u128;columns*N];
     for_blocks(&mut out,N,8,workers,|first,block|unsafe {
-        let mut m=Box::new([[vdupq_n_s16(0);BITS];MASK_BLOCK]);
+        let mut m=Box::new([vdupq_n_s16(0);BITS]);
         let mut x=Box::new([vdupq_n_s16(0);N]);
         let mut y=Box::new([vdupq_n_s16(0);N]);
         let mut acc=vec![vdupq_n_s32(0);4*N];let mut tail=acc.clone();
-        let mut low=vec![[0i64;8];N];
+        let mut low=vec![vdupq_n_s16(0);N];
+        let k0=vld1q_s16(kernels()[0].k.as_ptr());
+        let k1=vld1q_s16(kernels()[1].k.as_ptr());
+        let inv=twiddle(9721,3242);
         for (batch,target) in block.chunks_mut(8*N).enumerate() {
-            acc.fill(vdupq_n_s32(0));low.fill([0;8]);let here=target.len()/N;
+            acc.fill(vdupq_n_s32(0));low.fill(vdupq_n_s16(0));let here=target.len()/N;
             let words=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
             let (a0,a1)=acc.split_at_mut(2*N);let (t0,t1)=tail.split_at_mut(2*N);
             for start in (0..a.elements).step_by(crate::hybrid::CHUNK) {
                 let end=(start+crate::hybrid::CHUNK).min(a.elements);
-                hybrid_chunk_both(&words,a,start,end,&mut m,&mut x,a0,t0,a1,t1);
+                hybrid_chunk::<0>(&words,a,start,end,&mut m,&mut x,a0,t0);
+                hybrid_chunk::<1>(&words,a,start,end,&mut m,&mut x,a1,t1);
                 inverse_acc(0,t0,&mut x);inverse_acc(1,t1,&mut y);
                 for j in 0..N {
-                    let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
-                    for c in 0..here {
-                        let z=crate::hybrid::crt_pair((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32);
-                        let z=if z>crate::hybrid::PRODUCT/2 {z-crate::hybrid::PRODUCT} else {z};
-                        low[j][c]=(low[j][c]+z)&1023;
-                    }
+                    let u=center_lane(x[j],k0);let v=center_lane(y[j],k1);
+                    let t=center_lane(mul_pair(vsubq_s16(v,u),inv,k1),k1);
+                    low[j]=vaddq_s16(low[j],vaddq_s16(u,vmulq_n_s16(t,3889)));
                 }
             }
             inverse_acc(0,a0,&mut x);inverse_acc(1,a1,&mut y);
             for j in 0..N {
                 let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
-                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,low[j][c]);}
+                let t:[u16;8]=core::mem::transmute(low[j]);
+                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,t[c] as i64);}
             }
         }
     });out
