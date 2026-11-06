@@ -868,6 +868,25 @@ const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
 const PAIR_LEAD: usize = 2 * PP;
 
+const SIBLING_UMWAIT_CYCLES: u64 = 8_000;
+
+#[allow(unused_unsafe)]
+static HAS_WAITPKG: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    let max = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+    max >= 7 && unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ecx & (1 << 5) != 0
+});
+
+///
+#[inline]
+unsafe fn umwait_on(line: *const u8, ready: impl Fn() -> bool) {
+    core::arch::asm!(".byte 0xf3, 0x0f, 0xae, 0xf0", in("rax") line, options(nostack, preserves_flags));
+    if ready() {
+        return;
+    }
+    let deadline = core::arch::x86_64::_rdtsc().wrapping_add(SIBLING_UMWAIT_CYCLES);
+    core::arch::asm!(".byte 0xf2, 0x0f, 0xae, 0xf1", in("ecx") 1u32, in("eax") deadline as u32, in("edx") (deadline >> 32) as u32, options(nostack));
+}
+
 /// Diagnostics of the last [`commit_paired`], for the profile line only: per worker, the
 /// microseconds from the commitment's start to the end of its last group, and the 16-column
 /// groups it ran; and the number of sibling pairs that gave up their coupling.
@@ -957,11 +976,16 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                         return;
                     }
                     let start = std::time::Instant::now();
+                    let sleep = *HAS_WAITPKG;
                     let mut spins = 0u32;
                     while other.load(Ordering::Acquire) + PAIR_LEAD < d {
-                        core::hint::spin_loop();
+                        if sleep {
+                            umwait_on(other as *const AtomicUsize as *const u8, || other.load(Ordering::Acquire) + PAIR_LEAD >= d);
+                        } else {
+                            core::hint::spin_loop();
+                        }
                         spins += 1;
-                        if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
+                        if (sleep || spins % 64 == 0) && start.elapsed() > SIBLING_WAIT {
                             coupled.store(false, Ordering::Relaxed);
                             let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
                             if k < 16 {
