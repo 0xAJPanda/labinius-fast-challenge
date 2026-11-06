@@ -488,9 +488,12 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 && j + PREFETCH_SLOTS < N {
-                let kf = k.add(PREFETCH_SLOTS * STREAMS * LOCK) as *const i8;
-                for l in 0..(STREAMS * LOCK * 4).div_ceil(64) {
-                    _mm_prefetch::<_MM_HINT_T0>(kf.add(64 * l));
+                let lo = k.add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
+                let hi = lo + STREAMS * LOCK * 4;
+                let mut p = (lo + 63) & !63;
+                while p < hi {
+                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+                    p += 64;
                 }
             }
             macro_rules! call {
