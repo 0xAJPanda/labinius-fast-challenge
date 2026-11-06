@@ -725,6 +725,7 @@ unsafe fn pass_dual<const P:usize>(x:&mut [int16x8_t;N],row:&[i16],tail:&[i16],b
     }
 }
 #[inline(never)]
+#[allow(dead_code)]
 unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [int16x8_t;BITS],x:&mut [int16x8_t;N],acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
     let kern=&kernels()[P];let s=SCHEDULES[P];
     tail.fill(vdupq_n_s32(0));
@@ -737,6 +738,40 @@ unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hyb
         }
     }
     reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+}
+/// Elements whose masks are built once for both primes' transforms: a block's masks (8 KB per
+/// element) and one prime's two slot sums (40 KB) stay in L1 while the block goes through it.
+const MASK_BLOCK: usize = 2;
+
+/// One element of one prime: its transform multiplied into both slot sums, which are reduced
+/// every [`Schedule::accumulate`] elements of the chunk.
+#[inline(always)]
+unsafe fn hybrid_element<const P:usize>(m:&[int16x8_t;BITS],x:&mut [int16x8_t;N],a:&crate::hybrid::Matrix,start:usize,e:usize,acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
+    let kern=&kernels()[P];let s=SCHEDULES[P];
+    pass_a(m,x,kern);pass_b::<P>(x,kern);pass_c::<P>(x,kern);
+    pass_dual::<P>(x,a.row(e,P,0),a.row(e,P,1),acc,tail);
+    if (e-start+1)%s.accumulate==0 {
+        reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+    }
+}
+
+/// [`hybrid_chunk`] for both primes at once: every element's masks are built once
+/// ([`masks`], [`MASK_BLOCK`] elements at a time) and go through both primes' transforms.
+#[inline(never)]
+unsafe fn hybrid_chunk_both(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [[int16x8_t;BITS];MASK_BLOCK],x:&mut [int16x8_t;N],a0:&mut [int32x4_t],t0:&mut [int32x4_t],a1:&mut [int32x4_t],t1:&mut [int32x4_t]) {
+    t0.fill(vdupq_n_s32(0));t1.fill(vdupq_n_s32(0));
+    for e0 in (start..end).step_by(MASK_BLOCK) {
+        let n=(end-e0).min(MASK_BLOCK);
+        for (i,mi) in m.iter_mut().enumerate().take(n) {
+            let at=core::array::from_fn(|c|words[c].0.add((e0+i)*words[c].1));
+            masks(&at,mi);
+        }
+        for (i,mi) in m.iter().enumerate().take(n) {hybrid_element::<0>(mi,x,a,start,e0+i,a0,t0);}
+        for (i,mi) in m.iter().enumerate().take(n) {hybrid_element::<1>(mi,x,a,start,e0+i,a1,t1);}
+    }
+    for (acc,p) in [(&mut *a0,0usize),(&mut *t0,0),(&mut *a1,1),(&mut *t1,1)] {
+        reduce_sums(acc,PRIMES[p] as i32,kernels()[p].v32);
+    }
 }
 unsafe fn inverse_acc(p:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
     for j in 0..N {x[j]=vcombine_s16(vmovn_s32(acc[2*j]),vmovn_s32(acc[2*j+1]));}
@@ -755,46 +790,112 @@ const _: () = {
 };
 
 #[inline(always)]
-unsafe fn center_lane(x: int16x8_t, k: int16x8_t) -> int16x8_t {
-    let r = reduce(x, k);
-    let p = vdupq_laneq_s16::<0>(k);
-    let half = vshrq_n_s16::<1>(p);
-    let r = vsubq_s16(r, vreinterpretq_s16_u16(vandq_u16(vcgtq_s16(r, half), vreinterpretq_u16_s16(p))));
-    vaddq_s16(r, vreinterpretq_s16_u16(vandq_u16(vcltq_s16(r, vnegq_s16(half)), vreinterpretq_u16_s16(p))))
+unsafe fn tail_residues(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+    const P0: i32 = 3889;
+    const P1: i32 = 9721;
+    const PRODUCT: i32 = P0 * P1;
+    const TWIST: i16 = ((2 * 3242i64 * 32768 + P1 as i64) / (2 * P1 as i64)) as i16;
+    // The unreduced CRT lift lies inside (-PRODUCT, PRODUCT), so one correction centers it.
+    const _: () = assert!(P0 as u64 + P0 as u64 * (super::product_bound(P1 as u32, (P0 + P1) as u32) as u64) < PRODUCT as u64);
+    let t = vld1q_s16([3242, TWIST, 0, 0, 0, 0, 0, 0].as_ptr());
+    let r = mulc::<0, 1>(vsubq_s16(b, a), t, vdupq_n_s16(P1 as i16));
+    let lo = vmlal_n_s16(vmovl_s16(vget_low_s16(a)), vget_low_s16(r), P0 as i16);
+    let hi = vmlal_high_n_s16(vmovl_high_s16(a), r, P0 as i16);
+    let product = vdupq_n_s32(PRODUCT);
+    let half = vdupq_n_s32(PRODUCT / 2);
+    let center = |x| {
+        let above = vreinterpretq_s32_u32(vcgtq_s32(x, half));
+        let below = vreinterpretq_s32_u32(vcltq_s32(x, vnegq_s32(half)));
+        vaddq_s32(vsubq_s32(x, vandq_s32(above, product)), vandq_s32(below, product))
+    };
+    vcombine_s16(vmovn_s32(center(lo)), vmovn_s32(center(hi)))
+}
+
+#[cfg(test)]
+#[test]
+fn vector_tail_crt_matches_scalar() {
+    let mut state = 831u64;
+    for case in 0..100_000 {
+        let a: [i16; 8] = core::array::from_fn(|_| (super::tests::xorshift(&mut state) % 7779) as i16 - 3889);
+        let b: [i16; 8] = core::array::from_fn(|i| {
+            if case < 8 { [-9721, -9720, -4861, -1, 0, 4860, 9720, 9721][i] }
+            else { (super::tests::xorshift(&mut state) % 19443) as i16 - 9721 }
+        });
+        let result: [i16; 8] = unsafe { core::mem::transmute(tail_residues(vld1q_s16(a.as_ptr()), vld1q_s16(b.as_ptr()))) };
+        for i in 0..8 {
+            let z = crate::hybrid::crt_pair((a[i] as i32).rem_euclid(3889) as u32, (b[i] as i32).rem_euclid(9721) as u32);
+            let z = if z > crate::hybrid::PRODUCT / 2 { z - crate::hybrid::PRODUCT } else { z };
+            assert_eq!((result[i] as i64) & 1023, z & 1023, "a={} b={}", a[i], b[i]);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn combine_lanes(a: int16x8_t, b: int16x8_t, tail: int16x8_t) -> [u64; 8] {
+    const P0: i32 = 3889;
+    const P1: i32 = 9721;
+    const PRODUCT: i32 = P0 * P1;
+    const TWIST: i16 = ((2 * 3242i64 * 32768 + P1 as i64) / (2 * P1 as i64)) as i16;
+    let t = vld1q_s16([3242, TWIST, 0, 0, 0, 0, 0, 0].as_ptr());
+    let r = mulc::<0, 1>(vsubq_s16(b, a), t, vdupq_n_s16(P1 as i16));
+    let canonical = |x| vaddq_s32(x, vandq_s32(vshrq_n_s32::<31>(x), vdupq_n_s32(PRODUCT)));
+    let lo = canonical(vmlal_n_s16(vmovl_s16(vget_low_s16(a)), vget_low_s16(r), P0 as i16));
+    let hi = canonical(vmlal_high_n_s16(vmovl_high_s16(a), r, P0 as i16));
+    let residue = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
+    let k = vreinterpretq_u16_s16(vandq_s16(vmulq_n_s16(vsubq_s16(tail, residue), 153), vdupq_n_s16(1023)));
+    let kl = vmovl_u16(vget_low_u16(k));
+    let kh = vmovl_high_u16(k);
+    let lo = vreinterpretq_u32_s32(lo);
+    let hi = vreinterpretq_u32_s32(hi);
+    core::mem::transmute([
+        vaddw_u32(vmull_n_u32(vget_low_u32(kl), PRODUCT as u32), vget_low_u32(lo)),
+        vaddw_u32(vmull_high_n_u32(kl, PRODUCT as u32), vget_high_u32(lo)),
+        vaddw_u32(vmull_n_u32(vget_low_u32(kh), PRODUCT as u32), vget_low_u32(hi)),
+        vaddw_u32(vmull_high_n_u32(kh, PRODUCT as u32), vget_high_u32(hi)),
+    ])
+}
+
+#[cfg(test)]
+#[test]
+fn vector_final_crt_matches_scalar() {
+    let mut state = 967u64;
+    for _ in 0..100_000 {
+        let a: [i16; 8] = core::array::from_fn(|_| (super::tests::xorshift(&mut state) % 7779) as i16 - 3889);
+        let b: [i16; 8] = core::array::from_fn(|_| (super::tests::xorshift(&mut state) % 19443) as i16 - 9721);
+        let tail: [i16; 8] = core::array::from_fn(|_| super::tests::xorshift(&mut state) as i16);
+        let got = unsafe { combine_lanes(vld1q_s16(a.as_ptr()), vld1q_s16(b.as_ptr()), vld1q_s16(tail.as_ptr())) };
+        for i in 0..8 {
+            let want = crate::hybrid::combine((a[i] as i32).rem_euclid(3889) as u32, (b[i] as i32).rem_euclid(9721) as u32, tail[i] as i64);
+            assert_eq!(got[i] as u128, want);
+        }
+    }
 }
 
 pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec<u128> {
     let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
     let columns=values.len()/len;let mut out=vec![0u128;columns*N];
     for_blocks(&mut out,N,8,workers,|first,block|unsafe {
-        let mut m=Box::new([vdupq_n_s16(0);BITS]);
+        let mut m=Box::new([[vdupq_n_s16(0);BITS];MASK_BLOCK]);
         let mut x=Box::new([vdupq_n_s16(0);N]);
         let mut y=Box::new([vdupq_n_s16(0);N]);
         let mut acc=vec![vdupq_n_s32(0);4*N];let mut tail=acc.clone();
         let mut low=vec![vdupq_n_s16(0);N];
-        let k0=vld1q_s16(kernels()[0].k.as_ptr());
-        let k1=vld1q_s16(kernels()[1].k.as_ptr());
-        let inv=twiddle(9721,3242);
         for (batch,target) in block.chunks_mut(8*N).enumerate() {
             acc.fill(vdupq_n_s32(0));low.fill(vdupq_n_s16(0));let here=target.len()/N;
             let words=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
             let (a0,a1)=acc.split_at_mut(2*N);let (t0,t1)=tail.split_at_mut(2*N);
             for start in (0..a.elements).step_by(crate::hybrid::CHUNK) {
                 let end=(start+crate::hybrid::CHUNK).min(a.elements);
-                hybrid_chunk::<0>(&words,a,start,end,&mut m,&mut x,a0,t0);
-                hybrid_chunk::<1>(&words,a,start,end,&mut m,&mut x,a1,t1);
+                hybrid_chunk_both(&words,a,start,end,&mut m,&mut x,a0,t0,a1,t1);
                 inverse_acc(0,t0,&mut x);inverse_acc(1,t1,&mut y);
                 for j in 0..N {
-                    let u=center_lane(x[j],k0);let v=center_lane(y[j],k1);
-                    let t=center_lane(mul_pair(vsubq_s16(v,u),inv,k1),k1);
-                    low[j]=vaddq_s16(low[j],vaddq_s16(u,vmulq_n_s16(t,3889)));
+                    low[j] = vaddq_s16(low[j], tail_residues(x[j], y[j]));
                 }
             }
             inverse_acc(0,a0,&mut x);inverse_acc(1,a1,&mut y);
             for j in 0..N {
-                let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
-                let t:[u16;8]=core::mem::transmute(low[j]);
-                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,t[c] as i64);}
+                let residues = combine_lanes(x[j], y[j], low[j]);
+                for c in 0..here { target[c*N+j] = residues[c] as u128; }
             }
         }
     });out
