@@ -282,19 +282,6 @@ unsafe fn split_words(x: *const B128) -> (__m512i, __m512i) {
     )
 }
 
-/// `sum_i eq[i] * F162::from_b128(xs[i])`: on AArch64 with PMULL through unreduced partial
-/// products and one reduction ([`super::neon::dot_lifted`]), otherwise term by term.
-pub fn dot_lifted(eq: &[F162], xs: &[B128]) -> F162 {
-    assert_eq!(eq.len(), xs.len());
-    #[cfg(target_arch = "aarch64")]
-    if super::neon::pmull() {
-        return super::neon::dot_lifted(eq, xs);
-    }
-    eq.iter()
-        .zip(xs)
-        .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x))
-}
-
 /// `pi0` in the sumcheck's layout: the bits of a `B128` are the low coefficients of an `F162`.
 fn poly_from_b128(pi0: &[B128], out: &mut super::sumcheck::Poly) {
     let n = pi0.len();
@@ -839,31 +826,6 @@ mod tests {
             poly_from_b128_block(&p, [&mut w0[..], &mut w1[..], &mut w2[..]]);
         }
         assert!(emu.w == poly.w, "poly_from_b128 vs emulated");
-    }
-
-    #[test]
-    fn lazy_dot_lifted_matches_the_term_sum() {
-        let mut x = 0x5555_0123_4567_89ABu128;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x.wrapping_mul(0x2545F4914F6CDD1Du128) ^ (x >> 64)
-        };
-        for n in [0usize, 1, 2, 3, 17, 1000, 16384] {
-            let eq: Vec<F162> = (0..n)
-                .map(|_| {
-                    let (a, b) = (next(), next());
-                    F162([a as u64, (a >> 64) as u64, b as u64 & ((1 << 34) - 1)])
-                })
-                .collect();
-            let xs: Vec<B128> = (0..n).map(|_| B128(next())).collect();
-            let want = eq
-                .iter()
-                .zip(&xs)
-                .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x));
-            assert_eq!(dot_lifted(&eq, &xs).0, want.0, "n {n}");
-        }
     }
 
     #[test]
