@@ -338,9 +338,7 @@ fn commit_reference(values: &[B128], matrix: &[u128], modulus: u128) -> Vec<u128
 }
 
 fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
-    eq.iter()
-        .zip(column)
-        .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x))
+    cf::dot_lifted(eq, column)
 }
 
 /// `u_j = sum_i eq(p0, i) W[i + COLUMN_LEN j]`, one field element per column.
