@@ -482,6 +482,9 @@ unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *m
 impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        // Every row and stream in this callback uses the same fold constants.
+        let fx = _mm512_set1_epi32(32768);
+        let fw = _mm512_load_si512(FOLD.0.as_ptr().cast());
         for i in r0..r1 {
             let j = 27 * blk + i;
             let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
@@ -498,19 +501,19 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             }
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    core::arch::asm!(concat!($m!($mode), "/* {f} {fx} {fw} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(), fx = in(zmm_reg) fx, fw = in(zmm_reg) fw,
                         $($xn = in(zmm_reg) x[$xi],)*
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
-                        out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
+                        out("zmm26") _,  out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
                 };
             }
             macro_rules! call_first {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    core::arch::asm!(concat!($m!($mode), "/* {f} {fx} {fw} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(), fx = in(zmm_reg) fx, fw = in(zmm_reg) fw,
                         b = in(reg) self.b.add(j * DIGITS),
                         $($xn = in(zmm_reg) x[$xi],)*
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
-                        out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
+                        out("zmm26") _,  out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
                 };
             }
             if LOCK == 8 {
