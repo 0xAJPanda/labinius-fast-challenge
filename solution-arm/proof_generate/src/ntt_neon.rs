@@ -232,9 +232,47 @@ unsafe fn masks(words: &[*const u8; LANES], out: &mut [int16x8_t; BITS]) {
                 .enumerate()
             {
                 let byte = 2 * v + half;
-                for i in 0..8 {
-                    out[32 * byte + 4 * i + k] = vreinterpretq_s16_u16(vtstq_u16(column_bytes, bit[i]));
-                }
+                // The eight bit tests of this byte, each one `cmtst` and one store 64 bytes on
+                // (`out[32 byte + 4 i + k]`): written out so the compiler emits exactly that
+                // (it otherwise lowers the tests to shifts, compares and register copies).
+                let p = out.as_mut_ptr().add(32 * byte + k) as *mut u8;
+                core::arch::asm!(
+                    "cmtst {m0:v}.8h, {cb:v}.8h, {b0:v}.8h",
+                    "cmtst {m1:v}.8h, {cb:v}.8h, {b1:v}.8h",
+                    "cmtst {m2:v}.8h, {cb:v}.8h, {b2:v}.8h",
+                    "cmtst {m3:v}.8h, {cb:v}.8h, {b3:v}.8h",
+                    "str {m0:q}, [{p}]",
+                    "str {m1:q}, [{p}, #64]",
+                    "cmtst {m4:v}.8h, {cb:v}.8h, {b4:v}.8h",
+                    "cmtst {m5:v}.8h, {cb:v}.8h, {b5:v}.8h",
+                    "str {m2:q}, [{p}, #128]",
+                    "str {m3:q}, [{p}, #192]",
+                    "cmtst {m6:v}.8h, {cb:v}.8h, {b6:v}.8h",
+                    "cmtst {m7:v}.8h, {cb:v}.8h, {b7:v}.8h",
+                    "str {m4:q}, [{p}, #256]",
+                    "str {m5:q}, [{p}, #320]",
+                    "str {m6:q}, [{p}, #384]",
+                    "str {m7:q}, [{p}, #448]",
+                    cb = in(vreg) column_bytes,
+                    b0 = in(vreg) bit[0],
+                    b1 = in(vreg) bit[1],
+                    b2 = in(vreg) bit[2],
+                    b3 = in(vreg) bit[3],
+                    b4 = in(vreg) bit[4],
+                    b5 = in(vreg) bit[5],
+                    b6 = in(vreg) bit[6],
+                    b7 = in(vreg) bit[7],
+                    m0 = out(vreg) _,
+                    m1 = out(vreg) _,
+                    m2 = out(vreg) _,
+                    m3 = out(vreg) _,
+                    m4 = out(vreg) _,
+                    m5 = out(vreg) _,
+                    m6 = out(vreg) _,
+                    m7 = out(vreg) _,
+                    p = in(reg) p,
+                    options(nostack, preserves_flags)
+                );
             }
         }
     }
