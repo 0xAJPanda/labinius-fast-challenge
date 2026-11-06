@@ -35,7 +35,6 @@ const _: () = {
 /// Pair batches per reconstruction chunk; the build checks the public matrix's margin.
 pub const CHUNK_PAIRS: usize = 128;
 /// Chunks of each half column: [`CHUNK_PAIRS`] pair batches each and a shorter last one, so
-/// that every chunk lies in one half (the commitment's work units are halves).
 pub const fn chunks_per_half(np: usize) -> usize {
     (np / 2).div_ceil(CHUNK_PAIRS)
 }
@@ -679,14 +678,11 @@ unsafe fn transpose16x16_u32(r: &[__m512i; 16]) -> [__m512i; 16] {
     out
 }
 
-/// What [`write_rows`] writes: a whole column's rows, or one of the two halves of its
-/// ring-element range ([`HALVES`]). The first half to finish leaves its raw partial rows (the
-/// base residue canonical in `[0, 9721)`, the tail reduced without its means); the
-/// second adds its own to them and writes the final rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowsMode {
     Full,
     First,
+    Middle,
     Second,
 }
 
@@ -713,7 +709,7 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
             let low=_mm512_load_si512(p);
             let high=reduce_hi55(_mm512_load_si512(h));
             _mm512_store_si512(p,zero);_mm512_store_si512(h,zero);
-            let mu=if mode==RowsMode::First{0}else{keys.mu[j] as i32};
+            let mu=if mode==RowsMode::First||mode==RowsMode::Middle{0}else{keys.mu[j] as i32};
             let value=_mm512_add_epi32(_mm512_or_si512(low,_mm512_slli_epi32::<16>(high)),_mm512_set1_epi32(mu));
             rt[s]=_mm512_mask_sub_epi32(value,_mm512_cmp_epi32_mask(value,mask,_MM_CMPINT_NLT),value,mask);
         }
@@ -723,12 +719,10 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
         for c in 0..gc {
             let (db, dt) = ((dst.add(2 * c) as *mut i32).add(j0), (dst.add(2 * c + 1) as *mut i32).add(j0));
             let (mut b, mut t) = (c0[c], ct[c]);
-            if mode == RowsMode::Second {
+            if mode == RowsMode::Second || mode == RowsMode::Middle {
                 b = _mm512_add_epi32(b, _mm512_maskz_loadu_epi32(m, db));
                 b = _mm512_mask_sub_epi32(b, _mm512_cmp_epi32_mask(b, q, _MM_CMPINT_NLT), b, q);
                 t = _mm512_add_epi32(t, _mm512_maskz_loadu_epi32(m, dt));
-            }
-            if mode == RowsMode::Second {
                 t = _mm512_mask_sub_epi32(t,_mm512_cmp_epu32_mask(t,mask,_MM_CMPINT_NLT),t,mask);
             }
             _mm512_mask_storeu_epi32(db, m, b);
@@ -740,14 +734,13 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
 
 /// Parts of a column's ring-element range committed as separate work units by
 /// [`commit_paired`]: the commitment's coarse units otherwise leave cores idle at its end. Each
-/// part is whole digit chunks and one half-column chunk of the last digit.
-const HALVES: usize = 2;
+const fn parts(np: usize) -> usize {
+    if np % (4 * CHUNK_PAIRS) == 0 { 4 } else { 2 }
+}
 
-/// Where a group writes its rows: in full, or as one half of the range under its group's lock
-/// (`state` counts the halves already written).
 enum RowsOut<'a> {
     Full,
-    Half(&'a std::sync::Mutex<u8>),
+    Part(&'a std::sync::Mutex<u8>, usize),
 }
 
 /// Commits a group of up to 16 columns across all `np` pair batches and writes its `2 g` rows to
@@ -759,7 +752,9 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
     let hl = np / 2;
     let span = range.end - range.start;
-    assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
+    let one_half = span > 0 && range.start / hl == (range.end - 1) / hl;
+    let chunked = (range.start % hl) % CHUNK_PAIRS == 0 && (range.end % hl == 0 || (range.end % hl) % CHUNK_PAIRS == 0);
+    assert!((span == np && range.start == 0) || (one_half && chunked), "whole chunks of one half of the column");
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     // LOCK=8's FIRST sink broadcasts each digit's bias and overwrites all
@@ -772,7 +767,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         fill_stream(&mut ws.acc[0], s, b);
     }
     // Each auxiliary stream starts at fold_bias - scaled_NTT(mean) for this chunk.
-    let first_chunk = range.start / hl * chunks_per_half(np);
+    let first_chunk = range.start / hl * chunks_per_half(np) + range.start % hl / CHUNK_PAIRS;
     let mut bias = keys.mur.as_ptr().add(first_chunk * N * DIGITS);
     let acc = ws.acc[0].v.as_mut_ptr() as *mut i32;
     let w = ws.w.as_mut_ptr() as *mut i16;
@@ -837,9 +832,9 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     }
     match out {
         RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
-        RowsOut::Half(state) => {
+        RowsOut::Part(state, parts) => {
             let mut done = state.lock().unwrap();
-            let mode = if *done == 0 { RowsMode::First } else { RowsMode::Second };
+            let mode = if *done == 0 { RowsMode::First } else if *done as usize + 1 == parts { RowsMode::Second } else { RowsMode::Middle };
             write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, mode);
             *done += 1;
         }
@@ -890,21 +885,19 @@ pub fn worker_report(workers: usize) -> String {
 }
 
 /// The commitment on sibling pairs: hyperthreads `2k`, `2k + 1` (placed on core `k`) take
-/// 16-column work units of one ring-element part ([`HALVES`]) each and advance through the key
 /// within [`PAIR_LEAD`] pair batches of each other, so both read every key line from their core's
 /// L2. Units are handed out dynamically, part-major: a coupled pair claims two adjacent units
 /// (two column groups, one part, one key range) at a time, the second for the sibling that asks
 /// next. A sibling kept waiting longer than [`SIBLING_WAIT`] (descheduled: the host's writeback
 /// of the freshly written table, an interrupt) ends the pair's coupling, and from then on each
 /// of the two claims units on its own, so a slowed CPU does less of the work instead of holding
-/// up the commitment's end. The two parts of a column group may run on different workers; the
-/// second to finish writes its rows.
 fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let g = 16usize;
     let pairs = workers / 2;
     let groups = columns.len().div_ceil(g);
-    let units = groups * HALVES;
+    let parts = parts(np);
+    let units = groups * parts;
     let locks: Vec<std::sync::Mutex<u8>> = (0..groups).map(|_| std::sync::Mutex::new(0)).collect();
     let next = AtomicUsize::new(0);
     // Per pair: the unit its last pair claim left for the other sibling.
@@ -939,14 +932,14 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
             };
             let Some(u) = unit else { break };
             let (part, gi) = (u / groups, u % groups);
-            let range = part * np / HALVES..(part + 1) * np / HALVES;
+            let range = part * np / parts..(part + 1) * np / parts;
             let lo = gi * g;
             let n = g.min(columns.len() - lo);
             let ws = ws.get_or_insert_with(SmsWorker::new);
             ran += 1;
             let (from, base) = (range.start, progressed);
             unsafe {
-                let out = if HALVES == 1 { RowsOut::Full } else { RowsOut::Half(&locks[gi]) };
+                let out = RowsOut::Part(&locks[gi], parts);
                 group(&columns[lo..lo + n], keys, np, range.clone(), out, ws, (dst as *mut [u32; N]).add(2 * lo), |b_done| {
                     let d = base + (b_done - from);
                     mine.store(d, Ordering::Release);
