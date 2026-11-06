@@ -2416,16 +2416,12 @@ impl<'a> LeanSwitch<'a> {
             let chunk = (half / (16 * self.threads)).clamp(8, 1 << 12) & !7;
             let chunks = half.div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
-            // Consecutive chunks are a quarter of the output apart, so that the runners write
-            // to different huge pages and a page's first-touch fault holds up one or two of
-            // them, not all.
-            let ways = if chunks % 4 == 0 { 4 } else { 1 };
             crate::par::pool().run(self.threads.min(chunks), |_| loop {
                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if k >= chunks {
                     break;
                 }
-                let c = (k % ways) * (chunks / ways) + k / ways;
+                let c = chunks - 1 - k;
                 unsafe {
                     materialize_prefix_range(words as *const B128, half, &weights,
                         dst.map(|p| p as *mut u64), c * chunk..((c + 1) * chunk).min(half));
