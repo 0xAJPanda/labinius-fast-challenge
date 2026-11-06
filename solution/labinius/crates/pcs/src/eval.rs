@@ -254,68 +254,56 @@ pub(crate) fn binary_check(p0: &[F162], v: &[RingElement], u_folded: F162) -> bo
 // the row evaluation straight from the words
 // =============================================================================================
 
-/// The eight `B128` at `x` as `[limb0, limb1]` of their lifts.
+const PAIRED: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+
+#[inline(always)]
+unsafe fn x3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
+    _mm512_ternarylogic_epi64::<0x96>(a, b, c)
+}
+
 ///
 /// # Safety
-/// `x` addresses 8 readable `B128`.
 #[inline(always)]
-unsafe fn load_words2(x: *const F162Word, lo: __m512i, hi: __m512i) -> [__m512i; 2] {
-    let a = _mm512_loadu_si512(x as *const __m512i);
-    let b = _mm512_loadu_si512(x.add(4) as *const __m512i);
-    [
-        _mm512_permutex2var_epi64(a, lo, b),
-        _mm512_permutex2var_epi64(a, hi, b),
-    ]
-}
-
-/// Accumulate the 10 nonzero `clmul` products of 8 `F162` (`x = [x0, x1, x2]`, `sa = x0 ^ x1`)
-/// against 8 lifted `B128` words (`b = [b0, b1]`). The two `x2 * b2` products are zero and the
-/// Karatsuba cross-term adjustment `acc[8..12] ^= acc[0..4]` is deferred to [`horizontal_word10`].
-#[inline(always)]
-unsafe fn mac_word10(acc: &mut [__m512i; 10], x: [__m512i; 3], sa: __m512i, b: [__m512i; 2]) {
-    let sb = _mm512_xor_si512(b[0], b[1]);
-    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x00>(x[0], b[0]));
-    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x11>(x[0], b[0]));
-    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x00>(x[1], b[1]));
-    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x11>(x[1], b[1]));
-    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x00>(sa, sb));
-    acc[5] = _mm512_xor_si512(acc[5], _mm512_clmulepi64_epi128::<0x11>(sa, sb));
-    acc[6] = _mm512_xor_si512(acc[6], _mm512_clmulepi64_epi128::<0x00>(x[2], b[0]));
-    acc[7] = _mm512_xor_si512(acc[7], _mm512_clmulepi64_epi128::<0x11>(x[2], b[0]));
-    acc[8] = _mm512_xor_si512(acc[8], _mm512_clmulepi64_epi128::<0x00>(x[2], b[1]));
-    acc[9] = _mm512_xor_si512(acc[9], _mm512_clmulepi64_epi128::<0x11>(x[2], b[1]));
+unsafe fn mac_word5(acc: &mut [__m512i; 5], x: [__m512i; 3], sa: __m512i, p: *const F162Word) {
+    let q = p as *const u8;
+    let a = _mm512_loadu_si512(q as *const __m512i);
+    let b = _mm512_loadu_si512(q.add(64) as *const __m512i);
+    let sa_w = _mm512_xor_si512(a, _mm512_loadu_si512(q.add(8) as *const __m512i));
+    let sb_w = _mm512_xor_si512(b, _mm512_loadu_si512(q.add(56) as *const __m512i));
+    acc[0] = x3(acc[0], _mm512_clmulepi64_epi128::<0x00>(x[0], a), _mm512_clmulepi64_epi128::<0x01>(x[0], b));
+    acc[1] = x3(acc[1], _mm512_clmulepi64_epi128::<0x10>(x[1], a), _mm512_clmulepi64_epi128::<0x11>(x[1], b));
+    acc[2] = x3(acc[2], _mm512_clmulepi64_epi128::<0x00>(sa, sa_w), _mm512_clmulepi64_epi128::<0x11>(sa, sb_w));
+    acc[3] = x3(acc[3], _mm512_clmulepi64_epi128::<0x00>(x[2], a), _mm512_clmulepi64_epi128::<0x01>(x[2], b));
+    acc[4] = x3(acc[4], _mm512_clmulepi64_epi128::<0x10>(x[2], a), _mm512_clmulepi64_epi128::<0x11>(x[2], b));
 }
 
 #[inline(always)]
-unsafe fn horizontal_word10(acc: [__m512i; 10]) -> F162 {
+unsafe fn horizontal_word5(acc: [__m512i; 5]) -> F162 {
     let z = _mm512_setzero_si512();
     horizontal([
         acc[0],
+        z,
         acc[1],
+        z,
+        z,
+        z,
         acc[2],
-        acc[3],
         z,
+        _mm512_xor_si512(acc[3], acc[0]),
         z,
-        acc[4],
-        acc[5],
-        _mm512_xor_si512(acc[6], acc[0]),
-        _mm512_xor_si512(acc[7], acc[1]),
-        _mm512_xor_si512(acc[8], acc[2]),
-        _mm512_xor_si512(acc[9], acc[3]),
+        _mm512_xor_si512(acc[4], acc[1]),
+        z,
     ])
 }
 
 type F162Word = crate::fields::scalar::B128;
 
-/// [`dot`] against a run of `n` `B128` words read as their lifts.
 ///
 /// # Safety
 /// `b` addresses `n` words and `a` holds at least `n` elements.
 unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     debug_assert!(a.n >= n);
-    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
-    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-    let (mut acc, blocks) = ([_mm512_setzero_si512(); 10], n / 8);
+    let (mut acc, blocks) = ([_mm512_setzero_si512(); 5], n / 8);
     for t in 0..blocks {
         // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
         // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
@@ -329,10 +317,10 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
             _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
         let sa = _mm512_xor_si512(x[0], x[1]);
-        mac_word10(&mut acc, x, sa, load_words2(b.add(8 * t), lo, hi));
+        mac_word5(&mut acc, x, sa, b.add(8 * t));
     }
     let mut out = if blocks > 0 {
-        horizontal_word10(acc)
+        horizontal_word5(acc)
     } else {
         F162::ZERO
     };
@@ -350,10 +338,8 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
 /// `b0` and `b1` each address `n` words and `a` holds at least `n` elements.
 unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
     debug_assert!(a.n >= n);
-    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
-    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-    let mut acc0 = [_mm512_setzero_si512(); 10];
-    let mut acc1 = [_mm512_setzero_si512(); 10];
+    let mut acc0 = [_mm512_setzero_si512(); 5];
+    let mut acc1 = [_mm512_setzero_si512(); 5];
     let blocks = n / 8;
     for t in 0..blocks {
         let ahead0 = b0.wrapping_add(8 * t + 64) as *const i8;
@@ -368,11 +354,11 @@ unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usiz
             _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
         let sa = _mm512_xor_si512(x[0], x[1]);
-        mac_word10(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
-        mac_word10(&mut acc1, x, sa, load_words2(b1.add(8 * t), lo, hi));
+        mac_word5(&mut acc0, x, sa, b0.add(8 * t));
+        mac_word5(&mut acc1, x, sa, b1.add(8 * t));
     }
     let mut out = if blocks > 0 {
-        [horizontal_word10(acc0), horizontal_word10(acc1)]
+        [horizontal_word5(acc0), horizontal_word5(acc1)]
     } else {
         [F162::ZERO; 2]
     };
@@ -388,12 +374,18 @@ unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usiz
 /// and one column per task over `workers` threads: `u_j = sum_i eq(p0, i) lift(words[i + wdim j])`.
 /// `eq(p0, .)` straight into the word-sliced layout [`dot_words`] reads: entry `i` is
 /// `eq(p0[..3], i & 7) eq(p0[3..], i >> 3)`, eight entries per [`bf::mul_soa8`] against the
-/// eight low ones, cut over the pool. The field is exact, so the entries are [`eq_table`]'s.
 fn eq_poly(p0: &[F162], workers: usize) -> Poly {
     const LO: usize = 3;
     let n = 1usize << p0.len();
     if p0.len() < 2 * LO {
-        return Poly::from_scalars(&eq_table(p0));
+        let mut t = eq_table(p0);
+        for block in t.chunks_exact_mut(8) {
+            let natural: [F162; 8] = core::array::from_fn(|i| block[i]);
+            for (q, &e) in PAIRED.iter().enumerate() {
+                block[q] = natural[e];
+            }
+        }
+        return Poly::from_scalars(&t);
     }
     let lo = eq_table(&p0[..LO]);
     let hi = eq_table(&p0[LO..]);
@@ -402,7 +394,7 @@ fn eq_poly(p0: &[F162], workers: usize) -> Poly {
     let runs = crate::par::ranges(hi.len(), workers, 8);
     crate::par::pool().run(runs.len(), |r| unsafe {
         let lo_v: [__m512i; 3] = core::array::from_fn(|k| {
-            let limbs: [u64; 8] = core::array::from_fn(|i| lo[i].0[k]);
+            let limbs: [u64; 8] = core::array::from_fn(|i| lo[PAIRED[i]].0[k]);
             _mm512_loadu_si512(limbs.as_ptr() as *const __m512i)
         });
         for ih in runs[r].clone() {
@@ -494,7 +486,8 @@ mod word_tests {
             for workers in [1usize, 3, 8] {
                 assert_eq!(row_evaluate_words(&words, &p, workers), expected, "log {log}, workers {workers}");
                 let poly = eq_poly(&p, workers);
-                assert_eq!((0..eq.len()).map(|i| poly.get(i)).collect::<Vec<_>>(), eq, "log {log}");
+                let arranged: Vec<_> = (0..eq.len()).map(|i| if eq.len() < 8 { eq[i] } else { eq[i - i % 8 + PAIRED[i % 8]] }).collect();
+                assert_eq!((0..eq.len()).map(|i| poly.get(i)).collect::<Vec<_>>(), arranged, "log {log}");
             }
         }
     }
