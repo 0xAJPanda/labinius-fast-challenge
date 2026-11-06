@@ -3,7 +3,6 @@ use super::scalar::F162;
 use crate::arch::*;
 use crate::par;
 
-/// Fewest entries of a round's half a worker takes; smaller rounds run on the calling thread.
 const PAR_MIN: usize = 1 << 14;
 
 #[derive(Clone)]
@@ -36,7 +35,6 @@ impl Poly {
     }
 }
 
-/// Eight entries from `j` of the three limb slices.
 #[inline(always)]
 unsafe fn load(w: [&[u64]; 3], j: usize) -> [__m512i; 3] {
     [
@@ -58,14 +56,11 @@ fn get(w: [&[u64]; 3], j: usize) -> F162 {
     F162([w[0][j], w[1][j], w[2][j]])
 }
 
-/// One worker's share of a round: entries `[s, e)` of the low half `lo` and of the high half
-/// `hi`, both indexed from the start of the share.
 pub(super) struct Share<'a> {
     pub lo: [&'a mut [u64]; 3],
     pub hi: [&'a [u64]; 3],
 }
 
-/// `w` around `half` cut into the shares of `edges`, low halves writable.
 fn shares<'a>(w: &'a mut [Vec<u64>; 3], half: usize, edges: &[(usize, usize)]) -> Vec<Share<'a>> {
     let [w0, w1, w2] = w;
     let cut = |v: &'a mut Vec<u64>| {
@@ -125,8 +120,6 @@ unsafe fn horiz(acc: [__m512i; 12]) -> F162 {
     out
 }
 
-/// The round message `[sum a0 p0, sum (a0 + a1)(p0 + p1)]` over `j < half`. Workers sum
-/// disjoint ranges; their sums add (XOR) to the same field elements in any grouping.
 pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
     let ((a0, a1), (p0, p1)) = (halves(a, half), halves(p, half));
     let edges = edges(half);
@@ -134,7 +127,6 @@ pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
         let (a0, a1, p0, p1) = (cut(a0, s, e), cut(a1, s, e), cut(p0, s, e), cut(p1, s, e));
         #[cfg(target_arch = "aarch64")]
         if super::neon::pmull() {
-            // SAFETY: the CPU has PMULL.
             return unsafe { super::neon::msg_range(a0, a1, p0, p1) };
         }
         msg_range(a0, a1, p0, p1)
@@ -148,7 +140,6 @@ fn cut(w: [&[u64]; 3], s: usize, e: usize) -> [&[u64]; 3] {
     [&w[0][s..e], &w[1][s..e], &w[2][s..e]]
 }
 
-/// The low and high halves of `x` around `half`.
 fn halves(x: &Poly, half: usize) -> ([&[u64]; 3], [&[u64]; 3]) {
     (
         [&x.w[0][..half], &x.w[1][..half], &x.w[2][..half]],
@@ -156,7 +147,6 @@ fn halves(x: &Poly, half: usize) -> ([&[u64]; 3], [&[u64]; 3]) {
     )
 }
 
-/// [`msg`] over one range of the halves.
 fn msg_range(a0s: [&[u64]; 3], a1s: [&[u64]; 3], p0s: [&[u64]; 3], p1s: [&[u64]; 3]) -> [F162; 2] {
     let m = a0s[0].len();
     let mut e0 = F162::ZERO;
@@ -188,7 +178,6 @@ fn msg_range(a0s: [&[u64]; 3], a1s: [&[u64]; 3], p0s: [&[u64]; 3], p1s: [&[u64];
     [e0, einf]
 }
 
-/// `x[j] <- x[j] + r (x[j] + x[j + half])` for `j < half`, both polynomials, on the workers.
 pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
     let edges = edges(half);
     let sa = shares(&mut a.w, half, &edges);
@@ -210,17 +199,14 @@ pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
     });
 }
 
-/// [`fold`] on one share of one polynomial.
 fn fold_share(s: Share<'_>, r: F162) {
     #[cfg(target_arch = "aarch64")]
     if super::neon::pmull() {
-        // SAFETY: the CPU has PMULL.
         return unsafe { super::neon::fold_share(s.lo, s.hi, r) };
     }
     fold_share_emulated(s, r)
 }
 
-/// [`fold_share`] through the AVX-512 kernel.
 fn fold_share_emulated(s: Share<'_>, r: F162) {
     let Share { mut lo, hi } = s;
     let m = hi[0].len();
@@ -269,8 +255,6 @@ mod tests {
         Poly::from_scalars(&v)
     }
 
-    /// Rounds over several workers (native kernels where the CPU has them) against the emulated
-    /// kernels on one range and against the scalar field.
     #[test]
     fn rounds_match_the_emulated_kernels_and_the_scalar_field() {
         let mut seed = 0x1357_9BDF_2468_ACE0_FDB9_7531_0ECA_8642u128;

@@ -1,41 +1,11 @@
-//! The commitment through number-theoretic transforms modulo the three primes of
-//! [`MODULUS`] `= 3889 * 9721 * 17497`.
-//!
-//! Every prime is `1 mod 1944`, so modulo each of them `X^648 - X^324 + 1 = Phi_1944` splits into
-//! the 648 linear factors `X - zeta^e`, `e` coprime to 6, for a primitive 1944th root of unity
-//! `zeta`. The transform reduces a polynomial modulo those factors along a tree:
-//!
-//! - level 0 splits the trinomial as `(X^324 - zeta^324)(X^324 - zeta^1620)`, the two primitive
-//!   6th roots of unity `w` and `w^5` (`w + w^5 = 1`, `w * w^5 = 1`);
-//! - levels 1 and 2 split every binomial `X^n - zeta^e` by its square roots,
-//!   `(X^(n/2) - zeta^(e/2))(X^(n/2) + zeta^(e/2))`;
-//! - levels 3 to 6 split it by its cube roots, `X^(n/3) - zeta^(e/3 + 648 k)`, `k < 3`.
-//!
-//! A node of length `n` and exponent `e` holds a polynomial modulo `X^n - zeta^e` in place; its
-//! `r` children are stored one after the other, child `k` in the `k`-th `n / r` coefficients, so
-//! slot `i` of the result is the evaluation at `zeta^leaf(i)` (see [`Prime::leaves`]). A ring
-//! product is the slot-wise product, so a column's commitment `t = sum_m A_m s_m` is summed slot by
-//! slot, transformed back per prime and recombined by the Chinese remainder theorem into `[0, Q)`.
-//!
-//! [`commit`] runs the hot part, the forward transform of every binary ring element of the
-//! witness and the slot-wise products, in [`neon`] on AArch64 and in [`scalar_commit`] elsewhere.
-//! [`matrix`] expands and transforms the matrix eight elements per vector on AArch64; the inverse
-//! transform and the recombination are scalar. Every step is exact: the vector code keeps every
-//! value inside the `i16` and `i32` bounds that the `const` checks below verify.
 use labinius::fields::scalar::B128;
 use std::sync::OnceLock;
 
-/// Degree of the ring.
 pub const N: usize = 648;
-/// Half the degree: the trinomial's middle exponent.
 const HALF: usize = N / 2;
-/// The order of `zeta`.
 const ORDER: usize = 1944;
-/// Radix of the binomial levels 1 to 6.
 const RADICES: [usize; 6] = [2, 2, 3, 3, 3, 3];
-/// The three primes.
 pub const PRIMES: [u32; 3] = [3889, 9721, 17497];
-/// The commitment modulus the transforms cover, the product of [`PRIMES`].
 pub const MODULUS: u128 = PRIMES[0] as u128 * PRIMES[1] as u128 * PRIMES[2] as u128;
 const _: () = assert!(MODULUS == 661_473_542_593);
 const _: () = {
@@ -72,8 +42,6 @@ const fn pow_mod(base: u64, mut e: u64, p: u64) -> u64 {
     r
 }
 
-/// The first `g^((p - 1) / 1944)`, `g = 2, 3, ...`, of order exactly 1944: its 972nd and its
-/// 648th powers are not 1, and 1944 = 2^3 3^5 has no other maximal proper divisors.
 const fn primitive_root(p: u32) -> u32 {
     let p = p as u64;
     let mut g = 2;
@@ -86,23 +54,17 @@ const fn primitive_root(p: u32) -> u32 {
     }
 }
 
-/// `x` centered: the representative of `x mod p` in `[-(p - 1) / 2, (p - 1) / 2]`.
 pub const fn centered(x: i64, p: u32) -> i16 {
     let p = p as i64;
     let r = x.rem_euclid(p);
     (if r > p / 2 { r - p } else { r }) as i16
 }
 
-/// One prime's transform: the powers of its root and the exponent of every node.
 pub struct Prime {
     pub p: u32,
-    /// `zeta^i` for `i < 1944`, in `[0, p)`.
     pub pow: Vec<u32>,
-    /// `exps[l]`: the exponents `e` of the nodes `X^n - zeta^e` after level `l`, in storage
-    /// order; `exps[0]` = `[324, 1620]` and `exps[6]` holds the 648 leaves.
     pub exps: Vec<Vec<u32>>,
     inv_radix: [u32; 4],
-    /// `1 / (w - w^5)`, which undoes the trinomial split.
     inv_split: u32,
 }
 
@@ -135,22 +97,17 @@ impl Prime {
         }
     }
 
-    /// `zeta^e` for any exponent.
     #[inline]
     pub fn root(&self, e: usize) -> u64 {
         self.pow[e % ORDER] as u64
     }
 
-    /// The exponents of the 648 slots: slot `i` of a transform is the evaluation at
-    /// `zeta^leaves()[i]`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn leaves(&self) -> &[u32] {
         &self.exps[RADICES.len()]
     }
 
-    /// The transform of `x` (residues in `[0, p)`) in place.
     pub fn forward(&self, x: &mut [u32; N]) {
-        // the modulus as a constant, so that `%` is a multiplication
         match self.p {
             3889 => self.forward_mod(x, 3889),
             9721 => self.forward_mod(x, 9721),
@@ -192,7 +149,6 @@ impl Prime {
         }
     }
 
-    /// The inverse of [`Prime::forward`], residues in `[0, p)` in and out.
     pub fn inverse(&self, x: &mut [u32; N]) {
         match self.p {
             3889 => self.inverse_mod(x, 3889),
@@ -217,7 +173,6 @@ impl Prime {
                     for (k, slot) in y.iter_mut().enumerate().take(r) {
                         *slot = x[base + j + k * len] as u64;
                     }
-                    // a_i = r^-1 tau^-i sum_k eps^-(k i) y_k
                     for i in 0..r {
                         let mut acc = 0u64;
                         for (k, &v) in y.iter().enumerate().take(r) {
@@ -240,13 +195,11 @@ impl Prime {
     }
 }
 
-/// The three primes' transforms, built once.
 pub fn primes() -> &'static [Prime; 3] {
     static PLANS: OnceLock<[Prime; 3]> = OnceLock::new();
     PLANS.get_or_init(|| PRIMES.map(Prime::new))
 }
 
-/// Garner's recombination of residues `r_i mod p_i` into the residue in `[0, MODULUS)`.
 #[inline]
 pub fn crt(r: [u32; 3]) -> u128 {
     const P0: u64 = PRIMES[0] as u64;
@@ -259,29 +212,14 @@ pub fn crt(r: [u32; 3]) -> u128 {
     let x1 = (r1 + P1 - r0 % P1) % P1 * INV_P0_MOD_P1 % P1;
     let low = r0 + P0 * x1;
     let x2 = (r2 + P2 - low % P2) % P2 * INV_P0P1_MOD_P2 % P2;
-    // x0 + p0 x1 + p0 p1 x2 <= (p0 - 1) + p0 (p1 - 1) + p0 p1 (p2 - 1) = Q - 1
     (low + P0 * P1 * x2) as u128
 }
 
-/// Where the vector transform ([`neon`]) reduces, per prime. Lanes are `i16`; a level's
-/// multiplications are Barrett products by constants and its additions are lazy, so values
-/// grow level by level until a reduction brings them back to [`reduced_bound`].
-///
-/// Levels: 0 the trinomial split, 1 the first radix-2 split (both on the binary input, as
-/// selections of constants), 2 the second radix-2 split, 3 to 6 the radix-3 splits.
 #[derive(Clone, Copy)]
 pub struct Schedule {
-    /// `before[l]`: which inputs of level `l` to reduce (used for `l = 2..=6`): [`NONE`],
-    /// [`ALL`], or [`FIRST`], the input that is not multiplied by a twiddle.
     pub before: [u8; 7],
-    /// Reduce `d = tau b - tau^2 c` inside the radix-3 butterfly before it is multiplied by the
-    /// cube root of unity.
     pub reduce_d: bool,
-    /// Reduce the multiplied inputs (under [`ALL`]) and `d` with [`cheap_bound`]'s one-multiply
-    /// reduction instead of the Barrett reduction; the first inputs stay Barrett-reduced.
     pub cheap: bool,
-    /// Elements summed into the `i32` slot accumulators between two reductions of them, within
-    /// [`accumulator_bound`].
     pub accumulate: usize,
 }
 
@@ -305,8 +243,6 @@ pub const SCHEDULES: [Schedule; 3] = [
     },
 ];
 
-/// The schedule of the vector transform of a matrix element (any residues, see
-/// [`general_transform_bound`]): every level's inputs reduced, as for the largest prime.
 pub const GENERAL: Schedule = Schedule {
     before: [ALL; 7],
     reduce_d: true,
@@ -314,7 +250,6 @@ pub const GENERAL: Schedule = Schedule {
     accumulate: 0,
 };
 
-/// The schedule of the binary transforms (`0..3`, by prime) or of [`GENERAL`] (`3`).
 pub const fn schedule(index: usize) -> Schedule {
     if index < 3 {
         SCHEDULES[index]
@@ -323,9 +258,6 @@ pub const fn schedule(index: usize) -> Schedule {
     }
 }
 
-/// The bound on every value of the vector transform of centered residues (`|x| <= (p - 1) / 2`):
-/// levels 0 and 1 are Barrett products and sums with every value reduced in between, then
-/// levels 2 to 6 follow [`GENERAL`].
 pub const fn general_transform_bound(p: u32) -> u32 {
     const MAX: u32 = i16::MAX as u32;
     let h = (p - 1) / 2;
@@ -335,29 +267,19 @@ pub const fn general_transform_bound(p: u32) -> u32 {
     transform_bound(p, GENERAL)
 }
 
-/// Largest `|a w - round(a w' / 2^15) p|` for `|a| <= b`, `w' = round(w 2^15 / p)`, any `w`:
-/// `p (|a| / 2^16 + 1 / 2)` (`|w / p - w' / 2^15| <= 2^-16` and the rounding of the high
-/// product is at most `1 / 2`), rounded up.
 pub const fn product_bound(p: u32, b: u32) -> u32 {
     ((p as u64 * (b as u64 + 32768)).div_ceil(65536)) as u32
 }
 
-/// Largest `|a - round(floor(a v / 2^15) / 2^11) p|` over `|a| <= 2^15`, `v = round(2^26 / p)`:
-/// the quotient is off from `a / p` by at most `1/2 + 2^-11 + 2^-12`, so the remainder is at most
-/// `p / 2 + 3 p / 4096`, rounded up. The exhaustive test confirms it per prime.
 pub const fn reduced_bound(p: u32) -> u32 {
     p.div_ceil(2) + (3 * p).div_ceil(4096)
 }
 
-/// Largest `|a - round(a / 2^14) p|` for `|a| <= b`: `|a| |1 - p / 2^14| + p / 2`, rounded up.
-/// Close to [`reduced_bound`] only for a prime close to `2^14`.
 pub const fn cheap_bound(p: u32, b: u32) -> u32 {
     let off = (p as i64 - (1 << 14)).unsigned_abs();
     ((b as u64 * off + (p as u64) * (1 << 13)).div_ceil(1 << 14)) as u32
 }
 
-/// The bounds on a level's first input `a` and on its multiplied inputs, from the bound `b` on
-/// the previous level's outputs and the level's reduction mode.
 const fn level_inputs(p: u32, b: u32, mode: u8, cheap: bool) -> (u32, u32) {
     match mode {
         ALL if cheap => (reduced_bound(p), cheap_bound(p, b)),
@@ -367,20 +289,14 @@ const fn level_inputs(p: u32, b: u32, mode: u8, cheap: bool) -> (u32, u32) {
     }
 }
 
-/// The bound on every value the schedule produces, checked level by level against `i16`;
-/// returns the bound on the transform's output before its final reduction.
 pub const fn transform_bound(p: u32, s: Schedule) -> u32 {
     const MAX: u32 = i16::MAX as u32;
     let h = (p - 1) / 2;
-    // levels 0 and 1: m_j - (m_{j+324} & c) -+ ((m_{j+162} & c') + (m_{j+486} & c''))
     let b = 1 + 3 * h;
     assert!(b <= MAX);
-    // level 2, radix 2: a +- tau b
     let (a, x) = level_inputs(p, b, s.before[2], s.cheap);
     let mut b = a + product_bound(p, x);
     assert!(b <= MAX);
-    // levels 3 to 6, radix 3: y0 = a + (b' + c'), y1 = (a - c') + e, y2 = (a - b') - e,
-    // b' = tau b, c' = tau^2 c, e = eps (b' - c')
     let mut l = 3;
     while l <= 6 {
         let (a, x) = level_inputs(p, b, s.before[l], s.cheap);
@@ -402,9 +318,6 @@ pub const fn transform_bound(p: u32, s: Schedule) -> u32 {
     b
 }
 
-/// The accumulator bound: after a reduction a slot sum is at most `p` in magnitude, and each
-/// element adds a product of a centered matrix slot (`<= (p - 1) / 2`) and a transform slot as
-/// the last level leaves it (`<= transform_bound(p, s)`, not reduced again).
 pub const fn accumulator_bound(p: u32, s: Schedule) -> u64 {
     p as u64 + s.accumulate as u64 * ((p as u64 - 1) / 2) * transform_bound(p, s) as u64
 }
@@ -421,13 +334,9 @@ const _: () = {
     }
 };
 
-/// Stride of a transformed matrix row: the 648 slots and zeros up to a multiple of eight, so that
-/// an eight-slot vector load at any multiple of six stays inside the row.
 pub const ROW: usize = 656;
 const _: () = assert!(ROW >= 6 * (N / 6 - 1) + 8 && ROW % 8 == 0);
 
-/// The matrix in the transform domain: element `m`'s transform modulo prime `i` is
-/// `data[(3 m + i) ROW..][..N]`, centered residues (`|a| <= (p - 1) / 2`).
 pub struct Matrix {
     pub elements: usize,
     pub data: Vec<i16>,
@@ -446,9 +355,6 @@ impl Matrix {
     }
 }
 
-/// Runs `f(first, block)` on `workers` scoped threads over contiguous blocks of `out`, whose
-/// items come in groups of `unit` (`first` counts groups), block edges on multiples of `align`
-/// groups.
 pub fn for_blocks<T: Send>(
     out: &mut [T],
     unit: usize,
@@ -473,8 +379,6 @@ pub fn for_blocks<T: Send>(
     });
 }
 
-/// The transform of every element of `matrix` (`rq::ajtai_matrix` layout, residues below
-/// [`MODULUS`]) modulo each prime. The reference for [`matrix`].
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn transform_matrix(matrix: &[u128], workers: usize) -> Matrix {
     assert_eq!(matrix.len() % N, 0);
@@ -499,9 +403,6 @@ pub fn transform_matrix(matrix: &[u128], workers: usize) -> Matrix {
     Matrix { elements, data }
 }
 
-/// The transformed matrix for [`MODULUS`] over `elements` elements: each element is expanded
-/// on its own (`rq::ajtai_element`, the same coefficients as `rq::ajtai_matrix`) and
-/// transformed, eight elements per vector on AArch64, with no full-width matrix in memory.
 pub fn matrix(elements: usize, workers: usize) -> Matrix {
     let plans = primes();
     let mut data = vec![0i16; 3 * elements * ROW];
@@ -532,8 +433,6 @@ pub fn matrix(elements: usize, workers: usize) -> Matrix {
     Matrix { elements, data }
 }
 
-/// The transform of the first `count` lanes of `x` (centered residues) modulo prime `i`, into
-/// values congruent to the transform.
 fn transform_lanes(i: usize, x: &mut [[i16; 8]; N], count: usize) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -544,7 +443,6 @@ fn transform_lanes(i: usize, x: &mut [[i16; 8]; N], count: usize) {
     transform_lanes_scalar(i, x, count);
 }
 
-/// [`transform_lanes`] lane by lane in scalar arithmetic, residues in `[0, p)` out.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn transform_lanes_scalar(i: usize, x: &mut [[i16; 8]; N], count: usize) {
     let plan = &primes()[i];
@@ -558,7 +456,6 @@ fn transform_lanes_scalar(i: usize, x: &mut [[i16; 8]; N], count: usize) {
     }
 }
 
-/// Coefficient `4 q + k` of a binary witness element is bit `q` of word `k`.
 #[inline]
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub fn element_bits(words: &[B128], out: &mut [u32; N]) {
@@ -570,8 +467,6 @@ pub fn element_bits(words: &[B128], out: &mut [u32; N]) {
     }
 }
 
-/// The transform-domain sums of one column, `acc[i][slot] = sum_m A_m(slot) s_m(slot) mod p_i`,
-/// back to coefficients and recombined.
 pub fn finish_column(acc: &[[u32; N]; 3], out: &mut [u128]) {
     let mut residues = [[0u32; N]; 3];
     for ((plan, r), a) in primes().iter().zip(residues.iter_mut()).zip(acc) {
@@ -583,9 +478,6 @@ pub fn finish_column(acc: &[[u32; N]; 3], out: &mut [u128]) {
     }
 }
 
-/// The commitment in plain integer arithmetic: every column's elements transformed one by one,
-/// the slot products summed in `u64` (at most `elements` products below `p^2 < 2^29`), reduced
-/// once. Exact for any column; the reference for [`commit`] and the path off AArch64.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub fn scalar_commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
@@ -626,7 +518,6 @@ pub fn scalar_commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
 #[path = "ntt_neon.rs"]
 pub mod neon;
 
-/// The commitment of every column of `values` under the transformed matrix `a`.
 pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     {
@@ -654,7 +545,6 @@ pub mod tests {
         core::array::from_fn(|_| (xorshift(&mut s) % p as u64) as u32)
     }
 
-    /// `zeta` has order exactly 1944 and the slots are the 648 primitive 1944th roots, once each.
     #[test]
     fn roots_and_leaves() {
         for plan in primes() {
@@ -671,13 +561,11 @@ pub mod tests {
                 seen[e as usize] = true;
             }
             assert_eq!(plan.leaves().len(), N);
-            // (X^324 - w)(X^324 - w^5) = X^648 - X^324 + 1
             assert_eq!((plan.root(HALF) + plan.root(5 * HALF)) % p, 1);
             assert_eq!(plan.root(HALF) * plan.root(5 * HALF) % p, 1);
         }
     }
 
-    /// Slot `i` of the transform is the evaluation at `zeta^leaf(i)`.
     #[test]
     fn forward_is_evaluation() {
         for (n, plan) in primes().iter().enumerate() {
@@ -695,7 +583,6 @@ pub mod tests {
         }
     }
 
-    /// The inverse undoes the transform, on random and on edge inputs.
     #[test]
     fn round_trip() {
         for (n, plan) in primes().iter().enumerate() {
@@ -718,8 +605,6 @@ pub mod tests {
         }
     }
 
-    /// The slot-wise product is the product in `Z_p[X]/(X^648 - X^324 + 1)`, against the library's
-    /// schoolbook `mul_mod_phi`.
     #[test]
     fn product_matches_schoolbook() {
         for (n, plan) in primes().iter().enumerate() {
@@ -741,8 +626,6 @@ pub mod tests {
         }
     }
 
-    /// The scalar lane transform (the matrix path off AArch64) agrees with [`transform_lanes`]
-    /// modulo each prime, on random residues and on the extremes.
     #[test]
     fn lane_transforms_agree() {
         let mut s = 5u64;
@@ -766,7 +649,6 @@ pub mod tests {
         }
     }
 
-    /// Garner's recombination is the residue in `[0, Q)`.
     #[test]
     fn crt_is_exact() {
         let mut s = 99u64;

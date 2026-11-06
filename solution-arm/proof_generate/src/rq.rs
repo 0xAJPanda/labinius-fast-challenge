@@ -127,7 +127,6 @@ pub fn ajtai_matrix(q: u128, elements: usize) -> Vec<u128> {
     matrix
 }
 
-/// Element `index` of [`ajtai_matrix`]`(q, elements)`: its `N` coefficients, written to `out`.
 pub fn ajtai_element(q: u128, elements: usize, index: usize, out: &mut [u128]) {
     assert_eq!(out.len(), N);
     let width = coefficient_bytes(q);

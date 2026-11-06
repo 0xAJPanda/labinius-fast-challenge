@@ -1,41 +1,15 @@
-//! Native AArch64 kernels for the field switch.
-//!
-//! The kernels in [`crossfield`](super::crossfield) and [`sumcheck`](super::sumcheck) are
-//! written against AVX-512 GFNI and VPCLMULQDQ, which this target only emulates. These compute
-//! the same field elements with NEON and, for the `F162` products, PMULL:
-//!
-//! - [`partial_evals_rows`]: the `128 x n` by `n x 128` bit product `v[k] = sum_j bit_k(pi0[j])
-//!   eq[j]` by the method of four Russians. Per group of eight rows, a 256-entry table of the
-//!   XOR combinations of the eight `eq` rows, indexed by the byte that collects bit `k` of the
-//!   eight `pi0` rows (an 8 x 8 bit transpose per byte column, three masked shift rounds).
-//! - [`poly_from_eq_rows`]: `a[j] = sum_k bit_k(eq[j]) batch[k]`, sixteen lookups per row in
-//!   per-byte tables of `batch` combinations, written straight into the word-sliced layout.
-//! - [`poly_from_b128_rows`]: the low and high words of each `B128` via de-interleaving loads.
-//! - [`msg_range`] and [`fold_share`]: the sumcheck round over the word-sliced polynomials, two
-//!   entries per step, Karatsuba over the three 64-bit limbs with `PMULL`/`PMULL2`. Message sums
-//!   are accumulated unreduced and reduced once, as the AVX-512 kernel does.
-//!
-//! Everything here is GF(2)-linear bookkeeping around exact field arithmetic, so the outputs
-//! are bit-identical to the emulated kernels; the tests check that against both.
 use super::scalar::{B128, F162};
 use core::arch::aarch64::*;
 
-/// Whether the `F162` kernels can run: PMULL is the `aes` feature.
 #[inline]
 pub(super) fn pmull() -> bool {
     std::arch::is_aarch64_feature_detected!("aes")
 }
 
-// ---------------------------------------------------------------------------------------------
-// partial evaluations
-// ---------------------------------------------------------------------------------------------
 
-/// Rows per table group, and groups per pass (eight 4 KiB tables).
 const GROUP: usize = 8;
 const PASS: usize = 8;
 
-/// The eight rows at `p` as byte columns: `out[16 t + b]` collects bit `8 b + t` of rows
-/// `0..8` in bits `0..8`.
 #[inline(always)]
 unsafe fn patterns(p: *const B128, out: &mut [u8; 128]) {
     let mut v: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(p.add(i) as *const u8));
@@ -61,7 +35,6 @@ unsafe fn patterns(p: *const B128, out: &mut [u8; 128]) {
     }
 }
 
-/// `t[s]` = the sum of the rows `e[i]` over the set bits `i` of `s`.
 #[inline(always)]
 unsafe fn combinations(e: *const B128, t: &mut [uint8x16_t; 256]) {
     let rows: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(e.add(i) as *const u8));
@@ -79,12 +52,10 @@ unsafe fn combinations(e: *const B128, t: &mut [uint8x16_t; 256]) {
     }
 }
 
-/// `v[k] = sum_j bit_k(pi0[j]) eq[j]` over all rows of the slices.
 pub(super) fn partial_evals_rows(pi0: &[B128], eq: &[B128]) -> Vec<B128> {
     assert_eq!(pi0.len(), eq.len());
     let n = pi0.len();
     let groups = n / GROUP;
-    // acc[16 t + b] sums v[8 b + t], the order `patterns` emits.
     let mut acc = [0u128; 128];
     unsafe {
         let mut tabs: Vec<[uint8x16_t; 256]> = vec![[vdupq_n_u8(0); 256]; PASS];
@@ -127,12 +98,7 @@ pub(super) fn partial_evals_rows(pi0: &[B128], eq: &[B128]) -> Vec<B128> {
     v
 }
 
-// ---------------------------------------------------------------------------------------------
-// the sumcheck's polynomials
-// ---------------------------------------------------------------------------------------------
 
-/// Per-byte tables of `sum_k bit_k(x) batch[k]`, summed over the claims: entry `256 b + s` is
-/// the image of byte value `s` at byte `b`, its low limbs in `lo` and its top limb in `top`.
 pub(super) struct ByteTables {
     lo: Vec<u128>,
     top: Vec<u64>,
@@ -158,7 +124,6 @@ impl ByteTables {
     }
 }
 
-/// `w[.][j] = sum_c sum_k bit_k(eqs[c][j]) batch_c[k]`, each claim through its [`ByteTables`].
 pub(super) fn poly_from_eq_rows(eqs: &[&[B128]], tabs: &[ByteTables], w: [&mut [u64]; 3]) {
     let n = eqs[0].len();
     let [w0, w1, w2] = w;
@@ -184,7 +149,6 @@ pub(super) fn poly_from_eq_rows(eqs: &[&[B128]], tabs: &[ByteTables], w: [&mut [
     }
 }
 
-/// `pi0` lifted: low words, high words, and a zero top limb.
 pub(super) fn poly_from_b128_rows(pi0: &[B128], w: [&mut [u64]; 3]) {
     let n = pi0.len();
     let [w0, w1, w2] = w;
@@ -205,11 +169,7 @@ pub(super) fn poly_from_b128_rows(pi0: &[B128], w: [&mut [u64]; 3]) {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// F162 with PMULL
-// ---------------------------------------------------------------------------------------------
 
-/// The limb products of lane 0 and of lane 1.
 #[inline(always)]
 unsafe fn pmul_lo(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
     vreinterpretq_u64_p128(vmull_p64(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b)))
@@ -233,7 +193,6 @@ unsafe fn x3(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
     veorq_u64(veorq_u64(a, b), c)
 }
 
-/// Two entries' limbs from `j`.
 #[inline(always)]
 unsafe fn load2(w: [&[u64]; 3], j: usize) -> [uint64x2_t; 3] {
     [
@@ -243,13 +202,11 @@ unsafe fn load2(w: [&[u64]; 3], j: usize) -> [uint64x2_t; 3] {
     ]
 }
 
-/// The Karatsuba operands of a limb triple: `[x0, x1, x2, x0 + x1, x0 + x2, x1 + x2]`.
 #[inline(always)]
 unsafe fn kara(x: [uint64x2_t; 3]) -> [uint64x2_t; 6] {
     [x[0], x[1], x[2], x2(x[0], x[1]), x2(x[0], x[2]), x2(x[1], x[2])]
 }
 
-/// `acc[i] += a_i b_i` for both lanes, unreduced: each `acc[i]` is one 128-bit sum.
 #[inline(always)]
 unsafe fn mac2(acc: &mut [uint64x2_t; 6], a: [uint64x2_t; 3], b: [uint64x2_t; 3]) {
     let (ka, kb) = (kara(a), kara(b));
@@ -258,7 +215,6 @@ unsafe fn mac2(acc: &mut [uint64x2_t; 6], a: [uint64x2_t; 3], b: [uint64x2_t; 3]
     }
 }
 
-/// Six unreduced Karatsuba products of one element as limbs `p0..p5` of the 323-bit product.
 #[inline(always)]
 fn assemble(m: [u128; 6]) -> [u64; 6] {
     let [m0, m1, m2, k01, k02, k12] = m;
@@ -277,7 +233,6 @@ fn assemble(m: [u128; 6]) -> [u64; 6] {
     ]
 }
 
-/// The reduction modulo `x^162 + x^81 + 1` of [`F162`]'s product, on limbs `p0..p5`.
 #[inline(always)]
 fn reduce(p: [u64; 6]) -> F162 {
     const M34: u64 = (1 << 34) - 1;
@@ -297,10 +252,6 @@ unsafe fn to_u128(x: uint64x2_t) -> u128 {
     vgetq_lane_u64::<0>(x) as u128 | (vgetq_lane_u64::<1>(x) as u128) << 64
 }
 
-/// The round message over one range: `[sum a0 p0, sum (a0 + a1)(p0 + p1)]`.
-///
-/// # Safety
-/// The CPU must have PMULL ([`pmull`]).
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn msg_range(
     a0s: [&[u64]; 3],
@@ -337,10 +288,6 @@ pub(super) unsafe fn msg_range(
     [e0, einf]
 }
 
-/// `lo[j] <- lo[j] + r (lo[j] + hi[j])` over one share.
-///
-/// # Safety
-/// The CPU must have PMULL ([`pmull`]).
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
     let m = hi[0].len();
@@ -363,7 +310,6 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
         ];
         let x1 = load2(hi, j);
         let d = kara([x2(x0[0], x1[0]), x2(x0[1], x1[1]), x2(x0[2], x1[2])]);
-        // Products of lane 0 and lane 1, then their low and high words gathered across lanes.
         let mut plo = [vdupq_n_u64(0); 6];
         let mut phi = [vdupq_n_u64(0); 6];
         for k in 0..6 {

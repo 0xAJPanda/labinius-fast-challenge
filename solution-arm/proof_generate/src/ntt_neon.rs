@@ -1,45 +1,18 @@
-//! The hot part of [`super::commit`] on AArch64: eight columns per vector, one `i16` lane each.
-//!
-//! For a batch of eight columns and one ring element `m`, the binary witness elements become
-//! `0 / -1` lane masks per coefficient ([`masks`]), which are the coefficients of `-s`. Each
-//! prime's transform then runs on whole vectors, so every butterfly serves eight independent
-//! transforms and no lane ever moves: levels 0 and 1 select constants with the masks (no
-//! multiplications), level 2 is a radix-2 split and levels 3 to 6 are radix-3 splits whose
-//! twiddles are Barrett products by constants (`mul`, `sqrdmulh`, `mls` against a precomputed
-//! `round(w 2^15 / p)`). Values grow lazily within the `i16` bounds that
-//! [`super::transform_bound`] checks at compile time and are reduced where the prime's
-//! [`super::Schedule`] says. The last level's outputs are multiplied straight into the batch's
-//! `i32` slot sums with `smlsl` by the matrix slot (subtracting the product with `-s` adds the
-//! product with `s`); the sums are reduced every [`super::Schedule::accumulate`] elements.
 use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, N, PRIMES, ROW, SCHEDULES};
 use core::arch::aarch64::*;
 use labinius::fields::scalar::B128;
 use std::sync::OnceLock;
 
-/// Columns per vector.
 const LANES: usize = 8;
-/// Coefficients a binary witness element can have set.
 const BITS: usize = 512;
 
-/// One prime's constants in the order the passes read them. A twiddle `w` is stored as the pair
-/// `(w, round(w 2^15 / p))`, both centered.
 pub struct Kernel {
-    /// `[p, round(2^26 / p), eps, eps', 0, 0, 0, 0]`, `eps = zeta^648`.
     k: [i16; 8],
-    /// Levels 0 and 1: `[zeta^324, zeta^1620, zeta^162, zeta^486, zeta^810, zeta^486, 0, 0]`.
     a: [i16; 8],
-    /// Levels 0 and 1 of a general transform, as pairs: `zeta^324, zeta^1620, zeta^162,
-    /// zeta^810`.
     g: [i16; 8],
-    /// Levels 2 and 3, per level-1 node `n`: the radix-3 pairs of level-2 nodes `2n`, `2n + 1`,
-    /// then the radix-2 pair of node `n`.
     b: [[i16; 16]; 4],
-    /// Levels 4 and 5, per level-3 node `n`: its radix-3 pairs, then those of its three
-    /// children.
     c: [[i16; 16]; 24],
-    /// Level 6, per two level-5 nodes: their radix-3 pairs.
     d: [[i16; 8]; 108],
-    /// `round(2^31 / p)` for the reduction of the `i32` sums.
     v32: i32,
 }
 
@@ -55,7 +28,6 @@ impl Kernel {
         let plan = &primes()[index];
         let p = plan.p;
         let tw = |e: usize| twiddle(p, plan.root(e));
-        // a radix-3 node of exponent e: (tau, tau^2), tau = zeta^(e / 3)
         let r3 = |e: u32| -> [i16; 4] {
             let t = e as usize / 3;
             let (x, y) = (tw(t), tw(2 * t));
@@ -105,14 +77,10 @@ pub fn kernels() -> &'static [Kernel; 3] {
     K.get_or_init(|| [Kernel::new(0), Kernel::new(1), Kernel::new(2)])
 }
 
-/// Barrett product by the twiddle in lanes `W` (value) and `T` (twisted) of `t`; `k` holds `p` in
-/// lane 0. `|result| <= product_bound(p, |a|)`.
 #[inline(always)]
 unsafe fn mulc<const W: i32, const T: i32>(a: int16x8_t, t: int16x8_t, k: int16x8_t) -> int16x8_t {
     let mut lo = vmulq_laneq_s16::<W>(a, t);
     let hi = vqrdmulhq_laneq_s16::<T>(a, t);
-    // `lo - hi p` as one `mls`: written as the intrinsic, LLVM turns the two products into
-    // `mul`, `neg`, `mla`, one instruction more.
     core::arch::asm!(
         "mls {lo:v}.8h, {hi:v}.8h, {k:v}.h[0]",
         lo = inout(vreg) lo,
@@ -123,7 +91,6 @@ unsafe fn mulc<const W: i32, const T: i32>(a: int16x8_t, t: int16x8_t, k: int16x
     lo
 }
 
-/// Barrett reduction of any `i16` lanes to `|result| <= reduced_bound(p)`, congruent mod `p`.
 #[inline(always)]
 pub unsafe fn reduce(a: int16x8_t, k: int16x8_t) -> int16x8_t {
     let t = vqdmulhq_laneq_s16::<1>(a, k);
@@ -131,16 +98,11 @@ pub unsafe fn reduce(a: int16x8_t, k: int16x8_t) -> int16x8_t {
     vmlsq_laneq_s16::<0>(a, t, k)
 }
 
-/// `a - round(a / 2^14) p`: one multiplication, `|result| <= cheap_bound(p, |a|)`, for the prime
-/// close to `2^14`.
 #[inline(always)]
 pub unsafe fn reduce_cheap(a: int16x8_t, k: int16x8_t) -> int16x8_t {
     vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<14>(a), k)
 }
 
-/// Reduces the level's inputs the schedule asks for: all of them (the multiplied ones cheaply
-/// when `cheap`), or only those at `first`, the butterflies' inputs that are not multiplied by
-/// a twiddle.
 #[inline(always)]
 unsafe fn reduce_inputs<const L: usize>(
     v: &mut [int16x8_t; L],
@@ -160,7 +122,6 @@ unsafe fn reduce_inputs<const L: usize>(
     }
 }
 
-/// [`radix3`] with the schedule's reduction of `d`: none, Barrett, or the cheap one.
 macro_rules! r3 {
     ($s:expr, $t0:literal, $t1:literal, $t2:literal, $t3:literal, $a:expr, $b:expr, $c:expr, $t:expr, $k:expr) => {
         match ($s.reduce_d, $s.cheap) {
@@ -171,8 +132,6 @@ macro_rules! r3 {
     };
 }
 
-/// The radix-3 butterfly of a node with `(tau, tau^2)` in lanes `T0..T3` of `t`:
-/// `y_k = a + eps^k tau b + eps^2k tau^2 c`, with `eps^2 = -1 - eps`.
 #[inline(always)]
 unsafe fn radix3<const T0: i32, const T1: i32, const T2: i32, const T3: i32, const RD: u8>(
     a: int16x8_t,
@@ -198,28 +157,23 @@ unsafe fn radix3<const T0: i32, const T1: i32, const T2: i32, const T3: i32, con
     )
 }
 
-/// `out[i]`, lane `c`: `-1` where coefficient `i` of element `m` of column `c` is set, else 0.
-/// Coefficient `4 q + k` is bit `q` of word `k`; `words[c]` points at the element's four words.
 #[inline(always)]
 unsafe fn masks(words: &[*const u8; LANES], out: &mut [int16x8_t; BITS]) {
     let bit: [uint16x8_t; 8] = core::array::from_fn(|i| vdupq_n_u16(1 << i));
     for k in 0..4 {
         let r: [uint8x16_t; 8] = core::array::from_fn(|c| vld1q_u8(words[c].add(16 * k)));
-        // three zip rounds transpose the 8 x 16 bytes: t[v] holds byte 2v of every column in
-        // its low half and byte 2v + 1 in its high half
         let a: [uint8x16_t; 8] = core::array::from_fn(|i| {
             let (x, y) = (r[2 * (i % 4)], r[2 * (i % 4) + 1]);
             if i < 4 { vzip1q_u8(x, y) } else { vzip2q_u8(x, y) }
         });
         let b: [uint16x8_t; 8] = core::array::from_fn(|i| {
-            let h = i / 4; // bytes 0..8 or 8..16
+            let h = i / 4;
             let (x, y) = (
                 vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2)]),
                 vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2) + 1]),
             );
             if i % 2 == 0 { vzip1q_u16(x, y) } else { vzip2q_u16(x, y) }
         });
-        // b[4h + 2g + z]: rows 4g..4g+4, bytes 8h + 4z .. 8h + 4z + 4
         let t: [uint8x16_t; 8] = core::array::from_fn(|v| {
             let h = v / 4;
             let z = (v % 4) / 2;
@@ -250,15 +204,12 @@ unsafe fn store(x: &mut [int16x8_t; N], i: usize, v: int16x8_t) {
     *x.get_unchecked_mut(i) = v;
 }
 
-/// Levels 0 and 1 on the masks: four slots per `j < 162`, sums of at most four selected
-/// constants (`m & c` is `c` where the coefficient is set).
 #[inline(always)]
 unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
     let a = vld1q_s16(kern.a.as_ptr());
     let (cw, cw5) = (vdupq_laneq_s16::<0>(a), vdupq_laneq_s16::<1>(a));
     let (ca, caw) = (vdupq_laneq_s16::<2>(a), vdupq_laneq_s16::<3>(a));
     let (cb, cbw) = (vdupq_laneq_s16::<4>(a), vdupq_laneq_s16::<5>(a));
-    // coefficient j + 486 exists (is below 512) only for j < 26
     for j in 0..162 {
         let (m0, m1, m2) = (m[j], m[j + 162], m[j + 324]);
         let u = vsubq_s16(m0, vandq_s16(m2, cw));
@@ -277,7 +228,6 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
-/// Levels 2 and 3: per level-1 node (162 slots) and `j < 27`, the six slots `j + 27 i`.
 #[inline(always)]
 unsafe fn pass_b<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(S);
@@ -288,7 +238,6 @@ unsafe fn pass_b<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
         let base = 162 * n;
         for j in 0..27 {
             let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, base + j + 27 * i));
-            // level 2 multiplies v[3..6]
             reduce_inputs(&mut v, s.before[2], s.cheap, &[0, 1, 2], k);
             for i in 0..3 {
                 let b1 = mulc::<0, 1>(v[i + 3], t1, k);
@@ -306,7 +255,6 @@ unsafe fn pass_b<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
-/// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`.
 #[inline(always)]
 unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(S);
@@ -337,8 +285,6 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
-/// `acc[2 s..2 s + 2] -= a_s * y` for the six slots `s = base..base + 6`, `a_s` in lanes 0..6
-/// of `av`.
 #[inline(always)]
 unsafe fn mac6(acc: &mut [int32x4_t], base: usize, y: &[int16x8_t; 6], av: int16x8_t) {
     macro_rules! slot {
@@ -357,8 +303,6 @@ unsafe fn mac6(acc: &mut [int32x4_t], base: usize, y: &[int16x8_t; 6], av: int16
     slot!(5);
 }
 
-/// Level 6 per two level-5 nodes (six slots); its outputs, within [`super::transform_bound`],
-/// are either multiplied into `acc` by the matrix row (`MAC`) or stored.
 #[inline(always)]
 unsafe fn pass_d<const S: usize, const MAC: bool>(
     x: &mut [int16x8_t; N],
@@ -388,8 +332,6 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     }
 }
 
-/// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
-/// [`super::transform_bound`].
 #[inline(never)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub unsafe fn transform<const P: usize>(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N]) {
@@ -400,8 +342,6 @@ pub unsafe fn transform<const P: usize>(m: &[int16x8_t; BITS], x: &mut [int16x8_
     pass_d::<P, false>(x, kern, &[], &mut []);
 }
 
-/// Levels 0 and 1 of a general transform: Barrett products, every value reduced in between
-/// (see [`super::general_transform_bound`]).
 #[inline(always)]
 unsafe fn pass_a_general(x: &mut [int16x8_t; N], kern: &Kernel) {
     let g = vld1q_s16(kern.g.as_ptr());
@@ -420,11 +360,7 @@ unsafe fn pass_a_general(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
-/// The transform of eight matrix elements at once (lanes), centered residues in, values
-/// congruent to the transform out (within [`super::general_transform_bound`]).
 pub fn transform_general(prime: usize, x: &mut [[i16; 8]; N]) {
-    // SAFETY: `[[i16; 8]; N]` and `[int16x8_t; N]` have the same size and every bit pattern is
-    // valid for both; `int16x8_t` needs 16-byte alignment, so the lanes are copied.
     unsafe {
         let mut v: [int16x8_t; N] = core::array::from_fn(|j| vld1q_s16(x[j].as_ptr()));
         let kern = &kernels()[prime];
@@ -438,7 +374,6 @@ pub fn transform_general(prime: usize, x: &mut [[i16; 8]; N]) {
     }
 }
 
-/// `acc` reduced to `|acc| <= p` lane by lane: `acc - round(acc v / 2^31) p`, `v = round(2^31 / p)`.
 #[inline(always)]
 unsafe fn reduce_sums(acc: &mut [int32x4_t], p: i32, v: i32) {
     for a in acc.iter_mut() {
@@ -447,8 +382,6 @@ unsafe fn reduce_sums(acc: &mut [int32x4_t], p: i32, v: i32) {
     }
 }
 
-/// One prime's slot sums for a batch: `acc[2 s + h]` lane `l` is column `4 h + l`'s sum at slot
-/// `s`, reduced to `|sum| <= p`.
 #[inline(never)]
 unsafe fn sums<const P: usize>(
     words: &[(*const u8, usize); LANES],
@@ -476,10 +409,8 @@ unsafe fn sums<const P: usize>(
     reduce_sums(acc, p, kern.v32);
 }
 
-/// Zeros standing in for the missing columns of a partial batch.
 static ZERO_WORDS: [u128; 4] = [0; 4];
 
-/// The commitment of every column of `values` (columns of `4 a.elements` words).
 pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
@@ -493,7 +424,6 @@ pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
         for (b, target) in block.chunks_mut(LANES * N).enumerate() {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
-            // (first word of the column, bytes per element); missing columns read zeros
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
@@ -508,7 +438,6 @@ pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
                 sums::<1>(&words, a, &mut m, &mut x, a1);
                 sums::<2>(&words, a, &mut m, &mut x, a2);
             }
-            // lanes back to columns: reduce to [0, p), invert, recombine
             let lanes: Vec<[i32; 4]> =
                 acc.iter().map(|&v| unsafe { core::mem::transmute::<int32x4_t, [i32; 4]>(v) }).collect();
             for (c, column) in target.chunks_exact_mut(N).enumerate() {
@@ -543,7 +472,6 @@ mod tests {
         })
     }
 
-    /// The Barrett reduction, over every `i16`: congruent, and within [`reduced_bound`].
     #[test]
     fn reduction_is_exact_and_bounded() {
         for (i, kern) in kernels().iter().enumerate() {
@@ -561,8 +489,6 @@ mod tests {
         }
     }
 
-    /// The cheap reduction, over every `i16`, for the primes whose schedule uses it: congruent,
-    /// and within [`super::super::cheap_bound`] of `|a|`.
     #[test]
     fn cheap_reduction_is_exact_and_bounded() {
         for (i, kern) in kernels().iter().enumerate() {
@@ -582,8 +508,6 @@ mod tests {
         }
     }
 
-    /// Every twiddle's Barrett product, over every `i16`: congruent to `a w` and within
-    /// [`product_bound`] of `|a|`.
     #[test]
     fn twiddle_products_are_exact_and_bounded() {
         for (i, kern) in kernels().iter().enumerate() {
@@ -609,13 +533,10 @@ mod tests {
         }
     }
 
-    /// The vector transform of eight binary elements agrees lane by lane with the scalar
-    /// transform of `-s`.
     #[test]
     fn transform_matches_scalar() {
         let mut state = 7u64;
         for case in 0..12 {
-            // eight columns' words for one element: random, all ones, zero, single bits
             let words: [[u128; 4]; 8] = core::array::from_fn(|c| {
                 core::array::from_fn(|k| match (case, c) {
                     (0, _) => u128::MAX,

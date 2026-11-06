@@ -1,20 +1,11 @@
-//! The ARM track's prover: the CLI, transcript and proof format of the x86 track's `labinius-fast`,
-//! computed without AVX-512.
 //!
-//! The default commitment modulus is `Q = 3889 * 9721 * 17497` ([`ntt::MODULUS`]). Every factor is
-//! `1 mod 1944`, so the commitment `C_j = A W_j` is computed per prime through number-theoretic
-//! transforms of `R_648` and recombined by the Chinese remainder theorem ([`ntt`]). Any other
-//! modulus the checker accepts takes the earlier paths: below [`FAST_MODULUS`] a binary witness
-//! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
-//! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
-//! product. The field switch, row evaluation, and fold follow the checker's reference prover.
-mod hugealloc;
+mod huge;
 mod ntt;
-
-#[global_allocator]
-static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
 #[allow(dead_code)]
 mod rq;
+
+#[global_allocator]
+static ALLOCATOR: huge::HugePages = huge::HugePages;
 
 use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
@@ -36,7 +27,6 @@ const COLUMN_LEN: usize = 1 << ROW_LOG;
 const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 const LIMIT: u64 = 64 * 1024 * 1024;
 const MIN_MODULUS: u128 = 34_816_965_049;
-/// The default commitment modulus: the product of the three transform primes.
 const MODULUS: u128 = ntt::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
@@ -51,14 +41,9 @@ const RAW: usize = (GROUPS - 1) * GROUP + ROW;
 /// Largest modulus [`commit`]'s `u64` accumulator holds: a raw coefficient sums at most
 /// `WITNESS_COEFFICIENTS * RING_ELEMENTS = 2^21` residues below `Q`.
 const FAST_MODULUS: u128 = 1 << 43;
-/// Raw coefficients [`commit`] sums in registers per pass over a column's groups.
 const BLOCK: usize = 32;
-/// A table row stored between a block of zeros on either side, so that every block-sized
-/// window a group can reach reads in bounds, zeros outside the row.
 const PADDED: usize = BLOCK + ROW + BLOCK;
-/// Output blocks per column, covering the raw product.
 const BLOCKS: usize = RAW.div_ceil(BLOCK);
-/// How many blocks ahead [`add_block`] prefetches each group's table window; 0 disables it.
 const PREFETCH_BLOCKS: usize = 1;
 
 #[derive(Serialize)]
@@ -105,9 +90,6 @@ fn threads() -> usize {
     labinius::par::threads()
 }
 
-/// The witness table, read by the workers in contiguous slices straight into the words it is
-/// used as (little-endian `u128`, the file's encoding), so the pages are filled in parallel and
-/// the bytes are copied once.
 fn read_table(path: &str) -> Vec<B128> {
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(path).expect("read witness table");
@@ -120,7 +102,6 @@ fn read_table(path: &str) -> Vec<B128> {
         for (i, chunk) in words.chunks_mut(per).enumerate() {
             let file = &file;
             scope.spawn(move || {
-                // SAFETY: the bytes of initialized `u128`s; every pattern is a valid `u128`.
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(chunk.as_mut_ptr() as *mut u8, 16 * chunk.len())
                 };
@@ -134,7 +115,6 @@ fn read_table(path: &str) -> Vec<B128> {
         *w = u128::from_le(*w);
     }
     let mut words = std::mem::ManuallyDrop::new(words);
-    // SAFETY: `B128` is `repr(transparent)` over `u128`: same size, alignment and validity.
     unsafe { Vec::from_raw_parts(words.as_mut_ptr() as *mut B128, words.len(), words.capacity()) }
 }
 
@@ -150,9 +130,6 @@ fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
 
 /// The table of group `pattern`s for ring element `element` of `A`: row `s` is the sum of
 /// `A_m X^r` over the set bits `r` of `s`. Each row is a previous row plus one shifted copy.
-/// Row `s` occupies `table[s * PADDED..][..PADDED]` with its `ROW` coefficients from `BLOCK`.
-/// The table starts zeroed and only the coefficients are written, so row 0 and the padding
-/// stay zero; each row is written in one pass from the previous one.
 fn build_table(table: &mut [u64], element: &[u64]) {
     for s in 1usize..1 << GROUP {
         let r = s.ilog2() as usize;
@@ -167,8 +144,6 @@ fn build_table(table: &mut [u64], element: &[u64]) {
     }
 }
 
-/// The groups whose shifted rows reach output block `b`: group `g` adds row coefficient `i - 8g`
-/// to output coefficient `i`, nonzero for `0 <= i - 8g < ROW`.
 const fn group_range(b: usize) -> (usize, usize) {
     let first = b * BLOCK;
     let lo = if first + 1 > ROW { (first + 1 - ROW).div_ceil(GROUP) } else { 0 };
@@ -176,9 +151,6 @@ const fn group_range(b: usize) -> (usize, usize) {
     (lo, if hi < GROUPS - 1 { hi } else { GROUPS - 1 })
 }
 
-/// `acc += sum_g table[start_g + first..][..BLOCK]` for output block `b` of one column, with
-/// `start_g` the padded row of group `g`'s pattern moved back by its shift `8g`; the block's
-/// sums stay in registers across the groups.
 #[inline(always)]
 fn add_block(acc: &mut [u64], table: &[u64], starts: &[usize; GROUPS], b: usize) {
     let (lo, hi) = group_range(b);
@@ -192,7 +164,6 @@ fn add_block(acc: &mut [u64], table: &[u64], starts: &[usize; GROUPS], b: usize)
         for &start in &starts[lo..=hi] {
             let at = start.wrapping_add(first);
             if PREFETCH_BLOCKS > 0 {
-                // The same row's window `PREFETCH_BLOCKS` blocks on; a hint, never a fault.
                 let ahead = table.as_ptr().wrapping_add(at + PREFETCH_BLOCKS * BLOCK);
                 for line in 0..BLOCK / 8 {
                     core::arch::asm!(
@@ -261,11 +232,6 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 
 /// Every column's commitment, flattened. Columns go out over the cores; each worker walks the
 /// ring elements once, building that element's table and applying it to all of its columns.
-/// Per column the raw product is summed block by block: each `BLOCK` of output coefficients
-/// takes the slices of every group's table row that land on it while the block's sums stay in
-/// registers, so the accumulator is read and written once per block instead of once per group.
-///
-/// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
@@ -417,10 +383,6 @@ fn fold_element(values: &[B128], challenges: &[ShortChallenge], m: usize) -> Rin
     element
 }
 
-/// [`fold_element`] in narrow lanes: a raw coefficient gains at most one `+-1` per challenge
-/// term, so `sum_j weight_j <= i16::MAX` bounds every `i16` sum, and the latest columns are
-/// summed in `i8` lanes, sixteen to a vector, until their terms could reach `i8::MAX`. A column's
-/// bits become `0 / -1` byte masks in coefficient order; the ring reduction runs in `i32`.
 fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize) -> RingElement648 {
     let mut raw = [0i16; 2 * rq::N];
     let mut near = [0i8; 2 * rq::N];
@@ -465,7 +427,6 @@ fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize)
     element
 }
 
-/// `raw += near`, then `near = 0`.
 #[inline(always)]
 fn flush(raw: &mut [i16; 2 * rq::N], near: &mut [i8; 2 * rq::N]) {
     for (r, n) in raw.iter_mut().zip(near.iter_mut()) {
@@ -474,7 +435,6 @@ fn flush(raw: &mut [i16; 2 * rq::N], near: &mut [i8; 2 * rq::N]) {
     }
 }
 
-/// `mask[4p + k] = -1` where bit `p` of `words[k]` is set, else `0`: witness coefficient order.
 #[inline(always)]
 fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
     assert_eq!(words.len(), 4);
@@ -484,8 +444,6 @@ fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
         let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
         let bits = vld1q_u8(bits.as_ptr());
         let w: [uint8x16_t; 4] = core::array::from_fn(|k| vld1q_u8(words.as_ptr().add(k) as *const u8));
-        // Chunk c holds bits 16c..16c+16 of each word: bytes 2c and 2c+1, each spread over
-        // eight lanes and tested bit by bit, then interleaved word by word.
         for c in 0..8u8 {
             let idx = vcombine_u8(vdup_n_u8(2 * c), vdup_n_u8(2 * c + 1));
             let v = uint8x16x4_t(
@@ -539,9 +497,6 @@ fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
 }
 
 impl Proof {
-    /// The proof's bincode encoding under [`codec`]'s options (fixed-width little-endian
-    /// integers, `u64` sequence lengths, arrays without one), written field by field with
-    /// whole-slice copies; serde would hand bincode the byte vectors one `u8` at a time.
     fn encode(&self) -> Vec<u8> {
         let size = 4
             + 16
@@ -681,7 +636,6 @@ mod tests {
             .collect()
     }
 
-    /// The direct encoding is byte for byte bincode's under the proof codec.
     #[test]
     fn encoding_matches_bincode() {
         use bincode::Options;
@@ -709,8 +663,6 @@ mod tests {
         }
     }
 
-    /// The narrow fold agrees with the `i32` fold, on dense random columns and on all-ones
-    /// columns (every coefficient takes every term).
     #[test]
     fn narrow_fold_matches_wide() {
         let mut t = Transcript::new(b"labinius-fast/test");
@@ -737,8 +689,6 @@ mod tests {
         }
     }
 
-    /// The table lookup agrees with the checker's coefficient-by-coefficient commitment, at the
-    /// earlier default modulus, which the four-Russians path still serves.
     #[test]
     fn grouped_commit_matches_reference() {
         let modulus = 40_772_829_184;
@@ -768,9 +718,6 @@ mod tests {
         assert!(fast[2 * rq::N..].iter().all(|&x| x == 0));
     }
 
-    /// Columns of `elements` ring elements for the transform tests: dense random columns and the
-    /// edge cases (all zero, all ones, single bits at coefficients 0 and 511 of the first and the
-    /// last element), `count` columns in all, so the last batch of eight is partial.
     fn edge_columns(elements: usize, count: usize) -> Vec<B128> {
         let len = 4 * elements;
         let mut out = Vec::with_capacity(count * len);
@@ -779,9 +726,7 @@ mod tests {
             match j % 8 {
                 1 => col.fill(B128(u128::MAX)),
                 2 => {}
-                // coefficient 0 of the first element: bit 0 of word 0
                 3 => col[0] = B128(1),
-                // coefficient 511 = 4 * 127 + 3 of the last element: bit 127 of word 3
                 4 => col[len - 1] = B128(1 << 127),
                 5 => {
                     col[3] = B128(1 << 127);
@@ -799,8 +744,6 @@ mod tests {
         out
     }
 
-    /// The transform commitment agrees with the checker's schoolbook commitment at full size, on
-    /// one, three and eight workers, through the matrix transformed on as many.
     #[test]
     fn ntt_commit_matches_reference() {
         let values = edge_columns(RING_ELEMENTS, 11);
@@ -817,9 +760,6 @@ mod tests {
         }
     }
 
-    /// The matrix built element by element and transformed eight at a time is the scalar
-    /// transform of `rq::ajtai_matrix`, for element counts around the vector width and on one,
-    /// three and eight workers.
     #[test]
     fn fused_matrix_matches_scalar_transform() {
         for elements in [1usize, 7, 8, 9, 23, 64] {
@@ -834,7 +774,6 @@ mod tests {
         assert!(full.data == want.data);
     }
 
-    /// The same on short columns, many cases, column counts around the batch width.
     #[test]
     fn ntt_commit_matches_reference_short_columns() {
         for (elements, count) in [(1usize, 1usize), (3, 8), (5, 9), (7, 17), (2, 23)] {

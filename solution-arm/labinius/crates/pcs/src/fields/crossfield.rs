@@ -84,15 +84,9 @@ pub fn eq_expand_b128(r: &[B128]) -> Vec<B128> {
     t
 }
 
-/// Leading variables [`eq_expand_b128_into`] expands on one thread before it splits the table.
 const EXPAND_TOP: usize = 8;
 
 /// The expansion in place, doubling from the back so no entry is read after it is written.
-///
-/// After the first [`EXPAND_TOP`] rounds, every later round maps entry `i` to entries `2i` and
-/// `2i + 1` only, so each of the `2^EXPAND_TOP` entries grows its own contiguous block of the
-/// final table. The blocks are expanded on the workers with the same per-entry operations as
-/// the single-threaded doubling, so the table is identical.
 pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
     assert_eq!(t.len(), 1 << r.len());
     let parts = par::workers(t.len(), 1 << 16);
@@ -121,7 +115,6 @@ pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
     });
 }
 
-/// The doubling of [`eq_expand_b128_into`] from a root value `start`.
 fn expand_from(r: &[B128], t: &mut [B128], start: B128) {
     assert_eq!(t.len(), 1 << r.len());
     t[0] = start;
@@ -179,8 +172,6 @@ unsafe fn xor3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
 
 const TILE: usize = 64;
 
-/// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product. The tiles are
-/// split over the workers and the per-worker sums added (XOR), then the last partial tile.
 fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     assert_eq!(pi0.len(), eq_hi.len());
     let n = pi0.len();
@@ -205,7 +196,6 @@ fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     v
 }
 
-/// [`partial_evals`] over whole tiles, natively on AArch64.
 #[cfg(target_arch = "aarch64")]
 fn tile_sums(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     super::neon::partial_evals_rows(pi0, eq_hi)
@@ -216,9 +206,6 @@ fn tile_sums(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     partial_evals_tiles(pi0, eq_hi)
 }
 
-/// The sums of [`partial_evals`] over whole tiles: per tile the bit-transposed bytes of `pi0`
-/// are the matrices, those of `eq_hi` the vectors, and `acc[h][kb].qword[i].byte[t].bit[k']`
-/// sums `V[8kb + 7 - k'][8(8h + i) + t]`.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn partial_evals_tiles(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     assert_eq!(pi0.len(), eq_hi.len());
@@ -375,7 +362,6 @@ fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumchec
     });
 }
 
-/// [`poly_from_eq`] on one block: whole tiles through the byte planes, the rest through [`psi`].
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn poly_from_eq_block(
     eqs: &[&[B128]],
@@ -767,8 +753,6 @@ mod tests {
         assert_eq!((v1, m1, f1), (v2, m2, f2));
     }
 
-    /// The worker split of every switch pass, on sizes large enough for several workers and
-    /// with partial tiles: the parallel results against single-threaded references.
     #[test]
     fn parallel_passes_match_the_references() {
         let mut x = 0x0F1E_2D3C_4B5A_6978_8796_A5B4_C3D2_E1F0u128;
@@ -778,14 +762,12 @@ mod tests {
             x ^= x << 17;
             x.wrapping_mul(0x2545F4914F6CDD1D_9E3779B97F4A7C15) ^ (x >> 64)
         };
-        // eq expansion: subtrees on the workers against the plain doubling.
         let r: Vec<B128> = (0..18).map(|_| B128(next())).collect();
         let mut par_t = vec![B128::ZERO; 1 << 18];
         eq_expand_b128_into(&r, &mut par_t);
         let mut seq_t = vec![B128::ZERO; 1 << 18];
         expand_from(&r, &mut seq_t, B128::ONE);
         assert!(par_t == seq_t, "eq expansion");
-        // partial evaluations: workers + tail against the emulated tiles and the bitwise sum.
         let n = 3 * (1 << 14) + 13;
         let pi0: Vec<B128> = (0..n).map(|_| B128(next())).collect();
         let eq: Vec<B128> = (0..n).map(|_| B128(next())).collect();
@@ -801,7 +783,6 @@ mod tests {
         }
         assert_eq!(got, emu, "partial evaluations vs emulated");
         assert_eq!(got, reference(&pi0, &eq), "partial evaluations vs bitwise");
-        // the sumcheck's polynomials.
         let n = (1 << 17) + 13;
         let batch: Vec<F162> = (0..PACK)
             .map(|_| F162([next() as u64, next() as u64, (next() as u64) & M34_TEST]))

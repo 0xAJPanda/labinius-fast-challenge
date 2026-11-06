@@ -1,15 +1,6 @@
-//! The worker count and a scoped parallel loop for the prover's data-parallel passes.
-//!
-//! Every pass splits its index range into contiguous blocks, one per worker, on boundaries the
-//! kernel asks for; workers never share an output element, and passes that reduce (XOR sums over
-//! GF(2)) combine their per-worker partial sums afterwards, so the result does not depend on the
-//! worker count.
 
 use std::sync::OnceLock;
 
-/// Worker threads: `LABINIUS_THREADS` when it holds a positive integer, otherwise the available
-/// parallelism. The variable is a development knob for matching the scored machine's CPU count
-/// on a larger host; the scoring sandbox starts the prover with a cleared environment.
 pub fn threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
@@ -21,7 +12,6 @@ pub fn threads() -> usize {
     })
 }
 
-/// `[start, end)` of block `t` of `parts` over `n` items, block edges on multiples of `align`.
 #[inline]
 pub fn block(n: usize, parts: usize, t: usize, align: usize) -> (usize, usize) {
     let units = n / align;
@@ -31,7 +21,6 @@ pub fn block(n: usize, parts: usize, t: usize, align: usize) -> (usize, usize) {
     (lo * align, end)
 }
 
-/// `s` cut into the disjoint, ascending `[start, end)` ranges of `edges`.
 pub fn split_mut<'a, T>(s: &'a mut [T], edges: &[(usize, usize)]) -> Vec<&'a mut [T]> {
     let mut out = Vec::with_capacity(edges.len());
     let mut rest = s;
@@ -46,14 +35,11 @@ pub fn split_mut<'a, T>(s: &'a mut [T], edges: &[(usize, usize)]) -> Vec<&'a mut
     out
 }
 
-/// Workers for `n` items when a block below `min` items is not worth a thread.
 #[inline]
 pub fn workers(n: usize, min: usize) -> usize {
     (n / min.max(1)).clamp(1, threads())
 }
 
-/// Runs `f(t, start, end)` for every block of [`block`] on its own scoped thread (the calling
-/// thread takes the last block) and returns the per-block results in block order.
 pub fn map_blocks<R: Send>(
     n: usize,
     parts: usize,

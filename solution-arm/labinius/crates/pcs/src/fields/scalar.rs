@@ -3,7 +3,6 @@ use std::ops::{Add, AddAssign, Mul};
 
 const GHASH_MOD: u128 = (1 << 7) | (1 << 2) | (1 << 1) | 1;
 
-/// Transparent over its `u128`, so a table of words can be viewed as a table of `B128`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(transparent)]
 pub struct B128(pub u128);
