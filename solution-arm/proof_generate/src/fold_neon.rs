@@ -30,6 +30,7 @@ const PLANES: usize = 11;
 /// ([`Scratch`]), the sign in bit 31.
 pub struct Buckets {
     columns: usize,
+    lens: Vec<usize>,
     entries: Vec<u32>,
     starts: Vec<usize>,
     bias: Vec<i16>,
@@ -58,13 +59,20 @@ impl Buckets {
         let mut entries = Vec::new();
         let mut starts = vec![0];
         let mut bias = Vec::with_capacity(POSITIONS);
+        let mut lens = Vec::with_capacity(POSITIONS);
+        // Lists are padded to whole steps of sixteen with the zero word each plane keeps past
+        // its last column, so the counter never tests for a short step.
+        let zero = (challenges.len() * 16) as u32;
         for l in &lists {
             bias.push(l.iter().filter(|&&e| e >> 31 != 0).count() as i16);
+            lens.push(l.len());
             entries.extend_from_slice(l);
+            entries.resize(entries.len() + l.len().next_multiple_of(16) - l.len(), zero);
             starts.push(entries.len());
         }
         Some(Buckets {
             columns: challenges.len(),
+            lens,
             entries,
             starts,
             bias,
@@ -108,15 +116,10 @@ unsafe fn count<const L: usize, const P: usize, const H: usize>(
     let (mut o, mut t2, mut f4, mut e8) = (z, z, z, z);
     let mut high = [z; H];
     let n = list.len();
+    debug_assert!(n % 16 == 0);
     let mut i = 0;
     while i < n {
-        let ld = |k: usize| {
-            if i + k < n {
-                words(&bases, *list.get_unchecked(i + k))
-            } else {
-                z
-            }
-        };
+        let ld = |k: usize| words(&bases, *list.get_unchecked(i + k));
         let (ta, no) = csa(o, ld(0), ld(1));
         let (tb, no) = csa(no, ld(2), ld(3));
         let (fa, nt) = csa(t2, ta, tb);
@@ -270,7 +273,7 @@ pub const BLOCK: usize = 8;
 
 impl Scratch {
     pub fn new(buckets: &Buckets) -> Self {
-        Scratch(vec![0u128; BLOCK * 4 * buckets.columns])
+        Scratch(vec![0u128; BLOCK * 4 * (buckets.columns + 1)])
     }
 }
 
@@ -300,21 +303,22 @@ pub fn fold_elements(
     let count = out.len();
     assert!(count <= BLOCK && m0 + count <= RING_ELEMENTS);
     assert!(values.len() >= columns * COLUMN_LEN);
-    assert_eq!(scratch.0.len(), BLOCK * 4 * columns);
+    let stride = columns + 1;
+    assert_eq!(scratch.0.len(), BLOCK * 4 * stride);
     for j in 0..columns {
         let w = &values[j * COLUMN_LEN + 4 * m0..][..4 * count];
         for (i, x) in w.iter().enumerate() {
-            scratch.0[i * columns + j] = x.0;
+            scratch.0[i * stride + j] = x.0;
         }
     }
     for (e, slot) in out.iter_mut().enumerate() {
-        let plane0 = scratch.0[4 * e * columns..].as_ptr() as *const u8;
-        *slot = element(plane0, columns, buckets);
+        let plane0 = scratch.0[4 * e * stride..].as_ptr() as *const u8;
+        *slot = element(plane0, stride, buckets);
     }
 }
 
-/// One element from its four gathered word planes at `base`.
-fn element(base: *const u8, columns: usize, buckets: &Buckets) -> RingElement648 {
+/// One element from its four gathered word planes at `base`, `stride` words apart.
+fn element(base: *const u8, stride: usize, buckets: &Buckets) -> RingElement648 {
     let mut raw = [0i16; 2 * rq::N];
     unsafe {
         for pos in 0..POSITIONS {
@@ -322,10 +326,10 @@ fn element(base: *const u8, columns: usize, buckets: &Buckets) -> RingElement648
             if list.is_empty() {
                 continue;
             }
-            let plane = |k: usize| base.add(16 * k * columns);
+            let plane = |k: usize| base.add(16 * k * stride);
             let at = raw.as_mut_ptr().add(4 * pos);
             let bias = buckets.bias[pos];
-            if list.len() < 1 << 8 {
+            if buckets.lens[pos] < 1 << 8 {
                 // Counts below 256: eight planes, no high byte.
                 let [a, b] = count::<2, 8, 4>([plane(0), plane(1)], list);
                 let [c, d] = count::<2, 8, 4>([plane(2), plane(3)], list);

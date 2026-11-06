@@ -29,7 +29,7 @@ use crate::par;
 const PACK: usize = 1 << LOG_PACK;
 
 /// Block coordinates handled by the partial sets: `2^LEAN_K` blocks.
-pub const LEAN_K: usize = 4;
+pub const LEAN_K: usize = 6;
 
 /// Rows of `rest` per worker task of the partial-set pass.
 const SET_CHUNK: usize = 1 << 12;
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn lean_switch_matches_switch_prover() {
-        for (l, k) in [(10, 0), (10, 1), (10, 4), (11, 3), (13, 4), (16, 4), (17, 4), (17, 5), (18, 4)] {
+        for (l, k) in [(10, 0), (10, 1), (10, 4), (11, 3), (13, 4), (13, 6), (16, 4), (17, 4), (17, 5), (18, 6), (12, 12)] {
             check(l, k, 0x1234_5678_9ABC_DEF0 + (l * 31 + k) as u128);
         }
     }

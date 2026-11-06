@@ -7,7 +7,7 @@ pub const MODULUS: u128 = PRODUCT as u128 * 1024;
 pub const CHUNK: usize = 256;
 const _: () = assert!(MODULUS >= 34_816_965_049 && MODULUS < (1u128 << 96));
 
-pub struct Matrix { pub elements: usize, pub data: Vec<i16> }
+pub struct Matrix { pub elements: usize, pub data: std::borrow::Cow<'static, [i16]> }
 impl Matrix {
     pub fn row(&self, e: usize, p: usize, tail: usize) -> &[i16] {
         &self.data[(4*e+2*p+tail)*ROW..][..ROW]
@@ -99,7 +99,24 @@ pub fn matrix(elements: usize, workers: usize) -> Matrix {
             certificate(&raw);
         }
     });
-    Matrix {elements,data}
+    Matrix {elements,data:data.into()}
+}
+
+/// The build script's image of [`matrix`]`(RING_ELEMENTS)` (`build.rs`), 64-byte aligned.
+#[repr(C, align(64))]
+struct Aligned<T: ?Sized>(T);
+static IMAGE: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-key.bin")));
+
+/// The default matrix read in place from the embedded image, if it has the default shape.
+pub fn embedded(elements: usize) -> Option<Matrix> {
+    let bytes = &IMAGE.0;
+    if !cfg!(target_endian = "little") || bytes.len() != 2 * 4 * elements * ROW {
+        return None;
+    }
+    // SAFETY: the image is 64-byte aligned, `2 * len` bytes long, lives for the program, and
+    // every bit pattern is an `i16`; its little-endian words are the matrix entries.
+    let data = unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const i16, bytes.len() / 2) };
+    Some(Matrix { elements, data: std::borrow::Cow::Borrowed(data) })
 }
 
 #[inline]
@@ -143,6 +160,13 @@ mod tests {
     #[test] fn default_chunks_are_certified() {
         let a = matrix(crate::RING_ELEMENTS, 8);
         assert_eq!(a.elements, crate::RING_ELEMENTS);
+    }
+    /// The embedded image is the run-time matrix, entry for entry.
+    #[test] fn embedded_matrix_is_the_runtime_matrix() {
+        let e = embedded(crate::RING_ELEMENTS).expect("the image has the default shape");
+        let a = matrix(crate::RING_ELEMENTS, 8);
+        assert!(e.data == a.data);
+        assert!(embedded(crate::RING_ELEMENTS - 1).is_none());
     }
     #[test] fn crt_boundaries() {
         assert_eq!(3889*3242%9721,1); assert_eq!(PRODUCT*153%1024,1);

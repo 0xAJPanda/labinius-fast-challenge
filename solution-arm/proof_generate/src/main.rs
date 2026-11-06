@@ -272,7 +272,9 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     if modulus == hybrid::MODULUS {
-        return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
+        let a = hybrid::embedded(RING_ELEMENTS)
+            .unwrap_or_else(|| hybrid::matrix(RING_ELEMENTS, threads()));
+        return hybrid::commit(values, &a, threads());
     }
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
