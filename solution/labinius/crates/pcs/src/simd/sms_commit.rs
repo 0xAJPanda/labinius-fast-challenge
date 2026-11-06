@@ -752,9 +752,8 @@ enum RowsOut<'a> {
 
 /// Commits a group of up to 16 columns across all `np` pair batches and writes its `2 g` rows to
 /// `dst`. `sync(b_done)` is called at every [`PP`] boundary so hyperthread siblings can share the
-/// key stream in L2.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
+unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) -> bool {
     let g = cols.len();
     assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
     let hl = np / 2;
@@ -836,12 +835,16 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         }
     }
     match out {
-        RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
+        RowsOut::Full => {
+            write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full);
+            true
+        }
         RowsOut::Half(state) => {
             let mut done = state.lock().unwrap();
             let mode = if *done == 0 { RowsMode::First } else { RowsMode::Second };
             write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, mode);
             *done += 1;
+            *done as usize == HALVES
         }
     }
 }
@@ -899,7 +902,7 @@ pub fn worker_report(workers: usize) -> String {
 /// of the two claims units on its own, so a slowed CPU does less of the work instead of holding
 /// up the commitment's end. The two parts of a column group may run on different workers; the
 /// second to finish writes its rows.
-fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize) {
+fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize, complete: &(dyn Fn(usize, &[[u32; N]]) + Sync)) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let g = 16usize;
     let pairs = workers / 2;
@@ -945,7 +948,7 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
             let ws = ws.get_or_insert_with(SmsWorker::new);
             ran += 1;
             let (from, base) = (range.start, progressed);
-            unsafe {
+            let finished = unsafe {
                 let out = if HALVES == 1 { RowsOut::Full } else { RowsOut::Half(&locks[gi]) };
                 group(&columns[lo..lo + n], keys, np, range.clone(), out, ws, (dst as *mut [u32; N]).add(2 * lo), |b_done| {
                     let d = base + (b_done - from);
@@ -972,6 +975,9 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                     }
                 })
             };
+            if finished {
+                complete(lo, unsafe { core::slice::from_raw_parts((dst as *const [u32; N]).add(2 * lo), 2 * n) });
+            }
             progressed += range.len();
             mine.store(progressed, Ordering::Release);
         }
@@ -986,6 +992,10 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
 /// The commitment's rows: `rows[2c]` is column `c` modulo 9721 in the NTT domain (canonical),
 /// `rows[2c + 1]` its coefficients modulo TAIL_MODULUS.
 pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) -> Vec<[u32; N]> {
+    commit_columns_rows_then(keys, columns, workers, &|_, _| {})
+}
+
+pub fn commit_columns_rows_then(keys: &SmsKeys, columns: &[&[B128]], workers: usize, complete: &(dyn Fn(usize, &[[u32; N]]) + Sync)) -> Vec<[u32; N]> {
     assert!((DIGITS/2*chunk_count(keys.elements))as i64*HIGH_UPDATE_BOUND<HIGH_LIMIT,"split-total bound");
     assert!(!columns.is_empty(), "at least one witness column");
     let len = columns[0].len();
@@ -1002,7 +1012,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
     let dst = rows.as_mut_ptr() as usize;
     let paired = if workers >= 2 && workers % 2 == 0 && groups > 1 { crate::par::CorePlacement::for_sibling_pairs(workers) } else { None };
     if let Some(placement) = paired {
-        commit_paired(keys, columns, np, workers, Some(&placement), dst);
+        commit_paired(keys, columns, np, workers, Some(&placement), dst, complete);
     } else {
         let workers = workers.clamp(1, groups);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1018,7 +1028,10 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
                 let c0 = gi * g;
                 let gc = g.min(columns.len() - c0);
                 let ws = ws.get_or_insert_with(SmsWorker::new);
-                unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}) };
+                let finished = unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}) };
+                if finished {
+                    complete(c0, unsafe { core::slice::from_raw_parts((dst as *const [u32; N]).add(2 * c0), 2 * gc) });
+                }
             }
         });
     }

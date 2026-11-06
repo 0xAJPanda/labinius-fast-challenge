@@ -1028,60 +1028,32 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     }
 }
 
-/// The single-transform commitment's columns as coefficients modulo the selected integer modulus: `rows[2c]` is
-/// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo TAIL_MODULUS. The
-/// first goes through the inverse transform 32 columns at a time; each coefficient is then
-/// `t + M*((r-t)*M^-1 mod9721)`, packed into its 5 wire bytes.
-fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffer: Option<Vec<u8>>) -> Vec<u8> {
+fn sms_wire_columns(rows: &[[u32; N]], dst: &mut [u8]) {
     use labinius::simd::commit::sms;
-    assert_eq!(rows.len(), 2 * columns);
-    let width = rq::coefficient_bytes(sms::MODULUS);
-    assert_eq!(width, 5);
-    let mut out = match buffer {
-        Some(b) if b.len() == columns * N * width => b,
-        _ => vec![0u8; columns * N * width],
-    };
-    let blocks = columns.div_ceil(32);
-    let runs = labinius::par::ranges(blocks, workers, 1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let out_addr = out.as_mut_ptr() as usize;
-    let placement = labinius::par::CorePlacement::for_logical(runs.len());
-    let p = sms::P as u64;
-    let inv = sms::inv_tail();
-    labinius::par::pool().run(runs.len(), |r| {
-        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
-        let mut residues = vec![0i16; 32 * N];
-        loop {
-            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if blk >= blocks {
-                break;
-            }
-            let c0 = blk * 32;
-            let cols = (columns - c0).min(32);
-            let refs: [&[u32; N]; 32] = core::array::from_fn(|c| &rows[2 * (c0 + c.min(cols - 1))]);
-            labinius::bd::coefficients_from_rows(sms::P, &refs[..cols], &mut residues[..cols * N]);
-            // Block `blk` owns these disjoint, fixed-width wire coefficients.
-            let dst = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width) };
-            if lift_hybrid_wide_available() {
-                for c in 0..cols {
-                    // Column `c` owns its `5 N` bytes of `dst`.
-                    unsafe { lift_sms_column(&residues[c * N..(c + 1) * N], &rows[2 * (c0 + c) + 1], &mut dst[5 * c * N..5 * (c + 1) * N]) };
-                }
-            } else {
-                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
-                    let r = (residues[i] as i64).rem_euclid(p as i64) as u64;
-                    let t = rows[2 * (c0 + i / N) + 1][i % N] as u64;
-                    let k = ((r + p - t % p) * inv) % p;
-                    let value = t + k*sms::TAIL_MODULUS as u64;
-                    word.copy_from_slice(&value.to_le_bytes()[..5]);
-                }
-            }
+    let cols = rows.len() / 2;
+    assert!(rows.len() == 2 * cols && (1..=32).contains(&cols) && dst.len() == cols * N * 5);
+    assert_eq!(rq::coefficient_bytes(sms::MODULUS), 5);
+    let refs: [&[u32; N]; 32] = core::array::from_fn(|c| &rows[2 * c.min(cols - 1)]);
+    let mut residues = vec![0i16; 32 * N];
+    labinius::bd::coefficients_from_rows(sms::P, &refs, &mut residues);
+    if lift_hybrid_wide_available() {
+        for c in 0..cols {
+            // Column `c` owns its `5 N` bytes of `dst`.
+            unsafe { lift_sms_column(&residues[c * N..(c + 1) * N], &rows[2 * c + 1], &mut dst[5 * c * N..5 * (c + 1) * N]) };
         }
-    });
-    out
+    } else {
+        let p = sms::P as u64;
+        let inv = sms::inv_tail();
+        for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+            let r = (residues[i] as i64).rem_euclid(p as i64) as u64;
+            let t = rows[2 * (i / N) + 1][i % N] as u64;
+            let k = ((r + p - t % p) * inv) % p;
+            let value = t + k*sms::TAIL_MODULUS as u64;
+            word.copy_from_slice(&value.to_le_bytes()[..5]);
+        }
+    }
 }
 
-/// [`commitment_bytes_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
 /// `r` brought into `[0, 9721)`, `d = r - t mod 9721` in `[0, 9721)` (the `t mod 9721` and the
 /// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 9721^2`
 /// as in [`lift_hybrid_column`]), `value=t+M*(d*M^-1 mod9721)`, packed into 5-byte words.
@@ -1569,6 +1541,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let sms_built;
+    let mut sms_commitment: Option<Vec<u8>> = None;
     let rows = if modulus == modulus_choice::SMS_MODULUS {
         let keys = match sms_keys {
             Some(k) => k,
@@ -1577,7 +1550,16 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
                 sms_built.keys()
             }
         };
-        labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+        let bytes = COLUMNS * N * 5;
+        let out = sms_commitment.insert(match output.and_then(|o| o.commitment_buffer()) {
+            Some(b) if b.len() == bytes => b,
+            _ => vec![0u8; bytes],
+        });
+        let out_addr = out.as_mut_ptr() as usize;
+        labinius::simd::commit::sms::commit_columns_rows_then(&keys, &columns, workers, &|c0, rows| {
+            let dst = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * 5), rows.len() / 2 * N * 5) };
+            sms_wire_columns(rows, dst);
+        })
     } else if let Some(pairs) = pairs {
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
     } else if let Some(keys) = arranged {
@@ -1711,11 +1693,9 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             );
         }
     }
-    let buffer = output.and_then(|o| o.commitment_buffer());
-    let commitment = if modulus == modulus_choice::SMS_MODULUS {
-        commitment_bytes_sms(&rows, COLUMNS, workers, buffer)
-    } else {
-        commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer)
+    let commitment = match sms_commitment {
+        Some(bytes) => bytes,
+        None => commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, output.and_then(|o| o.commitment_buffer())),
     };
     let recombine_time = clock.elapsed();
     // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
