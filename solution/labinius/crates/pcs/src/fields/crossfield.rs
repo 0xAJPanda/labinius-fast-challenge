@@ -1285,6 +1285,9 @@ unsafe fn partials_row(
     ];
     let xs = scratch.xs.as_mut_ptr();
     for g in 0..groups {
+        let p = words.add(8 * g) as *const i8;
+        _mm_prefetch::<_MM_HINT_T0>(p);
+        _mm_prefetch::<_MM_HINT_T0>(p.add(64));
         *xs.add(g) = slice_group(eq.add(8 * g), &idx, ident);
     }
     let aps = scratch.aps.as_mut_ptr();
