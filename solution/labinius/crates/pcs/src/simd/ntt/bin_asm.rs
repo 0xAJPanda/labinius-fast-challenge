@@ -1347,7 +1347,7 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
     let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
     let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
     let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
+    let buf = |j: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * j + h))) };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
     for k in 0..4 {
@@ -1400,7 +1400,7 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let os = buf(kk);
+            let os = buf(j);
             let (t4, t5, t6) = if Q == 9721 {
                 (SMS_TWIDDLES.t4.as_ptr().add(4 * kk).cast::<u32>(),
                  SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
@@ -1417,7 +1417,7 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
         }
         for j in 0..6 {
             let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, ro(buf(j)), 0, 27);
         }
     }
 }
