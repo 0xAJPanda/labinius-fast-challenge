@@ -534,7 +534,7 @@ pub fn matrix(elements: usize, workers: usize) -> Matrix {
 
 /// The transform of the first `count` lanes of `x` (centered residues) modulo prime `i`, into
 /// values congruent to the transform.
-pub(crate) fn transform_lanes(i: usize, x: &mut [[i16; 8]; N], count: usize) {
+fn transform_lanes(i: usize, x: &mut [[i16; 8]; N], count: usize) {
     #[cfg(target_arch = "aarch64")]
     {
         let _ = count;
