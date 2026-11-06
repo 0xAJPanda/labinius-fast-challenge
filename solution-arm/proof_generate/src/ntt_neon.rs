@@ -693,13 +693,13 @@ unsafe fn inverse_lanes(p:usize,x:&mut [int16x8_t;N]) {
             for j in 0..*len {
                 let a=reduce(x[base+j],k);let b=reduce(x[base+j+len],k);
                 if *r==2 {
-                    x[base+j]=mul_pair(vaddq_s16(a,b),scale[0],k);
-                    x[base+j+len]=mul_pair(vsubq_s16(a,b),scale[1],k);
+                    x[base+j]=reduce(mul_pair(reduce(vaddq_s16(a,b),k),scale[0],k),k);
+                    x[base+j+len]=reduce(mul_pair(reduce(vsubq_s16(a,b),k),scale[1],k),k);
                 } else {
                     let c=reduce(x[base+j+2*len],k);
                     let e=mul_pair(vsubq_s16(b,c),inv.eps,k);
                     let z=[vaddq_s16(a,vaddq_s16(b,c)),vaddq_s16(vsubq_s16(a,c),e),vsubq_s16(vsubq_s16(a,b),e)];
-                    for i in 0..3 {x[base+j+i*len]=mul_pair(z[i],scale[i],k);}
+                    for i in 0..3 {x[base+j+i*len]=reduce(mul_pair(reduce(z[i],k),scale[i],k),k);}
                 }
             }
         }
@@ -742,27 +742,6 @@ unsafe fn inverse_acc(p:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
     for j in 0..N {x[j]=vcombine_s16(vmovn_s32(acc[2*j]),vmovn_s32(acc[2*j+1]));}
     inverse_lanes(p,x);
 }
-const _: () = {
-    let mut i = 0;
-    while i < 2 {
-        let p = PRIMES[i];
-        let r = super::reduced_bound(p);
-        let e = super::product_bound(p, 2 * r);
-        assert!(3 * r < 32768 && 2 * r + e < 32768);
-        assert!(super::product_bound(p, 2 * r + e) < 32768);
-        i += 1;
-    }
-};
-
-#[inline(always)]
-unsafe fn center_lane(x: int16x8_t, k: int16x8_t) -> int16x8_t {
-    let r = reduce(x, k);
-    let p = vdupq_laneq_s16::<0>(k);
-    let half = vshrq_n_s16::<1>(p);
-    let r = vsubq_s16(r, vreinterpretq_s16_u16(vandq_u16(vcgtq_s16(r, half), vreinterpretq_u16_s16(p))));
-    vaddq_s16(r, vreinterpretq_s16_u16(vandq_u16(vcltq_s16(r, vnegq_s16(half)), vreinterpretq_u16_s16(p))))
-}
-
 pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec<u128> {
     let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
     let columns=values.len()/len;let mut out=vec![0u128;columns*N];
@@ -771,12 +750,9 @@ pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec
         let mut x=Box::new([vdupq_n_s16(0);N]);
         let mut y=Box::new([vdupq_n_s16(0);N]);
         let mut acc=vec![vdupq_n_s32(0);4*N];let mut tail=acc.clone();
-        let mut low=vec![vdupq_n_s16(0);N];
-        let k0=vld1q_s16(kernels()[0].k.as_ptr());
-        let k1=vld1q_s16(kernels()[1].k.as_ptr());
-        let inv=twiddle(9721,3242);
+        let mut low=vec![[0i64;8];N];
         for (batch,target) in block.chunks_mut(8*N).enumerate() {
-            acc.fill(vdupq_n_s32(0));low.fill(vdupq_n_s16(0));let here=target.len()/N;
+            acc.fill(vdupq_n_s32(0));low.fill([0;8]);let here=target.len()/N;
             let words=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
             let (a0,a1)=acc.split_at_mut(2*N);let (t0,t1)=tail.split_at_mut(2*N);
             for start in (0..a.elements).step_by(crate::hybrid::CHUNK) {
@@ -785,17 +761,85 @@ pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec
                 hybrid_chunk::<1>(&words,a,start,end,&mut m,&mut x,a1,t1);
                 inverse_acc(0,t0,&mut x);inverse_acc(1,t1,&mut y);
                 for j in 0..N {
-                    let u=center_lane(x[j],k0);let v=center_lane(y[j],k1);
-                    let t=center_lane(mul_pair(vsubq_s16(v,u),inv,k1),k1);
-                    low[j]=vaddq_s16(low[j],vaddq_s16(u,vmulq_n_s16(t,3889)));
+                    let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
+                    for c in 0..here {
+                        let z=crate::hybrid::crt_pair((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32);
+                        let z=if z>crate::hybrid::PRODUCT/2 {z-crate::hybrid::PRODUCT} else {z};
+                        low[j][c]=(low[j][c]+z)&1023;
+                    }
                 }
             }
             inverse_acc(0,a0,&mut x);inverse_acc(1,a1,&mut y);
             for j in 0..N {
                 let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
-                let t:[u16;8]=core::mem::transmute(low[j]);
-                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,t[c] as i64);}
+                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,low[j][c]);}
             }
         }
     });out
 }
+
+/// Consume eight completed transforms per accumulator load/store.
+/// This retains the sums while eight ring elements share a public-key vector.
+#[inline(never)]
+unsafe fn sms_tile(chunk:&crate::sms::Chunk,batch:usize,x:&[[int16x8_t;N]],acc:&mut [int32x4_t]) {
+    const S:usize=crate::sms::STREAMS;
+    for j in 0..N {for stream in 0..S {
+        let av=vld1q_s16(chunk.key(batch,j,stream).as_ptr());
+        let at=2*(j*S+stream);
+        let mut lo=acc[at];let mut hi=acc[at+1];
+        macro_rules! term {($e:literal)=>{{
+            let y=x[$e][j];
+            lo=vmlsl_laneq_s16::<$e>(lo,vget_low_s16(y),av);
+            hi=vmlsl_high_laneq_s16::<$e>(hi,y,av);
+        }}}
+        term!(0);term!(1);term!(2);term!(3);term!(4);term!(5);term!(6);term!(7);
+        acc[at]=lo;acc[at+1]=hi;
+    }}
+}
+unsafe fn sms_inverse(stream:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
+    for j in 0..N {let at=2*(j*crate::sms::STREAMS+stream);x[j]=vcombine_s16(vmovn_s32(acc[at]),vmovn_s32(acc[at+1]));}
+    inverse_lanes(1,x);
+}
+pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128> {
+    use crate::sms::{CHUNK,DIGITS,STREAMS,TAIL,P};
+    let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
+    let columns=values.len()/len;let mut out=vec![0u128;columns*N];
+    for_blocks(&mut out,N,8,workers,|first,block|unsafe {
+        let zero=vdupq_n_s16(0);let z32=vdupq_n_s64(0);
+        let mut m=Box::new([zero;BITS]);let mut x=vec![[zero;N];8];
+        let mut inv=Box::new([zero;N]);let mut acc=vec![z32;STREAMS*4*N];let mut low=vec![[0i64;8];N];
+        for (batch,target) in block.chunks_mut(8*N).enumerate() {
+            acc.fill(z32);low.fill([0;8]);let here=target.len()/N;
+            let words:[(*const u8,usize);8]=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
+            for (ci,chunk) in a.chunks.iter().enumerate() {
+                for j in 0..N {for s in 1..STREAMS {let at=4*(j*STREAMS+s);acc[at..at+4].fill(z32);}}
+                for base in (0..chunk.elements).step_by(8) {
+                    let count=(chunk.elements-base).min(8);
+                    for e in 0..count {
+                        let at=core::array::from_fn(|c|words[c].0.add((ci*CHUNK+base+e)*words[c].1));
+                        masks(&at,&mut m);transform::<1>(&m,&mut x[e]);
+                    }
+                    // Missing key lanes are zero; clear transform lanes as well for diagnostics.
+                    for e in count..8 {x[e].fill(zero);}
+                    sms_dot::tile(chunk,base/8,&x,&mut acc);
+                }
+                for d in 0..DIGITS {
+                    sms_dot::inverse(d+1,&acc,&mut inv);
+                    for j in 0..N {
+                        let residues:[i16;8]=core::mem::transmute(inv[j]);let mean=chunk.means[d*N+j] as i64;
+                        for c in 0..here {
+                            let delta=(residues[c] as i64-mean+P/2).rem_euclid(P)-P/2;
+                            low[j][c]=(low[j][c]+((mean+delta)<<(4*d)))&(TAIL-1);
+                        }
+                    }
+                }
+            }
+            sms_dot::inverse(0,&acc,&mut inv);
+            for j in 0..N {let r:[i16;8]=core::mem::transmute(inv[j]);for c in 0..here {
+                target[c*N+j]=crate::sms::combine((r[c] as i64).rem_euclid(P),low[j][c]);
+            }}
+        }
+    });out
+}
+#[path="sms_dot.rs"]
+mod sms_dot;

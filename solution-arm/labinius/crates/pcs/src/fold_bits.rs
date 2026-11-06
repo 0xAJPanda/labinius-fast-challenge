@@ -604,17 +604,9 @@ impl Terms {
 
 /// For every column and row, the terms that reach the row: `t` in `lo .. hi` has
 /// `0 <= e - p_t < 128`. Positions are sorted, so the terms form a run.
-struct Schedule {
-    offsets: [usize; ROWS + 1],
-    negatives: [u32; ROWS],
-    planes: Vec<u16>,
-}
-
 pub struct Reach {
     columns: usize,
-    #[cfg(test)]
     lo_hi: Vec<[u8; 2]>,
-    schedules: Vec<Schedule>,
 }
 
 impl Reach {
@@ -634,7 +626,10 @@ impl Reach {
                 lo_hi[j * ROWS + e] = [lo.min(hi) as u8, hi as u8];
             }
         }
-        Self::with_rows(challenges, lo_hi)
+        Reach {
+            columns: challenges.len(),
+            lo_hi,
+        }
     }
 
     /// The same table term by term, the oracle of the tests.
@@ -655,42 +650,11 @@ impl Reach {
                 lo_hi[j * ROWS + e] = [lo.min(hi) as u8, hi as u8];
             }
         }
-        Self::with_rows(challenges, lo_hi)
-    }
-    fn with_rows(challenges: &[Challenge], lo_hi: Vec<[u8; 2]>) -> Self {
-        const _: () = assert!(BATCH * 2 * WORD_BITS <= u16::MAX as usize);
-        let terms: Vec<_> = challenges.iter().map(Terms::of).collect();
-        let schedules = challenges.chunks(BATCH).enumerate().map(|(g, cs)| {
-            let mut schedule = Schedule {
-                offsets: [0; ROWS + 1],
-                negatives: [0; ROWS],
-                planes: Vec::with_capacity(cs.iter().map(|c| c.weight).sum::<usize>() * WORD_BITS),
-            };
-            for e in 0..ROWS {
-                for i in 0..cs.len() {
-                    let j = g * BATCH + i;
-                    let t = &terms[j];
-                    let [lo, hi] = lo_hi[j * ROWS + e];
-                    for k in lo as usize..hi as usize {
-                        let plane = i * 2 * WORD_BITS + t.negative[k] as usize * WORD_BITS
-                            + e - t.position[k] as usize;
-                        schedule.planes.push(plane as u16);
-                        schedule.negatives[e] += t.negative[k] as u32;
-                    }
-                }
-                schedule.offsets[e + 1] = schedule.planes.len();
-            }
-            schedule
-        }).collect();
-        Self {
+        Reach {
             columns: challenges.len(),
-            #[cfg(test)]
             lo_hi,
-            schedules,
         }
     }
-
-    #[cfg(test)]
     #[inline(always)]
     fn of_row(&self, j: usize, e: usize) -> (usize, usize) {
         let r = self.lo_hi[j * ROWS + e];
@@ -746,9 +710,17 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
     assert_eq!(challenges.len(), columns, "one challenge per column");
     assert_eq!(reach.columns, columns, "the reach is of these challenges");
     assert_eq!(out.len(), BLOCK_ELEMENTS, "one block of elements");
+    let terms: Vec<Terms> = challenges.iter().map(Terms::of).collect();
     let mut counters = Counters::new();
     let mut negatives = vec![0u32; ROWS];
+    // Each column's planes and their complements, so a negative term reads `!b` straight from
+    // memory; `base[i][t]` is the address of term `t`'s plane for row 0, and row `e` reads it
+    // `e` planes further on (`e - p_t` is the plane index).
     let mut planes: Vec<[L; 2 * WORD_BITS]> = (0..BATCH).map(|_| [L::zero(); 2 * WORD_BITS]).collect();
+    let mut base = [[core::ptr::null::<L>(); 32]; BATCH];
+    let mut negs = [0u32; BATCH];
+    let mut list = [core::ptr::null::<L>(); 2 * BATCH * 32];
+    let zero = L::zero();
     let zeros = [L::zero(); 16];
     for batch_start in (0..columns).step_by(BATCH) {
         let batch = BATCH.min(columns - batch_start);
@@ -761,33 +733,55 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
             for q in 0..WORD_BITS {
                 complement[q] = direct[q].xor(L::ones());
             }
+            let t = &terms[column];
+            let first = plane.as_ptr();
+            for k in 0..32 {
+                // Plane `e - p` of the direct or complemented set: `first + (neg ? 128 : 0) - p`,
+                // then `+ e` per row. Positions are below 162 < 2^8; the pointer may point below
+                // the array for rows the term does not reach, and is never dereferenced there.
+                let offset = t.negative[k] as usize * WORD_BITS;
+                base[i][k] = first.wrapping_add(offset).wrapping_sub(t.position[k] as usize);
+            }
+            negs[i] = (0..32).map(|k| t.negative[k] as u32).sum::<u32>();
+            let _ = negs;
         }
-        let schedule = &reach.schedules[batch_start / BATCH];
-        let flat = planes.as_ptr() as *const L;
         for e in 0..ROWS {
-            let list = &schedule.planes[schedule.offsets[e]..schedule.offsets[e + 1]];
-            let n = list.len();
+            // The planes reaching row `e`, listed.
+            let mut n = 0usize;
+            let mut negative = 0u32;
+            for i in 0..batch {
+                let j = batch_start + i;
+                let (lo, hi) = reach.of_row(j, e);
+                let t = &terms[j];
+                let b = &base[i];
+                for k in lo..hi {
+                    *list.get_unchecked_mut(n) = b.get_unchecked(k).wrapping_add(e);
+                    negative += *t.negative.get_unchecked(k) as u32;
+                    n += 1;
+                }
+            }
             let mut hs = Hs::<L>::new();
             let mut pending = Pending::<L>::new();
             let mut at = 0usize;
             while at + 16 <= n {
-                let x: [L; 16] = core::array::from_fn(|i| *flat.add(*list.get_unchecked(at + i) as usize));
+                let x: [L; 16] = core::array::from_fn(|i| **list.get_unchecked(at + i));
                 pending.push(hs.add16(&x), 4);
                 at += 16;
             }
             if at < n {
                 let mut x = zeros;
                 for i in at..n {
-                    x[i - at] = *flat.add(*list.get_unchecked(i) as usize);
+                    x[i - at] = **list.get_unchecked(i);
                 }
                 pending.push(hs.add16(&x), 4);
             }
+            let _ = zero;
             pending.push(hs.ones, 0);
             pending.push(hs.twos, 1);
             pending.push(hs.fours, 2);
             pending.push(hs.eights, 3);
             pending.flush_into(counters.row(e));
-            negatives[e] += schedule.negatives[e];
+            negatives[e] += negative;
         }
     }
     // The raw rows as integers, then the verifier's reduction, then the elements.

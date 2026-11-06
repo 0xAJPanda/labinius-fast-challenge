@@ -11,6 +11,7 @@
 mod hugealloc;
 mod ntt;
 mod hybrid;
+mod sms;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -19,6 +20,7 @@ mod rq;
 
 use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
+use labinius::fields::lean::LeanSwitch;
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
@@ -38,7 +40,7 @@ const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 const LIMIT: u64 = 64 * 1024 * 1024;
 const MIN_MODULUS: u128 = 34_816_965_049;
 /// The default commitment modulus: the product of the three transform primes.
-const MODULUS: u128 = hybrid::MODULUS;
+const MODULUS: u128 = sms::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
 const GROUP: usize = 8;
@@ -268,20 +270,11 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
+    if modulus == sms::MODULUS {
+        return sms::commit(values, &sms::matrix(RING_ELEMENTS, threads()), threads());
+    }
     if modulus == hybrid::MODULUS {
-        const BYTES: usize = 4 * RING_ELEMENTS * ntt::ROW * 2;
-        #[repr(C, align(64))]
-        struct Aligned([u8; BYTES]);
-        static IMAGE: Aligned = Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-matrix.bin")));
-        #[cfg(target_endian = "little")]
-        let data = unsafe {
-            std::slice::from_raw_parts(IMAGE.0.as_ptr().cast::<i16>(), BYTES / 2)
-        }.to_vec();
-        #[cfg(target_endian = "big")]
-        let data = IMAGE.0.chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]])).collect::<Vec<_>>();
-        let matrix = hybrid::Matrix { elements: RING_ELEMENTS, data };
-        return hybrid::commit(values, &matrix, threads());
+        return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
     }
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
@@ -661,38 +654,23 @@ impl Proof {
     }
 }
 
-fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
-    #[cfg(target_arch = "aarch64")]
-    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
-        let partials = prepared.partials();
-        let value = partials.iter().zip(cf::eq_expand_b128(lo))
-            .fold(B128::ZERO, |a, (&v, e)| a + v * e);
-        t.absorb_b128(&[value]);
-        t.absorb_b128(&partials);
-        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
-        let mut rounds = Vec::with_capacity(LOG_PACKED);
-        let mut coords = Vec::with_capacity(LOG_PACKED);
-        for _ in 0..LOG_PACKED {
-            let msg = switch.msg();
-            t.absorb_f162(&msg);
-            let r = t.sample_f162(b"switch-round", 1)[0];
-            rounds.push(msg.map(|v| v.0));
-            coords.push(r);
-            switch.fold(r);
-        }
-        return (partials, rounds, coords, switch.final_eval());
-    }
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, hi);
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
+    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+    timer.lap("commit");
+    let mut t = transcript(seed, modulus, &commitment);
+    let lo = t.sample_b128(b"r-lo", 7);
+    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
+    let (mut switch, partials) = LeanSwitch::partials(values, &hi);
+    timer.lap("sw_partials");
     let value = partials
         .iter()
-        .zip(cf::eq_expand_b128(lo))
+        .zip(cf::eq_expand_b128(&lo))
         .fold(B128::ZERO, |a, (&v, e)| a + v * e);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+    switch.start(&batch);
+    timer.lap("sw_setup");
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
@@ -704,16 +682,6 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
         switch.fold(r);
     }
     let opened = switch.final_eval();
-    (partials, rounds, coords, opened)
-}
-
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
-    timer.lap("commit");
-    let mut t = transcript(seed, modulus, &commitment);
-    let lo = t.sample_b128(b"r-lo", 7);
-    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);
@@ -764,6 +732,7 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
+    timer.lap("drop");
     let bytes = proof.encode();
     std::fs::write(&args[2], bytes).expect("write proof");
     timer.lap("write");
@@ -906,14 +875,6 @@ mod tests {
             out.extend(col);
         }
         out
-    }
-
-    #[test]
-    fn embedded_hybrid_commit_matches_reference() {
-        let values = edge_columns(RING_ELEMENTS, 11);
-        let matrix = rq::ajtai_matrix(hybrid::MODULUS, RING_ELEMENTS);
-        let want = commit_reference(&values, &matrix, hybrid::MODULUS);
-        assert_eq!(commit(&values, hybrid::MODULUS), want);
     }
 
     /// The transform commitment agrees with the checker's schoolbook commitment at full size, on

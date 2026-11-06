@@ -4,7 +4,7 @@ use crate::ntt::{self, N, ROW, for_blocks, centered, primes};
 use labinius::fields::scalar::B128;
 pub const PRODUCT: i64 = 3889 * 9721;
 pub const MODULUS: u128 = PRODUCT as u128 * 1024;
-pub const CHUNK: usize = 224;
+pub const CHUNK: usize = 192;
 const _: () = assert!(MODULUS >= 34_816_965_049 && MODULUS < (1u128 << 96));
 
 pub struct Matrix { pub elements: usize, pub data: Vec<i16> }
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(certificate(&[a]),pos.into_iter().chain(neg).max().unwrap());
     }
     #[test] fn commitment_matches_schoolbook() {
-        for elements in [1,3,225] {
+        for elements in [1,3,193] {
             let a=matrix(elements,2);
             let mut s=19u64;
             let values:Vec<B128>=(0..4*elements*9).map(|_| {
