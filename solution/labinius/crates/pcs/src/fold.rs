@@ -1339,6 +1339,7 @@ pub fn fold_report(workers: usize) -> String {
     format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
 }
 
+///
 pub fn fold_witness_bitsliced(
     words: &[B128],
     columns: usize,
@@ -1346,13 +1347,15 @@ pub fn fold_witness_bitsliced(
     bpc: usize,
     q: u16,
     workers: usize,
-) -> Vec<RingElement> {
+    wire: Option<usize>,
+) -> (Vec<RingElement>, bool) {
     assert_eq!(challenges.len(), columns, "one challenge per column");
     assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
     if bpc % 4 != 0 || !bitsliced::fits(challenges) {
-        return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
+        return (fold_witness_streaming(words, columns, challenges, bpc, q, workers), false);
     }
-    bitsliced::fold_words(words, challenges, 128 * bpc, workers)
+    let out = bitsliced::fold_words_wire(words, challenges, 128 * bpc, workers, wire.unwrap_or(0));
+    (out, wire.is_some())
 }
 
 // Exact fold of the binary witness, independent of commitment-modulus arithmetic.
@@ -1370,7 +1373,7 @@ mod bitsliced {
     //! per full adder); the carry into bit six ripples through the remaining nine bits once per
     //! 64 inputs. The 15-bit counter cannot overflow when the total challenge weight plus the
     //! padding ([`fits`]) is at most 32767.
-    use super::{B128, Representation, RingElement, ShortChallenge};
+    use super::{B128, N, Representation, RingElement, ShortChallenge};
     use crate::fields::bitmat;
     use crate::simd::transpose_f162::transpose8x8_q;
     use core::arch::x86_64::*;
@@ -2199,6 +2202,25 @@ mod bitsliced {
         assert!(overflow == 0, "integer fold overflow");
     }
 
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+    unsafe fn write_wire(output: *const RingElement, wire: usize, block: usize) {
+        const _: () = assert!(N % 8 == 0 && N % 16 == 8);
+        if wire == 0 {
+            return;
+        }
+        let first = block * (LANES / 4);
+        for e in 0..LANES / 4 {
+            let src = core::ptr::addr_of!((*output.add(e)).v) as *const i16;
+            let dst = (wire as *mut u8).add(4 * N * (first + e));
+            for j in 0..N / 16 {
+                let s = _mm256_loadu_si256(src.add(16 * j) as *const __m256i);
+                _mm512_storeu_si512(dst.add(64 * j) as *mut __m512i, _mm512_cvtepi16_epi32(s));
+            }
+            let tail = _mm_loadu_si128(src.add(N & !15) as *const __m128i);
+            _mm256_storeu_si256(dst.add(4 * (N & !15)) as *mut __m256i, _mm256_cvtepi16_epi32(tail));
+        }
+    }
+
     /// Allocate capacity for `SLOTS` counts; `unslice` initializes every lane before `set_len`.
     #[inline]
     fn uninit_counts() -> Vec<[i16; LANES]> {
@@ -2219,6 +2241,7 @@ mod bitsliced {
         free: &std::sync::Mutex<Vec<Vec<[i16; LANES]>>>,
         next: &std::sync::atomic::AtomicUsize,
         out_addr: usize,
+        wire: usize,
         #[cfg(test)] profile: bool,
     ) -> u32 {
         let mut ran = 0u32;
@@ -2284,6 +2307,7 @@ mod bitsliced {
             if FUSED {
                 let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
                 write_acc(acc.as_ptr(), bias, output);
+                write_wire(output, wire, block);
                 #[cfg(test)]
                 if let Some(start) = start { times[2] += start.elapsed(); }
                 continue;
@@ -2295,6 +2319,7 @@ mod bitsliced {
             let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
             if parts == 1 {
                 write_counts(&counts, None, bias, output);
+                write_wire(output, wire, block);
                 #[cfg(test)]
                 if let Some(start) = start { times[2] += start.elapsed(); }
                 continue;
@@ -2313,6 +2338,7 @@ mod bitsliced {
                 }
             };
             write_counts(&counts, Some(&first), bias, output);
+            write_wire(output, wire, block);
             free.lock().unwrap().push(first);
             #[cfg(test)]
             if let Some(start) = start { times[2] += start.elapsed(); }
@@ -2325,13 +2351,24 @@ mod bitsliced {
         ran
     }
 
+    #[cfg(test)]
     pub(super) fn fold_words(
         words: &[B128],
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
+        fold_words_wire(words, challenges, column_words, workers, 0)
+    }
+
+    pub(super) fn fold_words_wire(
+        words: &[B128],
+        challenges: &[ShortChallenge],
+        column_words: usize,
+        workers: usize,
+        wire: usize,
+    ) -> Vec<RingElement> {
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers, wire)
     }
 
     fn fold_config<const GROUP: usize, const FUSED: bool>(
@@ -2339,6 +2376,7 @@ mod bitsliced {
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        wire: usize,
     ) -> Vec<RingElement> {
         assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
         #[cfg(test)]
@@ -2385,6 +2423,7 @@ mod bitsliced {
                 free,
                 next,
                 out_addr,
+                wire,
                 #[cfg(test)]
                 profile,
             );
@@ -2676,8 +2715,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers, 0),
+                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers, 0),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());
