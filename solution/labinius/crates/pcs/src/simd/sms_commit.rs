@@ -903,7 +903,13 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let g = 16usize;
     let pairs = workers / 2;
-    let groups = columns.len().div_ceil(g);
+    let cut = columns.len().saturating_sub(pairs * g);
+    let spans: Vec<(usize, usize)> = (0..cut)
+        .step_by(g)
+        .map(|lo| (lo, g.min(cut - lo)))
+        .chain((cut..columns.len()).step_by(g / 2).map(|lo| (lo, (g / 2).min(columns.len() - lo))))
+        .collect();
+    let groups = spans.len();
     let units = groups * HALVES;
     let locks: Vec<std::sync::Mutex<u8>> = (0..groups).map(|_| std::sync::Mutex::new(0)).collect();
     let next = AtomicUsize::new(0);
@@ -940,8 +946,7 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
             let Some(u) = unit else { break };
             let (part, gi) = (u / groups, u % groups);
             let range = part * np / HALVES..(part + 1) * np / HALVES;
-            let lo = gi * g;
-            let n = g.min(columns.len() - lo);
+            let (lo, n) = spans[gi];
             let ws = ws.get_or_insert_with(SmsWorker::new);
             ran += 1;
             let (from, base) = (range.start, progressed);
