@@ -448,16 +448,14 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
             });
-            let lanes: Vec<[i32; 4]> =
-                acc.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
+            // The base row shares the same bounded slot representation as the
+            // digit rows. Invert all columns together before extracting lanes.
+            narrow(&acc, 0, &mut y);
+            super::inverse::<PB>(&mut y);
+            let base: Vec<[i16; LANES]> =
+                y.iter().map(|&v| core::mem::transmute::<int16x8_t, [i16; LANES]>(v)).collect();
             let devs: Vec<[i32; 4]> = dev.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let plan = &primes()[PB];
             for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                let mut residues = [0u32; N];
-                for (slot, value) in residues.iter_mut().enumerate() {
-                    *value = lanes[idx(slot, 0) + c / 4][c % 4].rem_euclid(P1 as i32) as u32;
-                }
-                plan.inverse(&mut residues);
                 let mut tail: Vec<i64> = a.mu.iter().map(|&v| v as i64).collect();
                 let mut e = [0i64; N];
                 for d in 0..DIGITS {
@@ -467,7 +465,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     add_weighted(&mut tail, d, &e);
                 }
                 for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(residues[k], tail[k].rem_euclid(TAIL as i64) as u32);
+                    let r = base[k][c] as i32;
+                    let residue = if r < 0 { r + P1 as i32 } else { r };
+                    *o = crt(residue as u32, tail[k].rem_euclid(TAIL as i64) as u32);
                 }
             }
         }
