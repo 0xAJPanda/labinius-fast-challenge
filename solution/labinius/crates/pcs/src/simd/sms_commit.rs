@@ -425,7 +425,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 7;
+const PREFETCH_SLOTS: usize = 5;
 
 /// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
 /// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
