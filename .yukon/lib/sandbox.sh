@@ -5,6 +5,57 @@ if [[ -n "${LABINIUS_SANDBOX_SH_LOADED:-}" ]]; then
 fi
 readonly LABINIUS_SANDBOX_SH_LOADED=1
 
+# Keep legacy no-flag commands on x86, regardless of the host architecture.
+# ARM must be selected explicitly so an existing x86 checkout never changes tracks silently.
+labinius_parse_track_args() {
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --track)
+        if [[ "$#" -lt 2 ]]; then
+          echo "--track needs a value: x86 or arm" >&2
+          return 1
+        fi
+        LABINIUS_TRACK=$2
+        shift 2
+        ;;
+      *)
+        echo "unknown argument: $1 (expected --track x86|arm)" >&2
+        return 1
+        ;;
+    esac
+  done
+  export LABINIUS_TRACK
+}
+
+labinius_track() {
+  case "${LABINIUS_TRACK:-x86}" in
+    x86 | x86_64) echo x86 ;;
+    arm | aarch64 | arm64) echo arm ;;
+    *)
+      echo "unsupported solution track: ${LABINIUS_TRACK}" >&2
+      return 1
+      ;;
+  esac
+}
+
+labinius_solution_path() {
+  local track
+  track=$(labinius_track) || return 1
+  case "$track" in
+    x86) echo solution ;;
+    arm) echo solution-arm ;;
+  esac
+}
+
+labinius_score_file() {
+  local track
+  track=$(labinius_track) || return 1
+  case "$track" in
+    x86) echo labinius-fast-score.json ;;
+    arm) echo labinius-fast-arm-score.json ;;
+  esac
+}
+
 require_host_command() {
   local path=$1
   if [[ ! -x "$path" ]]; then
@@ -96,6 +147,8 @@ run_contestant_build() {
   local cargo_home=$3
   local network_mode=$4
   shift 4
+  # Both tracks are staged separately at this fixed sandbox path.
+  local prover_dir=/workspace/solution/proof_generate
 
   require_runner_temp_path "$solution_root"
   require_runner_temp_path "$target_dir"
@@ -144,13 +197,14 @@ run_contestant_build() {
     --setenv HOME /tmp
     --setenv RUSTUP_HOME /opt/rustup
     --setenv CARGO_HOME /cargo-home
-    --setenv CARGO_TARGET_DIR /workspace/solution/proof_generate/target
+    --setenv CARGO_TARGET_DIR "$prover_dir/target"
     --setenv CC /usr/bin/gcc-13
     --setenv CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER /usr/bin/gcc-13
+    --setenv CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER /usr/bin/gcc-13
     --setenv RUSTFLAGS "-C target-cpu=native"
     --setenv SSL_CERT_FILE /etc/ssl/certs/ca-certificates.crt
     --setenv CARGO_TERM_COLOR always
-    --chdir /workspace/solution/proof_generate
+    --chdir "$prover_dir"
   )
   system_library_binds args
   case "$network_mode" in

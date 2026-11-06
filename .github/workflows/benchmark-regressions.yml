@@ -17,6 +17,12 @@ jobs:
           persist-credentials: false
 
       # These tests exercise this checkout's timer with harmless stand-in
-      # provers. The protected benchmark job executes the master harness.
+      # provers; real benchmarks use the separately admitted track executors.
       - name: Test timing and score publication
         run: python3 -m unittest discover -s .yukon/tests -v
+
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Test workflow routing and compatibility
+        run: python3 -m unittest discover -s .github/tests -v

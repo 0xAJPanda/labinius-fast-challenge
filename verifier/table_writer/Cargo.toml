@@ -1,0 +1,20 @@
+[package]
+name = "labinius-table-writer"
+version = "0.1.0"
+edition = "2021"
+
+# Independent workspace: the witness table generator on hosts the pinned verifier does not build
+# on. It depends on BLAKE3 alone, so it builds anywhere and never links solution code.
+[workspace]
+resolver = "2"
+
+[[bin]]
+name = "labinius-table-writer"
+path = "src/main.rs"
+
+[dependencies]
+blake3 = "1.8"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
