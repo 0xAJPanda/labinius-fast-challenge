@@ -2331,7 +2331,7 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP, false>(words, challenges, column_words, workers)
     }
 
     fn fold_config<const GROUP: usize, const FUSED: bool>(
