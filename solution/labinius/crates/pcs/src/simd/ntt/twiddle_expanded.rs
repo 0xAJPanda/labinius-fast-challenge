@@ -68,6 +68,26 @@ macro_rules! level6_mem {
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
         )
     };
+    (lut $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
+        concat!(
+            "vpmullw zmm", $t, ", zmm", $a1, ", [{t6}+0", $off, "*16+64]\n",
+            "vpsrlw zmm30, zmm", $a0, ", 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
+            "vpmulhw zmm", $a1, ", zmm", $a1, ", [{t6}+0", $off, "*16+0]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a1, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpmullw zmm", $t, ", zmm", $a2, ", [{t6}+0", $off, "*16+192]\n",
+            "vpmulhw zmm", $a2, ", zmm", $a2, ", [{t6}+0", $off, "*16+128]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
+            "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
+        )
+    };
 }
 
 macro_rules! tail27_mem {
@@ -155,7 +175,7 @@ unsafe fn tail27_mem_b(
     core::arch::asm!(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
-            tail27_mem!(lut, barrett),
+            tail27_mem!(lut, lut),
         ),
         i = in(reg) bp,
         o = in(reg) op,
