@@ -37,13 +37,13 @@ pub const DIGITS: usize = 6;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 104;
+pub const CHUNK: usize = 144;
 /// Nodes of the encoder's closest-vector search: 1 is Babai's nearest plane alone, about 2000
 /// times cheaper than the x86 build's 512 for a slightly larger digit spread (rms 3.88 against
 /// 3.55). With [`CHUNK`] 64 the smallest margin is 12.16 standard deviations, and the Hoeffding
 /// union bound over every chunk, digit and coefficient of a column is 9.8e-30 (1.0e-26 per proof of
 /// 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
-const SEARCH: usize = 1;
+const SEARCH: usize = 512;
 /// The smallest admissible reconstruction margin, in standard deviations.
 pub const MIN_MARGIN: f64 = 7.5;
 /// The largest admissible failure bound of one column (`sum 2 exp(-z^2 / 2)`, Hoeffding, over
@@ -388,6 +388,77 @@ pub mod sve {
         }
     }
 
+    /// [`mac`] for transforms of `+s` in the dot-product lane order: `xs[4 h + q]`, lane `4 l + k`,
+    /// is column `2 q + l` of the group's element `4 h + k`. A 64-bit lane then holds one column's
+    /// four elements, and the halves of the key vector (elements 0..4, 4..8) are the indexed
+    /// operands of `sdot`: no packing, no duplicated or negated keys.
+    #[target_feature(enable = "sve")]
+    pub(super) unsafe fn mac_lanes(xs: &[[int16x8_t; N]; GROUP], keys: *const i16, acc: &mut [int64x2_t]) {
+        debug_assert!(acc.len() == ROWS * 4 * N);
+        let accp = acc.as_mut_ptr();
+        for j in 0..N {
+            let y: [int16x8_t; GROUP] = core::array::from_fn(|t| *xs[t].get_unchecked(j));
+            for r in 0..ROWS {
+                let k = vld1q_s16(keys.add((j * ROWS + r) * GROUP));
+                let p = accp.add(4 * (j * ROWS + r));
+                let (mut s0, mut s1, mut s2, mut s3) = (*p, *p.add(1), *p.add(2), *p.add(3));
+                core::arch::asm!(
+                    "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
+                    "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
+                    "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
+                    "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
+                    inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
+                    in("v4") y[0], in("v5") y[1], in("v6") y[2], in("v7") y[3],
+                    in("v8") y[4], in("v9") y[5], in("v10") y[6], in("v11") y[7],
+                    in("v12") k,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+                *p = s0;
+                *p.add(1) = s1;
+                *p.add(2) = s2;
+                *p.add(3) = s3;
+            }
+        }
+    }
+
+    /// [`mac_lanes`] for two key groups (`xs[..8]` with `keys0`, `xs[8..]` with `keys1`): each
+    /// sum loaded and stored once for sixteen elements.
+    #[target_feature(enable = "sve")]
+    pub(super) unsafe fn mac_lanes2(xs: &[[int16x8_t; N]; 2 * GROUP], keys0: *const i16, keys1: *const i16, acc: &mut [int64x2_t]) {
+        debug_assert!(acc.len() == ROWS * 4 * N);
+        let accp = acc.as_mut_ptr();
+        for j in 0..N {
+            let y: [int16x8_t; 2 * GROUP] = core::array::from_fn(|t| *xs[t].get_unchecked(j));
+            for r in 0..ROWS {
+                let k0 = vld1q_s16(keys0.add((j * ROWS + r) * GROUP));
+                let k1 = vld1q_s16(keys1.add((j * ROWS + r) * GROUP));
+                let p = accp.add(4 * (j * ROWS + r));
+                let (mut s0, mut s1, mut s2, mut s3) = (*p, *p.add(1), *p.add(2), *p.add(3));
+                core::arch::asm!(
+                    "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
+                    "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
+                    "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
+                    "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
+                    "sdot z0.d, z14.h, z13.h[0]", "sdot z1.d, z15.h, z13.h[0]",
+                    "sdot z2.d, z16.h, z13.h[0]", "sdot z3.d, z17.h, z13.h[0]",
+                    "sdot z0.d, z18.h, z13.h[1]", "sdot z1.d, z19.h, z13.h[1]",
+                    "sdot z2.d, z20.h, z13.h[1]", "sdot z3.d, z21.h, z13.h[1]",
+                    inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
+                    in("v4") y[0], in("v5") y[1], in("v6") y[2], in("v7") y[3],
+                    in("v8") y[4], in("v9") y[5], in("v10") y[6], in("v11") y[7],
+                    in("v14") y[8], in("v15") y[9], in("v16") y[10], in("v17") y[11],
+                    in("v18") y[12], in("v19") y[13], in("v20") y[14], in("v21") y[15],
+                    in("v12") k0, in("v13") k1,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+                *p = s0;
+                *p.add(1) = s1;
+                *p.add(2) = s2;
+                *p.add(3) = s3;
+            }
+        }
+    }
+
     /// `v mod 9721` in `[-4860, 4860]` for `|v| < 2^41`: the double-precision quotient is off by
     /// less than `1 / (2 p)`, so its rounding is the nearest integer quotient.
     #[inline(always)]
@@ -461,7 +532,7 @@ unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
     ix: &mut [uint8x16_t; 162],
-    xs: &mut [[int16x8_t; N]; GROUP],
+    xs: &mut [[int16x8_t; N]; 2 * GROUP],
     acc: &mut [int32x4_t],
     mut acc64: Option<&mut [int64x2_t]>,
     y: &mut [int16x8_t; N],
@@ -469,6 +540,7 @@ unsafe fn sums(
 ) {
     let kern = &kernels()[PB];
     let front = &fronts()[PB];
+    let front_plus = &fronts_plus()[PB];
     let s: Schedule = schedule(FRONT);
     const { assert!(GROUP <= FRONT_SCHEDULES[PB].accumulate) };
     let p = P1 as i32;
@@ -478,22 +550,48 @@ unsafe fn sums(
     }
     // elements summed since the last reduction, never above `s.accumulate`
     let mut since = 0usize;
-    for g in 0..a.elements.div_ceil(GROUP) {
+    let groups = a.elements.div_ceil(GROUP);
+    let mut g = 0;
+    while g < groups {
         let e0 = GROUP * g;
-        let here = (a.elements - e0).min(GROUP);
-        for i in 0..here {
-            let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
-            indices(&at, ix);
-            let x = &mut xs[i];
-            pass_ab::<FRONT>(ix, x, kern, front);
-            pass_c2::<FRONT>(x, kern);
-            pass_d::<FRONT, false>(x, kern, &[], &mut []);
-        }
-        // a missing element's keys are zero; its stale transform contributes nothing
+        // SVE: two key groups per pass over the sums when the chunk does not end after the first
+        let two = acc64.is_some() && g + 1 < groups && (e0 + GROUP) % CHUNK != 0;
+        let here = (a.elements - e0).min(if two { 2 * GROUP } else { GROUP });
         match acc64.as_deref_mut() {
-            Some(w) => sve::mac(xs, a.group(g), w),
-            None => mac(xs, a.group(g), acc),
+            Some(w) => {
+                // the dot-product lane order ([`sve::mac_lanes`]): transform `4 h + q`, lane
+                // `4 l + k` is column `2 q + l` of element `e0 + 4 h + k`; missing elements read
+                // zeros (their keys are zero as well)
+                for (t, x) in xs.iter_mut().enumerate().take(if two { 2 * GROUP } else { GROUP }) {
+                    let at: [*const u8; LANES] = core::array::from_fn(|lane| {
+                        let (c, e) = (2 * (t % 4) + lane / 4, e0 + 4 * (t / 4) + lane % 4);
+                        if e < a.elements { words[c].0.add(e * words[c].1) } else { ZERO_WORDS.as_ptr() as *const u8 }
+                    });
+                    indices(&at, ix);
+                    pass_ab::<FRONT>(ix, x, kern, front_plus);
+                    pass_c2::<FRONT>(x, kern);
+                    pass_d::<FRONT, false>(x, kern, &[], &mut []);
+                }
+                if two {
+                    sve::mac_lanes2(xs, a.group(g), a.group(g + 1), w);
+                } else {
+                    sve::mac_lanes((&xs[..GROUP]).try_into().unwrap(), a.group(g), w);
+                }
+            }
+            None => {
+                for i in 0..here {
+                    let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
+                    indices(&at, ix);
+                    let x = &mut xs[i];
+                    pass_ab::<FRONT>(ix, x, kern, front);
+                    pass_c2::<FRONT>(x, kern);
+                    pass_d::<FRONT, false>(x, kern, &[], &mut []);
+                }
+                // a missing element's keys are zero; its stale transform contributes nothing
+                mac((&xs[..GROUP]).try_into().unwrap(), a.group(g), acc);
+            }
         }
+        g += if two { 2 } else { 1 };
         let e = e0 + here;
         since += GROUP;
         let end = e % CHUNK == 0 || e == a.elements;
@@ -570,7 +668,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let mut ix = Box::new([vdupq_n_u8(0); 162]);
-        let mut xs = Box::new([[vdupq_n_s16(0); N]; GROUP]);
+        let mut xs = Box::new([[vdupq_n_s16(0); N]; 2 * GROUP]);
         let mut acc64 = if sve::available() { Some(vec![vdupq_n_s64(0); ROWS * 4 * N]) } else { None };
         let mut y = Box::new([vdupq_n_s16(0); N]);
         let mut acc = vec![vdupq_n_s32(0); ROWS * 2 * N];

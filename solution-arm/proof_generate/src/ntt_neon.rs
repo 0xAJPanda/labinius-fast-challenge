@@ -502,7 +502,8 @@ pub struct Front {
 }
 
 impl Front {
-    fn new(index: usize) -> Front {
+    /// The tables of `-s` (`plus`: of `+s`).
+    fn new(index: usize, plus: bool) -> Front {
         let plan = &primes()[index];
         let p = plan.p as i64;
         let root = |e: usize| plan.root(e) as i64;
@@ -516,7 +517,8 @@ impl Front {
                 // level 1: node n / 2 of exponent e split by +-zeta^(e / 2); the value of -s
                 let tau = root(plan.exps[0][n / 2] as usize / 2);
                 let [a, b] = level0[n / 2];
-                let u = (-(if n % 2 == 0 { a + tau * b } else { a - tau * b })).rem_euclid(p);
+                let v = if n % 2 == 0 { a + tau * b } else { a - tau * b };
+                let u = (if plus { v } else { -v }).rem_euclid(p);
                 // level 2: node n split by +-w, w = zeta^(e / 2): node 2n gets u + w u', 2n + 1 u - w u'
                 let w = root(plan.exps[1][n] as usize / 2);
                 for (n2, sign) in [(2 * n, 1i64), (2 * n + 1, -1)] {
@@ -535,7 +537,13 @@ impl Front {
 
 pub fn fronts() -> &'static [Front; 2] {
     static F: OnceLock<[Front; 2]> = OnceLock::new();
-    F.get_or_init(|| [Front::new(0), Front::new(1)])
+    F.get_or_init(|| [Front::new(0, false), Front::new(1, false)])
+}
+
+/// [`fronts`] for the transform of `+s`.
+pub fn fronts_plus() -> &'static [Front; 2] {
+    static F: OnceLock<[Front; 2]> = OnceLock::new();
+    F.get_or_init(|| [Front::new(0, true), Front::new(1, true)])
 }
 
 /// Byte rows of [`indices`] per word: the 16 bytes of the word and zeros up to the furthest byte
