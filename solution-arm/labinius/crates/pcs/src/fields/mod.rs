@@ -14,5 +14,7 @@ pub mod f162;
 pub mod lean;
 #[cfg(target_arch = "aarch64")]
 mod neon;
+#[cfg(target_arch = "aarch64")]
+pub mod prefix;
 pub mod scalar;
 pub mod sumcheck;

@@ -654,26 +654,61 @@ impl Proof {
     }
 }
 
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
-    timer.lap("commit");
-    let mut t = transcript(seed, modulus, &commitment);
-    let lo = t.sample_b128(b"r-lo", 7);
-    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let (mut switch, partials) = LeanSwitch::partials(values, &hi);
+/// The field switch: the 128 partials, one message per coordinate of `hi`, the coordinates and
+/// the opened value, with `t` advanced exactly as the checker replays it (claim, partials, batch,
+/// then message / coordinate per round). On AArch64 with `prefix` set, the prefix switch
+/// (`labinius::fields::prefix`, from e0a27c0e) runs unless it declines (a coordinate equal to
+/// one, no PMULL, fewer than seven coordinates); otherwise the block-set [`LeanSwitch`] of this
+/// source runs. Both compute the same field elements.
+fn switch_proof(
+    values: &[B128],
+    lo: &[B128],
+    hi: &[B128],
+    t: &mut Transcript,
+    prefix: bool,
+    timer: &mut Timer,
+) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
+    let claim = |partials: &[B128]| {
+        partials
+            .iter()
+            .zip(cf::eq_expand_b128(lo))
+            .fold(B128::ZERO, |a, (&v, e)| a + v * e)
+    };
+    #[cfg(target_arch = "aarch64")]
+    if prefix {
+        if let Some(prepared) = labinius::fields::prefix::Prepared::new(values, hi) {
+            let partials = prepared.partials();
+            timer.lap("sw_partials");
+            t.absorb_b128(&[claim(&partials)]);
+            t.absorb_b128(&partials);
+            let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+            let mut switch = labinius::fields::prefix::Switch::new(values, prepared, &batch);
+            timer.lap("sw_setup");
+            let mut rounds = Vec::with_capacity(hi.len());
+            let mut coords = Vec::with_capacity(hi.len());
+            for _ in 0..hi.len() {
+                let msg = switch.msg();
+                t.absorb_f162(&msg);
+                let r = t.sample_f162(b"switch-round", 1)[0];
+                rounds.push(msg.map(|v| v.0));
+                coords.push(r);
+                switch.fold(r);
+            }
+            return (partials, rounds, coords, switch.final_eval());
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = prefix;
+    let (mut switch, partials) = LeanSwitch::partials(values, hi);
     timer.lap("sw_partials");
-    let value = partials
-        .iter()
-        .zip(cf::eq_expand_b128(&lo))
-        .fold(B128::ZERO, |a, (&v, e)| a + v * e);
-    t.absorb_b128(&[value]);
+    t.absorb_b128(&[claim(&partials)]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
     switch.start(&batch);
     timer.lap("sw_setup");
-    let mut rounds = Vec::with_capacity(LOG_PACKED);
-    let mut coords = Vec::with_capacity(LOG_PACKED);
-    for _ in 0..LOG_PACKED {
+    let mut rounds = Vec::with_capacity(hi.len());
+    let mut coords = Vec::with_capacity(hi.len());
+    for _ in 0..hi.len() {
         let msg = switch.msg();
         t.absorb_f162(&msg);
         let r = t.sample_f162(b"switch-round", 1)[0];
@@ -681,7 +716,16 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
         coords.push(r);
         switch.fold(r);
     }
-    let opened = switch.final_eval();
+    (partials, rounds, coords, switch.final_eval())
+}
+
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
+    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+    timer.lap("commit");
+    let mut t = transcript(seed, modulus, &commitment);
+    let lo = t.sample_b128(b"r-lo", 7);
+    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
+    let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t, true, timer);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);
@@ -757,6 +801,54 @@ mod tests {
                 B128(word)
             })
             .collect()
+    }
+
+    /// The prefix switch and the block-set fallback give the same partials, messages,
+    /// coordinates and opened value and leave the transcript in the same state: on random
+    /// coordinates, with a zero coordinate (first, inside the prefix, last), and with a coordinate
+    /// equal to one, where the prefix path declines and the fallback must run instead.
+    #[test]
+    fn prefix_switch_matches_lean_fallback() {
+        let mut state = 0x0bad_5eed_1234_5678_9abc_def0_1357_9bdfu128;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let cases: [(usize, Option<(usize, B128)>); 7] = [
+            (10, None),
+            (11, None),
+            (12, Some((0, B128::ZERO))),
+            (12, Some((2, B128::ZERO))),
+            (14, Some((13, B128::ZERO))),
+            (12, Some((0, B128::ONE))),
+            (12, Some((5, B128::ONE))),
+        ];
+        for (case, &(l, special)) in cases.iter().enumerate() {
+            let values: Vec<B128> = (0..1usize << l).map(|_| B128(next())).collect();
+            let lo: Vec<B128> = (0..7).map(|_| B128(next())).collect();
+            let mut hi: Vec<B128> = (0..l).map(|_| B128(next())).collect();
+            if let Some((k, x)) = special {
+                hi[k] = x;
+            }
+            let run = |prefix: bool| {
+                let mut t = Transcript::new(b"labinius-fast/test-switch");
+                t.absorb_u64(l as u64);
+                let mut timer = Timer(std::time::Instant::now(), Vec::new());
+                let out = switch_proof(&values, &lo, &hi, &mut t, prefix, &mut timer);
+                (out, t.sample_b128(b"probe", 2))
+            };
+            let ((pa, ra, ca, oa), probe_a) = run(true);
+            let ((pb, rb, cb, ob), probe_b) = run(false);
+            assert_eq!(pa.len(), 128, "case {case}");
+            assert_eq!(ra.len(), l, "case {case}");
+            assert_eq!(pa, pb, "partials, case {case}");
+            assert_eq!(ra, rb, "messages, case {case}");
+            assert_eq!(ca, cb, "coordinates, case {case}");
+            assert_eq!(oa, ob, "opened value, case {case}");
+            assert_eq!(probe_a, probe_b, "transcript state, case {case}");
+        }
     }
 
     /// The direct encoding is byte for byte bincode's under the proof codec.

@@ -528,6 +528,119 @@ pub(super) unsafe fn lift_combine_rows(
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// the prefix switch (e0a27c0e): partial sets over one shared eq block, the linear-map message
+// and the prefix materialization; kept beside the lean switch kernels above, its fallback
+// ---------------------------------------------------------------------------------------------
+
+/// Partial sets share one equality block and its lookup tables across all word blocks.
+pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end: usize) -> Vec<Vec<B128>> {
+    let stride = eq.len();
+    assert_eq!(words.len() % stride, 0);
+    assert!(start <= end && end <= stride && start % GROUP == 0 && end % GROUP == 0);
+    let blocks = words.len() / stride;
+    unsafe {
+        let mut sums = vec![[vdupq_n_u8(0); 128]; blocks];
+        let mut tabs = vec![[vdupq_n_u8(0); 256]; PASS];
+        let mut pats = [[0u8; 128]; PASS];
+        for base in (start..end).step_by(GROUP * PASS) {
+            let count = ((end - base) / GROUP).min(PASS);
+            for x in 0..count {
+                combinations(eq.as_ptr().add(base + GROUP * x), &mut tabs[x]);
+            }
+            for (q, sum) in sums.iter_mut().enumerate() {
+                for x in 0..count {
+                    patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
+                }
+                for k in 0..128 {
+                    let mut a = sum[k];
+                    for x in 0..count {
+                        a = veorq_u8(a, tabs[x][pats[x][k] as usize]);
+                    }
+                    sum[k] = a;
+                }
+            }
+        }
+        sums.into_iter().map(|sum| {
+            let mut out = vec![B128::ZERO; 128];
+            for (q, s) in sum.into_iter().enumerate() {
+                vst1q_u8(&mut out[8 * (q % 16) + q / 16].0 as *mut u128 as *mut u8, s);
+            }
+            out
+        }).collect()
+    }
+}
+
+impl ByteTables {
+    #[inline(always)]
+    pub(super) fn apply(&self, x: B128) -> F162 {
+        unsafe {
+            let mut lo = vdupq_n_u64(0);
+            let mut top = 0u64;
+            for b in 0..16 {
+                let s = 256 * b + ((x.0 >> (8 * b)) & 255) as usize;
+                lo = veorq_u64(lo, vld1q_u64(self.lo.as_ptr().add(s) as *const u64));
+                top ^= *self.top.get_unchecked(s);
+            }
+            F162([vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<1>(lo), top])
+        }
+    }
+}
+
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start: usize, out: [&mut [u64]; 3]) {
+    let stride = words.len() / weights.len();
+    let [o0, o1, o2] = out;
+    let len = o0.len();
+    assert!(o1.len() == len && o2.len() == len && start + len <= stride && len % 2 == 0);
+    let weights: Vec<_> = weights.iter().map(|w| kara(w.0.map(|v| vdupq_n_u64(v)))).collect();
+    for i in (0..len).step_by(2) {
+        let mut acc0 = [vdupq_n_u64(0); 6];
+        let mut acc1 = acc0;
+        for (q, w) in weights.iter().enumerate() {
+            let p = vld2q_u64(words.as_ptr().add(q * stride + start + i) as *const u64);
+            let k = [p.0, p.1, vdupq_n_u64(0), x2(p.0, p.1), p.0, p.1];
+            for j in [0, 1, 3, 4, 5] {
+                acc0[j] = x2(acc0[j], pmul_lo(w[j], k[j]));
+                acc1[j] = x2(acc1[j], pmul_hi(w[j], k[j]));
+            }
+        }
+        let a = reduce(assemble(acc0.map(|v| to_u128(v))));
+        let b = reduce(assemble(acc1.map(|v| to_u128(v))));
+        for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
+            dst[i] = a.0[k];
+            dst[i + 1] = b.0[k];
+        }
+    }
+}
+
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn linear_message(eq: &[B128], lo: [&[u64]; 3], hi: [&[u64]; 3], l: &ByteTables, lp: &ByteTables) -> [F162; 2] {
+    let n = eq.len();
+    assert!(lo.iter().chain(hi.iter()).all(|s| s.len() == n));
+    let mut acc0 = [vdupq_n_u64(0); 6];
+    let mut acci = acc0;
+    for j in (0..n / 2 * 2).step_by(2) {
+        let a = [l.apply(eq[j]), l.apply(eq[j + 1])];
+        let d = [lp.apply(eq[j]), lp.apply(eq[j + 1])];
+        let pack = |a: [F162; 2]| core::array::from_fn(|k| vcombine_u64(vcreate_u64(a[0].0[k]), vcreate_u64(a[1].0[k])));
+        let (p0, p1) = (load2(lo, j), load2(hi, j));
+        mac2(&mut acc0, pack(a), p0);
+        mac2(&mut acci, pack(d), core::array::from_fn(|k| x2(p0[k], p1[k])));
+    }
+    let mut out = [reduce(assemble(acc0.map(|v| to_u128(v)))), reduce(assemble(acci.map(|v| to_u128(v))))];
+    if n % 2 != 0 {
+        let j = n - 1;
+        let p0 = F162(core::array::from_fn(|k| lo[k][j]));
+        let p1 = F162(core::array::from_fn(|k| hi[k][j]));
+        out[0] += l.apply(eq[j]) * p0;
+        out[1] += lp.apply(eq[j]) * (p0 + p1);
+    }
+    out
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
