@@ -1550,8 +1550,6 @@ unsafe fn stream_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 /// Fold outputs of at least this many elements (per plane) are written non-temporally: at
 /// 24 bytes per element this is 50 MB, past what stays in the cache between two rounds.
 const STREAM_FROM: usize = 1 << 21;
-/// Words ahead of the current tile that [`fold_message_range`] prefetches in each stream.
-const FOLD_AHEAD: usize = 128;
 
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
@@ -1935,18 +1933,6 @@ unsafe fn fold_message_range(
     let mut buf = EqTile([B128::ZERO; TILE]);
     let stream = hh >= STREAM_FROM;
     for j0 in range.step_by(TILE) {
-        // The four source rows of the next tiles, all three planes, a tile ahead of the
-        // hardware prefetcher; a prefetch past a plane's end is harmless.
-        if let Src::Planes(p) = src {
-            for k in 0..3 {
-                for o in [j0, j0 + half, j0 + hh, j0 + hh + half] {
-                    let a = p[k].wrapping_add(o + FOLD_AHEAD) as *const i8;
-                    for l in 0..(TILE * 8 / 64) {
-                        _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
-                    }
-                }
-            }
-        }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
