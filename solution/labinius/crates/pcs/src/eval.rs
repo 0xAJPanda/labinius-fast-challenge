@@ -443,7 +443,10 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     let chunks = columns.div_ceil(chunk);
     let out_addr = out.as_mut_ptr() as usize;
     let split = (wdim - wdim / TAIL_PARTS) & !7;
+    let lanes = if columns % 4 == 0 { 4 } else { 1 };
+    let stride = columns / lanes;
     for (from, n, add) in [(0, split, false), (split, wdim - split, true)] {
+        let column = |l: usize| if add { l } else { (l % stride) * lanes + (lanes - 1 - l / stride) };
         let next = std::sync::atomic::AtomicUsize::new(0);
         let put = |j: usize, v: F162| unsafe {
             let p = (out_addr as *mut F162).add(j);
@@ -454,25 +457,26 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
             if k >= chunks {
                 break;
             }
-            // Chunk `k` owns `out[k * chunk ..]`.
             let end = ((k + 1) * chunk).min(columns);
             let mut j = k * chunk;
             while j + 1 < end {
+                let (c0, c1) = (column(j), column(j + 1));
                 let [v0, v1] = unsafe {
                     dot_words2(
                         &eq,
                         from,
-                        words.as_ptr().add(j * wdim + from),
-                        words.as_ptr().add((j + 1) * wdim + from),
+                        words.as_ptr().add(c0 * wdim + from),
+                        words.as_ptr().add(c1 * wdim + from),
                         n,
                     )
                 };
-                put(j, v0);
-                put(j + 1, v1);
+                put(c0, v0);
+                put(c1, v1);
                 j += 2;
             }
             if j < end {
-                put(j, unsafe { dot_words(&eq, from, words.as_ptr().add(j * wdim + from), n) });
+                let c = column(j);
+                put(c, unsafe { dot_words(&eq, from, words.as_ptr().add(c * wdim + from), n) });
             }
         });
     }
