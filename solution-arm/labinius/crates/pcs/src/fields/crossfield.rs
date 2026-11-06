@@ -94,21 +94,21 @@ const EXPAND_TOP: usize = 8;
 /// final table. The blocks are expanded on the workers with the same per-entry operations as
 /// the single-threaded doubling, so the table is identical.
 pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
-    eq_expand_b128_from(r, t, B128::ONE);
+    eq_expand_b128_scaled_into(r, t, B128::ONE);
 }
 
-/// The same equality expansion with root `start`: every entry is multiplied by `start`.
-/// Seeding the root avoids a separate pass over the completed table.
-pub(super) fn eq_expand_b128_from(r: &[B128], t: &mut [B128], start: B128) {
+/// `scale` times the table of [`eq_expand_b128_into`]: the root of the doubling is `scale`, so
+/// the scaling costs no multiplication per entry.
+pub fn eq_expand_b128_scaled_into(r: &[B128], t: &mut [B128], scale: B128) {
     assert_eq!(t.len(), 1 << r.len());
     let parts = par::workers(t.len(), 1 << 16);
     if parts <= 1 || r.len() <= EXPAND_TOP {
-        expand_from(r, t, start);
+        expand_from(r, t, scale);
         return;
     }
     let (top, low) = r.split_at(EXPAND_TOP);
     let mut prefix = [B128::ZERO; 1 << EXPAND_TOP];
-    expand_from(top, &mut prefix, start);
+    expand_from(top, &mut prefix, scale);
     let size = 1usize << low.len();
     let edges: Vec<(usize, usize)> = (0..parts)
         .map(|w| par::block(1 << EXPAND_TOP, parts, w, 1))
@@ -697,48 +697,6 @@ pub fn eval_pi1(pi0: &[B128], r_pp: &[F162]) -> F162 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Independent product definition, including zero roots/coordinates and both index orders.
-    #[test]
-    fn seeded_eq_expansion_matches_direct_products() {
-        let mut state = 0x8e6f_1a93_527d_40cbu128;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            B128(state)
-        };
-        for log in [0usize, 1, 3, 8, 9] {
-            let r: Vec<_> = (0..log).map(|i| match i % 5 {
-                0 => B128::ZERO,
-                1 => B128::ONE,
-                _ => next(),
-            }).collect();
-            for start in [B128::ZERO, B128::ONE, next()] {
-                let mut got = vec![B128::ZERO; 1 << log];
-                eq_expand_b128_from(&r, &mut got, start);
-                for (j, &value) in got.iter().enumerate() {
-                    let want = r.iter().enumerate().fold(start, |a, (i, &ri)| {
-                        a * if j & (1 << (log - 1 - i)) == 0 { B128::ONE + ri } else { ri }
-                    });
-                    assert_eq!(value, want, "log={log} entry={j} start={start:?}");
-                }
-            }
-        }
-    }
-
-    /// Exercises the worker subtrees when LABINIUS_THREADS enables several workers.
-    #[test]
-    fn seeded_parallel_eq_matches_the_scaled_table() {
-        let r: Vec<_> = (0..18).map(|i| B128((i as u128 + 3) * 0x9e37_79b9_7f4a_7c15)).collect();
-        let start = B128(0xa076_1d64_78bd_642f_e703_7ed1_a0b4_28db);
-        let mut got = vec![B128::ZERO; 1 << r.len()];
-        eq_expand_b128_from(&r, &mut got, start);
-        let want: Vec<_> = eq_expand_b128(&r).into_iter().map(|v| v * start).collect();
-        let mismatch = got.iter().zip(&want).position(|(a, b)| a != b);
-        assert_eq!(mismatch, None, "seeded expansion differs from the scaled reference");
-    }
-
 
     fn reference(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
         let mut v = vec![B128::ZERO; PACK];

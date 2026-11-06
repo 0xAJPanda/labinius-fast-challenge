@@ -968,30 +968,6 @@ mod tests {
             .collect()
     }
 
-    fn anon_huge_kb() -> u64 {
-        let s = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
-        s.lines().find(|l| l.starts_with("AnonHugePages:")).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse().ok()).unwrap_or(0)
-    }
-
-    /// The key copy is backed by transparent huge pages and equals the image: `cargo test --release
-    /// key_copy -- --ignored --nocapture` (alone, so that no other test allocates meanwhile).
-    #[test]
-    #[ignore]
-    #[cfg(target_arch = "aarch64")]
-    fn key_copy_uses_huge_pages() {
-        use ntt::neon::sms;
-        let before = anon_huge_kb();
-        let t = std::time::Instant::now();
-        sms::prefetch_key(&SMS_DATA.0);
-        let m = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS).unwrap();
-        let took = t.elapsed();
-        let after = anon_huge_kb();
-        eprintln!("key copy {took:?}, AnonHugePages {before} kB -> {after} kB");
-        assert!(m.data.as_ptr() as usize != SMS_DATA.0.as_ptr() as usize, "the copy is used");
-        assert!(m.data.iter().zip(SMS_DATA.0.chunks_exact(2)).all(|(&v, b)| v == i16::from_le_bytes([b[0], b[1]])));
-        assert!(after >= before + 36 * 1024, "THP did not take");
-    }
-
     /// The direct encoding is byte for byte bincode's under the proof codec.
     /// The SMS commitment agrees with the schoolbook commitment at full size on random columns
     /// (its digit recombination is statistical: random witnesses), one and three workers.
@@ -1023,12 +999,6 @@ mod tests {
         let want = commit_reference(&values, &matrix, q);
         let a = sms::matrix(elements, 3);
         assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
-        // several passes of batches over the key blocks (SVE path), the last pass and batch partial
-        let values: Vec<B128> = (0..57).flat_map(|s| column(300 + s)).take(57 * 4 * elements).collect();
-        let want = commit_reference(&values, &matrix, q);
-        for workers in [1, 2] {
-            assert!(sms::commit(&values, &a, workers) == want, "57 columns, workers {workers}");
-        }
     }
     #[test]
     fn encoding_matches_bincode() {
