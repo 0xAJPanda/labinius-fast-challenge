@@ -22,3 +22,11 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+# Existing locked crates, also used by the unchanged public-matrix generator at build time.
+[build-dependencies]
+labinius = { path = "../labinius/crates/pcs" }
+blake3 = "1.8"
+
+[profile.release.build-override]
+opt-level = 3
