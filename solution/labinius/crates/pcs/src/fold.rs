@@ -1381,12 +1381,10 @@ mod bitsliced {
     /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
     const PF_AHEAD: usize = 0;
     const BITS: usize = 15;
-    /// Columns per group: 16 * 129 planes, 132 KB per worker. 32 columns (264 KB) halve the
-    /// outer group loops and partial CSA trees, but on the scored 8488C the smaller planes'
-    /// cache footprint wins: full-shape fold 22.0 vs 23.0 ms (three alternating 7-rep medians;
-    /// 8 columns 23.1). The planes of a group (`GUARD + COL_GROUP * STRIDE`) keep the qword
-    /// offsets in u16 (`(2 + 32 * 129) * 8 <= 65535` at most).
-    const COL_GROUP: usize = 16;
+    /// Columns per group: 32 * 129 planes, about 258 KiB per worker. Larger groups
+    /// amortize the schedule and partial carry-save trees. The qword offsets remain in u16:
+    /// `(GUARD + COL_GROUP * STRIDE) * 8 <= 65535`.
+    const COL_GROUP: usize = 32;
     /// Parts of the column groups per block in the fold's dynamic task hand-out.
     const PARTS: usize = 2;
     /// Planes per column: the 128 direct planes and a zero guard, which is also the next
