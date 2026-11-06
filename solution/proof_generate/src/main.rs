@@ -1122,8 +1122,7 @@ unsafe fn lift_sms_column(_: &[i16], _: &[u32; N], _: &mut [u8]) {
 }
 
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
-/// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 64;
+const PREFIX_SETS: usize = 128;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
