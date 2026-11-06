@@ -19,6 +19,7 @@ mod rq;
 
 use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
+use labinius::fields::lean::LeanSwitch;
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
@@ -377,9 +378,7 @@ fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
 
 fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
     row.absorb(t);
-    (0..COLUMNS)
-        .map(|_| sample_short_challenge(t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-        .collect()
+    labinius::challenge::sample_short_challenges(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND)
 }
 
 /// `v_m = sum_j c_j W_{j,m}` over the integers. A challenge sits in `R_648` as `c(-X^4)`, so each
@@ -649,38 +648,23 @@ impl Proof {
     }
 }
 
-fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
-    #[cfg(target_arch = "aarch64")]
-    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
-        let partials = prepared.partials();
-        let value = partials.iter().zip(cf::eq_expand_b128(lo))
-            .fold(B128::ZERO, |a, (&v, e)| a + v * e);
-        t.absorb_b128(&[value]);
-        t.absorb_b128(&partials);
-        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
-        let mut rounds = Vec::with_capacity(LOG_PACKED);
-        let mut coords = Vec::with_capacity(LOG_PACKED);
-        for _ in 0..LOG_PACKED {
-            let msg = switch.msg();
-            t.absorb_f162(&msg);
-            let r = t.sample_f162(b"switch-round", 1)[0];
-            rounds.push(msg.map(|v| v.0));
-            coords.push(r);
-            switch.fold(r);
-        }
-        return (partials, rounds, coords, switch.final_eval());
-    }
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, hi);
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
+    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+    timer.lap("commit");
+    let mut t = transcript(seed, modulus, &commitment);
+    let lo = t.sample_b128(b"r-lo", 7);
+    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
+    let (mut switch, partials) = LeanSwitch::partials(values, &hi);
+    timer.lap("sw_partials");
     let value = partials
         .iter()
-        .zip(cf::eq_expand_b128(lo))
+        .zip(cf::eq_expand_b128(&lo))
         .fold(B128::ZERO, |a, (&v, e)| a + v * e);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+    switch.start(&batch);
+    timer.lap("sw_setup");
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
@@ -692,16 +676,6 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
         switch.fold(r);
     }
     let opened = switch.final_eval();
-    (partials, rounds, coords, opened)
-}
-
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
-    timer.lap("commit");
-    let mut t = transcript(seed, modulus, &commitment);
-    let lo = t.sample_b128(b"r-lo", 7);
-    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);
@@ -752,6 +726,7 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
+    timer.lap("drop");
     let bytes = proof.encode();
     std::fs::write(&args[2], bytes).expect("write proof");
     timer.lap("write");
