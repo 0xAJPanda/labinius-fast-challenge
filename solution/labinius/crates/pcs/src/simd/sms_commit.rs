@@ -425,9 +425,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-/// Slots ahead the sink prefetches its key lines. The accumulator lines are L1-resident already,
-/// so prefetching them only spends issue slots.
-const PREFETCH_SLOTS: usize = 3;
+const PREFETCH_SLOTS: usize = 6;
 
 /// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
 /// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
