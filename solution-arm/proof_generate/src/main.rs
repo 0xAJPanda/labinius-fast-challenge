@@ -10,6 +10,7 @@
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
 mod hugealloc;
 mod ntt;
+mod hybrid;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -37,7 +38,7 @@ const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 const LIMIT: u64 = 64 * 1024 * 1024;
 const MIN_MODULUS: u128 = 34_816_965_049;
 /// The default commitment modulus: the product of the three transform primes.
-const MODULUS: u128 = ntt::neon::hybrid::MODULUS;
+const MODULUS: u128 = hybrid::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
 const GROUP: usize = 8;
@@ -267,9 +268,7 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
-    #[cfg(target_arch = "aarch64")]
-    if modulus == ntt::neon::hybrid::MODULUS {
-        use ntt::neon::hybrid;
+    if modulus == hybrid::MODULUS {
         return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
     }
     if modulus == ntt::MODULUS {
@@ -656,8 +655,15 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     let mut t = transcript(seed, modulus, &commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, &hi);
+    let prefix = cf::PrefixWorkspace::partial_evals(values, &hi);
+    let (partials, prefix, fallback) = match prefix {
+        Some((v, ws)) => (v, Some(ws), None),
+        None => {
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            let v = ws.partial_evals(0, values, &hi);
+            (v, None, Some(ws))
+        }
+    };
     let value = partials
         .iter()
         .zip(cf::eq_expand_b128(&lo))
@@ -665,18 +671,28 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+    let mut prefix = prefix.map(|ws| ws.start(values, &batch));
+    let mut fallback = fallback.map(|ws| cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch));
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
-        let msg = switch.msg();
+        let msg = match &mut prefix {
+            Some(p) => p.msg(),
+            None => fallback.as_mut().unwrap().msg(),
+        };
         t.absorb_f162(&msg);
         let r = t.sample_f162(b"switch-round", 1)[0];
         rounds.push(msg.map(|v| v.0));
         coords.push(r);
-        switch.fold(r);
+        match &mut prefix {
+            Some(p) => p.fold(r),
+            None => fallback.as_mut().unwrap().fold(r),
+        }
     }
-    let opened = switch.final_eval();
+    let opened = match &prefix {
+        Some(p) => p.final_eval(),
+        None => fallback.as_ref().unwrap().final_eval(),
+    };
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);

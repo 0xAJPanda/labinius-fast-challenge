@@ -602,6 +602,180 @@ impl SwitchProver {
     }
 }
 
+
+/// Six leading coordinates select 64 blocks. Their bit partials supply the first six
+/// sumcheck messages without lifting either full polynomial. This is the prefix/linear-map
+/// identity used by the x86 LeanSwitch, with the ordinary sumcheck retained on the small tail.
+pub const PREFIX_SETS: usize = 64;
+
+pub struct PrefixWorkspace {
+    eq: Vec<B128>,
+    sets: Vec<Vec<B128>>,
+    hi: Vec<B128>,
+}
+
+fn b128_inverse(x: B128) -> B128 {
+    assert_ne!(x, B128::ZERO);
+    let mut out = B128::ONE;
+    let mut base = x;
+    let mut exponent = u128::MAX - 1;
+    while exponent != 0 {
+        if exponent & 1 != 0 { out = out * base; }
+        base = base * base;
+        exponent >>= 1;
+    }
+    out
+}
+
+fn prefix_scales(r: &[B128]) -> Vec<B128> {
+    let ratios: Vec<_> = r.iter().map(|&x| x * b128_inverse(B128::ONE + x)).collect();
+    (0..1usize << r.len()).map(|q| {
+        ratios.iter().enumerate().fold(B128::ONE, |a, (i, &v)| {
+            if q & (1 << (r.len() - 1 - i)) != 0 { a * v } else { a }
+        })
+    }).collect()
+}
+
+impl PrefixWorkspace {
+    pub fn partial_evals(pi0: &[B128], hi: &[B128]) -> Option<(Vec<B128>, Self)> {
+        Self::with_prefix(pi0, hi, PREFIX_SETS.trailing_zeros() as usize)
+    }
+
+    fn with_prefix(pi0: &[B128], hi: &[B128], prefix: usize) -> Option<(Vec<B128>, Self)> {
+        assert_eq!(pi0.len(), 1usize << hi.len());
+        if hi.len() <= prefix || hi.iter().any(|&r| r == B128::ONE) { return None; }
+        let groups = 1usize << prefix;
+        let scale = hi[..prefix].iter().fold(B128::ONE, |a, &r| a * (B128::ONE + r));
+        let mut eq = eq_expand_b128(&hi[prefix..]);
+        for e in &mut eq { *e = *e * scale; }
+        let n = eq.len();
+        // Parallelize across blocks, without recursively spawning each block's workers.
+        let parts = par::map_blocks(groups, groups.min(par::threads()), 1, |_, s, e| {
+            (s..e).map(|q| {
+                let words = &pi0[q * n..(q + 1) * n];
+                if n % TILE == 0 { tile_sums(words, &eq) } else { partial_evals(words, &eq) }
+            }).collect::<Vec<_>>()
+        });
+        let sets: Vec<Vec<B128>> = parts.into_iter().flatten().collect();
+        let scales = prefix_scales(&hi[..prefix]);
+        let mut v = vec![B128::ZERO; PACK];
+        for (set, &c) in sets.iter().zip(&scales) {
+            for (dst, &x) in v.iter_mut().zip(set) { *dst = *dst + c * x; }
+        }
+        Some((v, Self { eq, sets, hi: hi.to_vec() }))
+    }
+
+    pub fn start<'a>(self, words: &'a [B128], batch: &[F162]) -> PrefixSwitch<'a> {
+        let lp = compose_prefix_map(batch, b128_inverse(B128::ONE + self.hi[0]));
+        PrefixSwitch { words, ws: self, l: batch.to_vec(), lp, rs: Vec::new(),
+            round: 0, half: words.len(), tail: None }
+    }
+}
+
+fn compose_prefix_map(images: &[F162], d: B128) -> Vec<F162> {
+    let tab = psi_table(images);
+    (0..PACK).map(|i| psi(&tab, B128(1u128 << i) * d)).collect()
+}
+
+pub struct PrefixSwitch<'a> {
+    words: &'a [B128],
+    ws: PrefixWorkspace,
+    l: Vec<F162>,
+    lp: Vec<F162>,
+    rs: Vec<F162>,
+    round: usize,
+    half: usize,
+    tail: Option<(super::sumcheck::Poly, super::sumcheck::Poly)>,
+}
+
+impl PrefixSwitch<'_> {
+    pub fn msg(&mut self) -> [F162; 2] {
+        self.half /= 2;
+        if let Some((a, p)) = &self.tail {
+            return super::sumcheck::msg(a, p, self.half);
+        }
+        let prefix = self.ws.sets.len().trailing_zeros() as usize;
+        let suffix = prefix - self.round - 1;
+        let scales = prefix_scales(&self.ws.hi[self.round + 1..prefix]);
+        let weights = eq_expand_f162(&self.rs);
+        let (lm, lpm) = (psi_table(&self.l), psi_table(&self.lp));
+        // Sixteen output bits per task: even the first message uses all available CPUs.
+        let tasks = weights.len() * (PACK / 16);
+        let sums = par::map_blocks(tasks, par::threads().min(tasks), 1, |_, s, e| {
+            let mut out = [F162::ZERO; 2];
+            for task in s..e {
+                let z = task / (PACK / 16);
+                let bit = 16 * (task % (PACK / 16));
+                let g0 = z << (prefix - self.round);
+                let g1 = g0 | (1 << suffix);
+                let mut local = [F162::ZERO; 2];
+                for i in bit..bit + 16 {
+                    let mut a = B128::ZERO;
+                    let mut b = B128::ZERO;
+                    for (q, &scale) in scales.iter().enumerate() {
+                        a = a + self.ws.sets[g0 | q][i] * scale;
+                        b = b + self.ws.sets[g1 | q][i] * scale;
+                    }
+                    let basis = F162::from_b128(B128(1u128 << i));
+                    local[0] += psi(&lm, a) * basis;
+                    local[1] += psi(&lpm, a + b) * basis;
+                }
+                out[0] += weights[z] * local[0];
+                out[1] += weights[z] * local[1];
+            }
+            out
+        });
+        sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
+    }
+
+    pub fn fold(&mut self, r: F162) {
+        if let Some((a, p)) = &mut self.tail {
+            super::sumcheck::fold(a, p, self.half, r);
+            self.round += 1;
+            return;
+        }
+        for (l, &lp) in self.l.iter_mut().zip(&self.lp) { *l += r * lp; }
+        self.rs.push(r);
+        self.round += 1;
+        let prefix = self.ws.sets.len().trailing_zeros() as usize;
+        if self.round < prefix {
+            self.lp = compose_prefix_map(&self.l, b128_inverse(B128::ONE + self.ws.hi[self.round]));
+            return;
+        }
+        let n = self.ws.eq.len();
+        let mut a = super::sumcheck::Poly::zero(n);
+        poly_from_eq(&[&self.ws.eq], &[self.l.clone()], &mut a);
+        let weights = eq_expand_f162(&self.rs);
+        let mut p = super::sumcheck::Poly::zero(n);
+        let parts = par::workers(n, 1024);
+        let edges: Vec<_> = (0..parts).map(|w| par::block(n, parts, w, 2)).collect();
+        let [p0, p1, p2] = &mut p.w;
+        let chunks = par::split_mut(p0, &edges).into_iter()
+            .zip(par::split_mut(p1, &edges)).zip(par::split_mut(p2, &edges));
+        let words = self.words;
+        let weights = &weights;
+        std::thread::scope(|scope| {
+            for (((p0, p1), p2), &(s, _)) in chunks.zip(&edges) {
+                scope.spawn(move || {
+                    #[cfg(target_arch = "aarch64")]
+                    if super::neon::pmull() {
+                        unsafe { super::neon::bind_prefix(words, n, s, weights, [p0, p1, p2]); }
+                        return;
+                    }
+                    for j in 0..p0.len() {
+                        let value = weights.iter().enumerate().fold(F162::ZERO, |a, (q, &w)|
+                            a + w * F162::from_b128(words[q * n + s + j]));
+                        p0[j] = value.0[0]; p1[j] = value.0[1]; p2[j] = value.0[2];
+                    }
+                });
+            }
+        });
+        self.tail = Some((a, p));
+    }
+
+    pub fn final_eval(&self) -> F162 { self.tail.as_ref().expect("bound prefix").1.get(0) }
+}
+
 pub fn slice_sum(v: &[B128], batch: &[F162]) -> F162 {
     let mut u = vec![0u128; PACK];
     for (i, &vi) in v.iter().enumerate() {
@@ -841,6 +1015,57 @@ mod tests {
             let pi0: Vec<B128> = (0..n).map(|_| next()).collect();
             let eq: Vec<B128> = (0..n).map(|_| next()).collect();
             assert_eq!(partial_evals(&pi0, &eq), reference(&pi0, &eq));
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefix_switch_tests {
+    use super::*;
+
+    #[test]
+    fn prefix_messages_and_transcript_match_full_lift() {
+        let mut seed = 0x123456789abcdef0_fedcba9876543210u128;
+        let mut next = || {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            seed
+        };
+        for (log, prefix) in [(4, 1), (7, 2), (9, 6), (12, 6), (16, 6)] {
+            let words: Vec<_> = (0..1usize << log).map(|_| B128(next())).collect();
+            let mut hi: Vec<_> = (0..log).map(|_| B128(next())).collect();
+            // Zero is a valid coordinate: the nonzero-prefix ratios may vanish.
+            hi[log - 1] = B128::ZERO;
+            if log == 9 { hi[0] = B128::ZERO; }
+            let eq = eq_expand_b128(&hi);
+            let (v, ws) = PrefixWorkspace::with_prefix(&words, &hi, prefix).unwrap();
+            assert_eq!(v, partial_evals(&words, &eq), "partials log={log}");
+            let batch = eq_expand_f162(&(0..LOG_PACK).map(|_| {
+                F162([next() as u64, next() as u64, next() as u64 & ((1 << 34) - 1)])
+            }).collect::<Vec<_>>());
+            let mut reference = SwitchProver::new(&words, &eq, &batch);
+            let mut candidate = ws.start(&words, &batch);
+            let mut transcript = crate::Transcript::new(b"prefix-switch-regression");
+            for round in 0..log {
+                let want = reference.msg();
+                let got = candidate.msg();
+                // Compare serialized limbs, including the exact order of the two messages.
+                let bytes = |m: [F162; 2]| m.into_iter().flat_map(|v|
+                    v.0.into_iter().flat_map(u64::to_le_bytes)).collect::<Vec<_>>();
+                assert_eq!(bytes(got), bytes(want), "message log={log} round={round}");
+                transcript.absorb_f162(&got);
+                let r = transcript.sample_f162(b"switch-round", 1)[0];
+                candidate.fold(r); reference.fold(r);
+            }
+            assert_eq!(candidate.final_eval(), reference.final_eval(), "final log={log}");
+        }
+    }
+
+    #[test]
+    fn prefix_rejects_degenerate_coordinates() {
+        let words = vec![B128::ONE; 256];
+        for pos in 0..8 {
+            let mut hi = vec![B128(3); 8]; hi[pos] = B128::ONE;
+            assert!(PrefixWorkspace::partial_evals(&words, &hi).is_none());
         }
     }
 }
