@@ -8,7 +8,11 @@
 //! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
 //! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
+mod hugealloc;
 mod ntt;
+
+#[global_allocator]
+static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
 #[allow(dead_code)]
 mod rq;
 
