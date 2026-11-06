@@ -1361,7 +1361,8 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
         // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined tails
         // and prefixes outgrow the instruction cache and the decoded-uop cache.
         let hs = core::hint::black_box(H);
-        for h in 0..hs {
+        for hr in 0..hs {
+            let h = hs - 1 - hr;
             let (ip, bp) = (ips[h], bps[h]);
             for i in 0..27 {
                 let n0 = ldb(ip, i);
