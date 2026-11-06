@@ -1758,7 +1758,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         cf::LeanSwitch::with_sets_factored(values, eq, &hi, &batch, workers, planes, sets.into())
     });
     let (rounds, coords, opened) = match lean {
-        Some(mut sw) => switch_rounds(&mut sw, &mut t),
+        Some(mut sw) => {
+            let out = switch_rounds(&mut sw, &mut t);
+            std::mem::forget(sw);
+            out
+        }
         None => {
             // The baseline's prover, whose workspace holds its own full expansion.
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
