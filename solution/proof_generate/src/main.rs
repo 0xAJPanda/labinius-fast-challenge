@@ -561,6 +561,26 @@ unsafe fn write_folded_element_avx512(v: &[i16; N], dst: *mut u8) {
     );
 }
 
+///
+/// # Safety
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn write_folded_element_stream(v: &[i16; N], dst: *mut u8) {
+    use core::arch::x86_64::*;
+    const _: () = assert!(N == 648 && FOLDED_BYTES == 4);
+    debug_assert_eq!(dst as usize % 32, 0);
+    let src = v.as_ptr();
+    let (lead, plain) = if dst as usize % 64 == 0 { (0, N - 8) } else { (8, 0) };
+    _mm256_storeu_si256(
+        dst.add(FOLDED_BYTES * plain) as *mut __m256i,
+        _mm256_cvtepi16_epi32(_mm_loadu_si128(src.add(plain) as *const __m128i)),
+    );
+    for j in 0..(N - 8) / 16 {
+        let s = _mm256_loadu_si256(src.add(lead + 16 * j) as *const __m256i);
+        _mm512_stream_si512(dst.add(FOLDED_BYTES * lead + 64 * j) as *mut _, _mm512_cvtepi16_epi32(s));
+    }
+}
+
 fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
     let elements = folded.elements();
     assert!(
@@ -1273,6 +1293,8 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
     let avx512 = std::arch::is_x86_feature_detected!("avx512f");
+    #[cfg(target_arch = "x86_64")]
+    let stream = avx512 && (addr + folded_at) % 32 == 0;
     labinius::par::pool().run(cruns.len() + fruns.len(), |i| {
         let out = addr as *mut u8;
         if i < cruns.len() {
@@ -1286,6 +1308,15 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
         }
         let r = fruns[i - cruns.len()].clone();
         let mut dst = out.add(folded_at + FOLDED_BYTES * N * r.start);
+        #[cfg(target_arch = "x86_64")]
+        if stream {
+            for e in &elements[r] {
+                write_folded_element_stream(&e.v, dst);
+                dst = dst.add(FOLDED_BYTES * N);
+            }
+            core::arch::x86_64::_mm_sfence();
+            return;
+        }
         #[cfg(target_arch = "x86_64")]
         if avx512 {
             for e in &elements[r] {
