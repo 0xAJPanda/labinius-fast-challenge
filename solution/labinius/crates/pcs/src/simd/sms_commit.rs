@@ -482,20 +482,31 @@ unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *m
 impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
-        for i in r0..r1 {
-            let j = 27 * blk + i;
-            let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
-            let k = self.k.add(j * STREAMS * LOCK);
-            let a = self.acc.add(j * STREAMS * 16);
+        // Two rows share one contiguous prefetch walk, with the same requested
+        // lines and lead as before; avoid a full-callback burst.
+        for begin in (r0..r1).step_by(2) {
+            let end = (begin + 2).min(r1);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
+                let first = 27 * blk + begin + PREFETCH_SLOTS;
+                let lo = self.k.wrapping_add(first * STREAMS * LOCK) as usize;
+                let hi = lo + (end - begin) * STREAMS * LOCK * 4;
                 let mut p = (lo + 63) & !63;
                 while p < hi {
                     _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
                     p += 64;
                 }
             }
+            self.rows_without_prefetch(blk, w0, begin, end);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn rows_without_prefetch(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        for i in r0..r1 {
+            let j = 27 * blk + i;
+            let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
+            let k = self.k.add(j * STREAMS * LOCK);
+            let a = self.acc.add(j * STREAMS * 16);
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
                     core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
