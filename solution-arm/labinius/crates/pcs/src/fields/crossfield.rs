@@ -341,6 +341,11 @@ fn eq_matrices(batch: &[F162]) -> [[u64; 16]; 24] {
     m
 }
 
+/// [`poly_from_eq`] for the lean switch.
+pub(super) fn poly_from_eq_pub(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumcheck::Poly) {
+    poly_from_eq(eqs, batches, out)
+}
+
 /// `a[j] = sum_i sum_k bit_k(eq[i][j]) batch[i][k]`, straight into the sumcheck's layout: per
 /// tile the byte planes of `eq` through [`eq_matrices`], and the 24 output planes back to qwords.
 fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumcheck::Poly) {

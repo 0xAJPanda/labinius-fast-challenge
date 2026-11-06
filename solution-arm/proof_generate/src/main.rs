@@ -656,8 +656,9 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     let mut t = transcript(seed, modulus, &commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, &hi);
+    let mut switch = labinius::fields::lean::LeanSwitch::new(values, &hi, threads());
+    let partials = switch.partials();
+    timer.lap("partials");
     let value = partials
         .iter()
         .zip(cf::eq_expand_b128(&lo))
@@ -665,7 +666,7 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+    switch.start(&batch);
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {

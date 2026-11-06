@@ -539,3 +539,87 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// the lean switch's weighted lift
+// ---------------------------------------------------------------------------------------------
+
+/// `out[j - s] = sum_z w[z] lift(pi0[z b + j])` for `j` in `[s, t)`: per entry the 64 products
+/// of a two-limb word by a three-limb weight, six PMULLs each, summed unreduced in four 128-bit
+/// columns and reduced once. Four entries per step share the weights' registers.
+///
+/// # Safety
+/// The CPU must have PMULL ([`pmull`]).
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn weighted_lift_rows(
+    pi0: &[B128],
+    b: usize,
+    w: &[F162],
+    s: usize,
+    t: usize,
+    out: [&mut [u64]; 3],
+) {
+    let [o0, o1, o2] = out;
+    assert!(o0.len() == t - s && o1.len() == t - s && o2.len() == t - s);
+    assert!(w.len() * b <= pi0.len() && t <= b);
+    // Per weight: [w0, w1], [w1, w0], [w2, w2].
+    let wv: Vec<[uint64x2_t; 3]> = w
+        .iter()
+        .map(|x| {
+            [
+                vcombine_u64(vcreate_u64(x.0[0]), vcreate_u64(x.0[1])),
+                vcombine_u64(vcreate_u64(x.0[1]), vcreate_u64(x.0[0])),
+                vdupq_n_u64(x.0[2]),
+            ]
+        })
+        .collect();
+    let base = pi0.as_ptr() as *const u64;
+    const STEP: usize = 4;
+    let mut j = s;
+    while j < t {
+        let cnt = (t - j).min(STEP);
+        let mut acc = [[vdupq_n_u64(0); 4]; STEP];
+        if cnt == STEP {
+            for (z, ws) in wv.iter().enumerate() {
+                let row = base.add(2 * (z * b + j));
+                for e in 0..STEP {
+                    let x = vld1q_u64(row.add(2 * e));
+                    let a = &mut acc[e];
+                    a[0] = veorq_u64(a[0], pmul_lo(x, ws[0]));
+                    a[1] = x3(a[1], pmul_lo(x, ws[1]), pmul_hi(x, ws[1]));
+                    a[2] = x3(a[2], pmul_hi(x, ws[0]), pmul_lo(x, ws[2]));
+                    a[3] = veorq_u64(a[3], pmul_hi(x, ws[2]));
+                }
+            }
+        } else {
+            for (z, ws) in wv.iter().enumerate() {
+                let row = base.add(2 * (z * b + j));
+                for e in 0..cnt {
+                    let x = vld1q_u64(row.add(2 * e));
+                    let a = &mut acc[e];
+                    a[0] = veorq_u64(a[0], pmul_lo(x, ws[0]));
+                    a[1] = x3(a[1], pmul_lo(x, ws[1]), pmul_hi(x, ws[1]));
+                    a[2] = x3(a[2], pmul_hi(x, ws[0]), pmul_lo(x, ws[2]));
+                    a[3] = veorq_u64(a[3], pmul_hi(x, ws[2]));
+                }
+            }
+        }
+        for e in 0..cnt {
+            let [c0, c1, c2, c3] = acc[e].map(|x| to_u128(x));
+            let lo = |x: u128| x as u64;
+            let hi = |x: u128| (x >> 64) as u64;
+            let r = reduce([
+                lo(c0),
+                hi(c0) ^ lo(c1),
+                hi(c1) ^ lo(c2),
+                hi(c2) ^ lo(c3),
+                hi(c3),
+                0,
+            ]);
+            o0[j - s + e] = r.0[0];
+            o1[j - s + e] = r.0[1];
+            o2[j - s + e] = r.0[2];
+        }
+        j += cnt;
+    }
+}
