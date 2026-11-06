@@ -292,6 +292,53 @@ fn reduce(p: [u64; 6]) -> F162 {
     ])
 }
 
+/// `sum_i eq[i] * x_i` with each `x_i` lifted to `F162` (top limb zero): six `PMULL`s per term
+/// into four unreduced 128-bit sums at 64-bit offsets (two interleaved sets for latency), and
+/// one reduction at the end. The same field element as the sum of reduced products.
+pub(super) fn dot_lifted(eq: &[F162], xs: &[B128]) -> F162 {
+    assert_eq!(eq.len(), xs.len());
+    unsafe {
+        let z = vdupq_n_u64(0);
+        let mut acc = [[z; 4]; 2];
+        let term = |acc: &mut [uint64x2_t; 4], e: &F162, x: &B128| {
+            let a = vld1q_u64(e.0.as_ptr());
+            let a2 = vdupq_n_u64(e.0[2]);
+            let x = vld1q_u64(x as *const B128 as *const u64);
+            let xs = vextq_u64::<1>(x, x);
+            let p00 = pmul_lo(a, x);
+            let p11 = pmul_hi(a, x);
+            let p01 = pmul_lo(a, xs);
+            let p10 = pmul_hi(a, xs);
+            let p20 = pmul_lo(a2, x);
+            let p21 = pmul_hi(a2, x);
+            acc[0] = x2(acc[0], p00);
+            acc[1] = x3(acc[1], p01, p10);
+            acc[2] = x3(acc[2], p11, p20);
+            acc[3] = x2(acc[3], p21);
+        };
+        let pairs = eq.len() / 2;
+        for i in 0..pairs {
+            term(&mut acc[0], eq.get_unchecked(2 * i), xs.get_unchecked(2 * i));
+            term(&mut acc[1], eq.get_unchecked(2 * i + 1), xs.get_unchecked(2 * i + 1));
+        }
+        if eq.len() % 2 == 1 {
+            let i = eq.len() - 1;
+            term(&mut acc[0], &eq[i], &xs[i]);
+        }
+        let c: [u128; 4] = core::array::from_fn(|k| to_u128(veorq_u64(acc[0][k], acc[1][k])));
+        let lo = |x: u128| x as u64;
+        let hi = |x: u128| (x >> 64) as u64;
+        reduce([
+            lo(c[0]),
+            hi(c[0]) ^ lo(c[1]),
+            hi(c[1]) ^ lo(c[2]),
+            hi(c[2]) ^ lo(c[3]),
+            hi(c[3]),
+            0,
+        ])
+    }
+}
+
 #[inline(always)]
 unsafe fn to_u128(x: uint64x2_t) -> u128 {
     vgetq_lane_u64::<0>(x) as u128 | (vgetq_lane_u64::<1>(x) as u128) << 64
@@ -410,122 +457,110 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
     }
 }
 
-
-// ---------------------------------------------------------------------------------------------
-// the lean switch: block partial sets and the materialized fold
-// ---------------------------------------------------------------------------------------------
-
-/// Groups of eight `eq` rows whose tables are built per pass of [`partial_sets_rows`].
-const LPASS: usize = 4;
-
-/// `sets[u][k] = sum_j bit_k(pi0[u * stride + j0 + j]) eq[j]` for `u < blocks`, `j < eq.len()`.
-///
-/// The four-Russians tables of [`partial_evals_rows`] depend only on the `eq` rows, so each one
-/// is built once and read for all `blocks` blocks of `pi0` that share those `eq` rows.
-pub(super) fn partial_sets_rows(
-    pi0: &[B128],
-    stride: usize,
-    blocks: usize,
-    j0: usize,
-    eq: &[B128],
-) -> Vec<Vec<B128>> {
-    let m = eq.len();
-    assert!(blocks >= 1 && (blocks - 1) * stride + j0 + m <= pi0.len());
-    let groups = m / GROUP;
-    let mut out = vec![vec![B128::ZERO; 128]; blocks];
+/// Partial sets share one equality block and its lookup tables across all word blocks.
+pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end: usize) -> Vec<Vec<B128>> {
+    let stride = eq.len();
+    assert_eq!(words.len() % stride, 0);
+    assert!(start <= end && end <= stride && start % GROUP == 0 && end % GROUP == 0);
+    let blocks = words.len() / stride;
     unsafe {
-        let mut tabs: Vec<[uint8x16_t; 256]> = vec![[vdupq_n_u8(0); 256]; LPASS];
-        let mut sums: Vec<[uint8x16_t; 128]> = vec![[vdupq_n_u8(0); 128]; blocks];
-        let mut pats = [[0u8; 128]; LPASS];
-        let mut g = 0;
-        while g < groups {
-            let count = (groups - g).min(LPASS);
+        let mut sums = vec![[vdupq_n_u8(0); 128]; blocks];
+        let mut tabs = vec![[vdupq_n_u8(0); 256]; PASS];
+        let mut pats = [[0u8; 128]; PASS];
+        for base in (start..end).step_by(GROUP * PASS) {
+            let count = ((end - base) / GROUP).min(PASS);
             for x in 0..count {
-                combinations(eq.as_ptr().add(GROUP * (g + x)), &mut tabs[x]);
+                combinations(eq.as_ptr().add(base + GROUP * x), &mut tabs[x]);
             }
-            let tabs = &tabs[..count];
-            for (u, sum) in sums.iter_mut().enumerate() {
-                let base = pi0.as_ptr().add(u * stride + j0);
+            for (q, sum) in sums.iter_mut().enumerate() {
                 for x in 0..count {
-                    patterns(base.add(GROUP * (g + x)), &mut pats[x]);
+                    patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
                 }
-                let pats = &pats[..count];
-                for (q, s) in sum.iter_mut().enumerate() {
-                    let mut a = vdupq_n_u8(0);
-                    for (t, p) in tabs.iter().zip(pats) {
-                        a = veorq_u8(a, *t.get_unchecked(*p.get_unchecked(q) as usize));
+                for k in 0..128 {
+                    let mut a = sum[k];
+                    for x in 0..count {
+                        a = veorq_u8(a, tabs[x][pats[x][k] as usize]);
                     }
-                    *s = veorq_u8(*s, a);
-                }
-            }
-            g += count;
-        }
-        for (sum, v) in sums.iter().zip(out.iter_mut()) {
-            for (q, s) in sum.iter().enumerate() {
-                let mut a = 0u128;
-                vst1q_u8(&mut a as *mut u128 as *mut u8, *s);
-                v[8 * (q % 16) + q / 16] = B128(a);
-            }
-        }
-    }
-    for (u, v) in out.iter_mut().enumerate() {
-        let rows = &pi0[u * stride + j0..][..m];
-        for (&p, &e) in rows[GROUP * groups..].iter().zip(&eq[GROUP * groups..]) {
-            for (k, vk) in v.iter_mut().enumerate() {
-                if p.bit(k) {
-                    *vk = *vk + e;
+                    sum[k] = a;
                 }
             }
         }
+        sums.into_iter().map(|sum| {
+            let mut out = vec![B128::ZERO; 128];
+            for (q, s) in sum.into_iter().enumerate() {
+                vst1q_u8(&mut out[8 * (q % 16) + q / 16].0 as *mut u128 as *mut u8, s);
+            }
+            out
+        }).collect()
     }
-    out
 }
 
-/// `out[.][j] = sum_u w[u] lift(pi0[u * stride + j0 + j])`, products accumulated unreduced and
-/// reduced once per entry.
-///
-/// # Safety
-/// The CPU must have PMULL ([`pmull`]).
+impl ByteTables {
+    #[inline(always)]
+    pub(super) fn apply(&self, x: B128) -> F162 {
+        unsafe {
+            let mut lo = vdupq_n_u64(0);
+            let mut top = 0u64;
+            for b in 0..16 {
+                let s = 256 * b + ((x.0 >> (8 * b)) & 255) as usize;
+                lo = veorq_u64(lo, vld1q_u64(self.lo.as_ptr().add(s) as *const u64));
+                top ^= *self.top.get_unchecked(s);
+            }
+            F162([vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<1>(lo), top])
+        }
+    }
+}
+
 #[target_feature(enable = "aes")]
-pub(super) unsafe fn lift_combine_rows(
-    pi0: &[B128],
-    stride: usize,
-    w: &[F162],
-    j0: usize,
-    out: [&mut [u64]; 3],
-) {
+pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start: usize, out: [&mut [u64]; 3]) {
+    let stride = words.len() / weights.len();
     let [o0, o1, o2] = out;
-    let m = o0.len();
-    assert!(o1.len() == m && o2.len() == m);
-    assert!(!w.is_empty() && (w.len() - 1) * stride + j0 + m <= pi0.len());
-    let src = pi0.as_ptr() as *const u64;
-    for j in 0..m {
-        let mut acc = [vdupq_n_u64(0); 4];
-        for (u, wu) in w.iter().enumerate() {
-            let at = 2 * (u * stride + j0 + j);
-            let x0 = *src.add(at);
-            let x1 = *src.add(at + 1);
-            for i in 0..3 {
-                let wi = wu.0[i];
-                acc[i] = veorq_u64(acc[i], vreinterpretq_u64_p128(vmull_p64(wi, x0)));
-                acc[i + 1] = veorq_u64(acc[i + 1], vreinterpretq_u64_p128(vmull_p64(wi, x1)));
+    let len = o0.len();
+    assert!(o1.len() == len && o2.len() == len && start + len <= stride && len % 2 == 0);
+    let weights: Vec<_> = weights.iter().map(|w| kara(w.0.map(|v| vdupq_n_u64(v)))).collect();
+    for i in (0..len).step_by(2) {
+        let mut acc0 = [vdupq_n_u64(0); 6];
+        let mut acc1 = acc0;
+        for (q, w) in weights.iter().enumerate() {
+            let p = vld2q_u64(words.as_ptr().add(q * stride + start + i) as *const u64);
+            let k = [p.0, p.1, vdupq_n_u64(0), x2(p.0, p.1), p.0, p.1];
+            for j in [0, 1, 3, 4, 5] {
+                acc0[j] = x2(acc0[j], pmul_lo(w[j], k[j]));
+                acc1[j] = x2(acc1[j], pmul_hi(w[j], k[j]));
             }
         }
-        let lo = |x: uint64x2_t| vgetq_lane_u64::<0>(x);
-        let hi = |x: uint64x2_t| vgetq_lane_u64::<1>(x);
-        let p = [
-            lo(acc[0]),
-            hi(acc[0]) ^ lo(acc[1]),
-            hi(acc[1]) ^ lo(acc[2]),
-            hi(acc[2]) ^ lo(acc[3]),
-            hi(acc[3]),
-            0,
-        ];
-        let y = reduce(p);
-        o0[j] = y.0[0];
-        o1[j] = y.0[1];
-        o2[j] = y.0[2];
+        let a = reduce(assemble(acc0.map(|v| to_u128(v))));
+        let b = reduce(assemble(acc1.map(|v| to_u128(v))));
+        for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
+            dst[i] = a.0[k];
+            dst[i + 1] = b.0[k];
+        }
     }
+}
+
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn linear_message(eq: &[B128], lo: [&[u64]; 3], hi: [&[u64]; 3], l: &ByteTables, lp: &ByteTables) -> [F162; 2] {
+    let n = eq.len();
+    assert!(lo.iter().chain(hi.iter()).all(|s| s.len() == n));
+    let mut acc0 = [vdupq_n_u64(0); 6];
+    let mut acci = acc0;
+    for j in (0..n / 2 * 2).step_by(2) {
+        let a = [l.apply(eq[j]), l.apply(eq[j + 1])];
+        let d = [lp.apply(eq[j]), lp.apply(eq[j + 1])];
+        let pack = |a: [F162; 2]| core::array::from_fn(|k| vcombine_u64(vcreate_u64(a[0].0[k]), vcreate_u64(a[1].0[k])));
+        let (p0, p1) = (load2(lo, j), load2(hi, j));
+        mac2(&mut acc0, pack(a), p0);
+        mac2(&mut acci, pack(d), core::array::from_fn(|k| x2(p0[k], p1[k])));
+    }
+    let mut out = [reduce(assemble(acc0.map(|v| to_u128(v)))), reduce(assemble(acci.map(|v| to_u128(v))))];
+    if n % 2 != 0 {
+        let j = n - 1;
+        let p0 = F162(core::array::from_fn(|k| lo[k][j]));
+        let p1 = F162(core::array::from_fn(|k| hi[k][j]));
+        out[0] += l.apply(eq[j]) * p0;
+        out[1] += lp.apply(eq[j]) * (p0 + p1);
+    }
+    out
 }
 
 #[cfg(test)]

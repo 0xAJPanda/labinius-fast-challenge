@@ -514,6 +514,41 @@ fn attempt(x: &mut Xof, weight: usize, perm: &mut [u8; N162]) -> ShortChallenge 
 /// function of what has been absorbed and takes one transcript finalisation however many attempts
 /// the bound needs; the per-attempt work is then the Fisher-Yates, the sign hash of the candidate,
 /// and the blocked evaluation, with no allocation.
+/// [`sample_short_challenge`] `n` times in a row. Each challenge reads only its own transcript
+/// derivation, so the derivations are taken here in order (one counter step each, as the loop of
+/// single calls takes them) and the rejection sampling runs on the workers: the challenges, and
+/// the transcript afterwards, are exactly those of the sequential loop.
+pub fn sample_short_challenges(
+    t: &mut Transcript,
+    n: usize,
+    weight: usize,
+    bound: f64,
+) -> Vec<ShortChallenge> {
+    let readers: Vec<blake3::OutputReader> =
+        (0..n).map(|_| t.reader(b"short-challenge")).collect();
+    let bound_sq = bound * bound + 1e-12;
+    let parts = crate::par::workers(n, 32);
+    let readers = &readers;
+    crate::par::map_blocks(n, parts, 1, |_, s, e| {
+        let mut perm = [0u8; N162];
+        readers[s..e]
+            .iter()
+            .map(|r| {
+                let mut x = Xof::new(r.clone());
+                loop {
+                    let c = attempt(&mut x, weight, &mut perm).signed();
+                    if within(&c, bound_sq) {
+                        return c;
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 pub fn sample_short_challenge(
     t: &mut Transcript,
     weight: usize,
@@ -528,6 +563,26 @@ pub fn sample_short_challenge(
         let c = attempt(&mut x, weight, &mut perm).signed();
         if within(&c, bound_sq) {
             return (c, attempts);
+        }
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn batched_challenges_match_the_sequential_ones() {
+        for n in [1usize, 5, 100, 1024] {
+            let mut a = Transcript::new(b"labinius/test/batch");
+            a.absorb_u64(n as u64);
+            let mut b = a.clone();
+            let seq: Vec<ShortChallenge> = (0..n)
+                .map(|_| sample_short_challenge(&mut a, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+                .collect();
+            let par = sample_short_challenges(&mut b, n, DEFAULT_WEIGHT, DEFAULT_BOUND);
+            assert_eq!(seq, par);
+            assert_eq!(a.sample_b128(b"after", 1), b.sample_b128(b"after", 1));
         }
     }
 }
