@@ -1329,6 +1329,11 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
 /// microseconds from the fold's dispatch to the end of its last task, and the tasks it ran.
 pub static FOLD_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static FOLD_TASKS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Per worker, the microseconds its tasks spent transposing the planes (slice), accumulating
+/// them into the counters (add) and writing counts (output). Diagnostics only.
+pub static FOLD_SLICE_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static FOLD_ADD_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static FOLD_OUT_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 
 /// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/..`.
 pub fn fold_report(workers: usize) -> String {
@@ -1336,7 +1341,13 @@ pub fn fold_report(workers: usize) -> String {
     let w = workers.min(16);
     let ends: Vec<String> = (0..w).map(|i| FOLD_END_US[i].load(Relaxed).to_string()).collect();
     let tasks: Vec<String> = (0..w).map(|i| FOLD_TASKS[i].load(Relaxed).to_string()).collect();
-    format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
+    let sl: Vec<String> = (0..w).map(|i| FOLD_SLICE_US[i].load(Relaxed).to_string()).collect();
+    let ad: Vec<String> = (0..w).map(|i| FOLD_ADD_US[i].load(Relaxed).to_string()).collect();
+    let ou: Vec<String> = (0..w).map(|i| FOLD_OUT_US[i].load(Relaxed).to_string()).collect();
+    format!(
+        " fold_end_us={} fold_tasks={} fold_slice_us={} fold_add_us={} fold_out_us={}",
+        ends.join("/"), tasks.join("/"), sl.join("/"), ad.join("/"), ou.join("/")
+    )
 }
 
 pub fn fold_witness_bitsliced(
@@ -1810,23 +1821,26 @@ mod bitsliced {
             }};
         }
         let mut t: *const u16;
-        macro_rules! two {
-            ($off:expr, $leaf:ident) => {{
-                if PF_AHEAD > 0 {
-                    let fa = planes.add(*t.add($off + PF_AHEAD) as usize) as *const i8;
-                    let fb = planes.add(*t.add($off + 1 + PF_AHEAD) as usize) as *const i8;
-                    _mm_prefetch::<_MM_HINT_T0>(fa);
-                    _mm_prefetch::<_MM_HINT_T0>(fa.add(64));
-                    _mm_prefetch::<_MM_HINT_T0>(fb);
-                    _mm_prefetch::<_MM_HINT_T0>(fb.add(64));
-                }
-                let pa = planes.add(*t.add($off) as usize);
-                let pb = planes.add(*t.add($off + 1) as usize);
+        // Two scheduled offsets, already fetched. This loop is bound by the load ports, not by
+        // the vector ports: an entry costs a 128-byte pair of plane loads plus its own offset,
+        // so the offset load is a third of the pressure and every offset load removed is worth
+        // more than a vector op saved. [`four`] therefore fetches four offsets with one 64-bit
+        // load and splits them in the integer ALUs, leaving the load ports to the planes.
+        macro_rules! two_off {
+            ($oa:expr, $ob:expr, $leaf:ident) => {{
+                let pa = planes.add($oa);
+                let pb = planes.add($ob);
                 let a0 = _mm512_load_si512(pa as *const __m512i);
                 let b0 = _mm512_load_si512(pb as *const __m512i);
                 let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
                 let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
                 ($leaf(&mut s0[0], a0, b0), $leaf(&mut s1[0], a1, b1))
+            }};
+        }
+        macro_rules! two {
+            ($off:expr, $leaf:ident) => {{
+                let w = core::ptr::read_unaligned(t.add($off) as *const u32);
+                two_off!((w & 0xffff) as usize, (w >> 16) as usize, $leaf)
             }};
         }
         macro_rules! level {
@@ -1836,7 +1850,25 @@ mod bitsliced {
                 (csa(&mut s0[$bit], x0, y0), csa(&mut s1[$bit], x1, y1))
             }};
         }
-        macro_rules! four { ($off:expr, $leaf:ident) => { level!(1, two, $off, $leaf) }; }
+        // Four entries from one 64-bit load. Every call site passes a whole `four`-sized group
+        // (the chunk loop's levels and the remainder's binary partial trees of size 4 and up),
+        // so the four contiguous u16 offsets are always in bounds.
+        macro_rules! four {
+            ($off:expr, $leaf:ident) => {{
+                let w = core::ptr::read_unaligned(t.add($off) as *const u64);
+                let (x0, x1) = two_off!(
+                    (w & 0xffff) as usize,
+                    ((w >> 16) & 0xffff) as usize,
+                    $leaf
+                );
+                let (y0, y1) = two_off!(
+                    ((w >> 32) & 0xffff) as usize,
+                    (w >> 48) as usize,
+                    $leaf
+                );
+                (csa(&mut s0[1], x0, y0), csa(&mut s1[1], x1, y1))
+            }};
+        }
         macro_rules! eight { ($off:expr, $leaf:ident) => { level!(2, four, $off, $leaf) }; }
         macro_rules! sixteen { ($off:expr, $leaf:ident) => { level!(3, eight, $off, $leaf) }; }
         macro_rules! thirty_two { ($off:expr, $leaf:ident) => { level!(4, sixteen, $off, $leaf) }; }
@@ -2222,10 +2254,7 @@ mod bitsliced {
         #[cfg(test)] profile: bool,
     ) -> u32 {
         let mut ran = 0u32;
-        #[cfg(test)]
         let mut times = [std::time::Duration::ZERO; 3];
-        #[cfg(not(test))]
-        let _ = worker;
         let zero = _mm512_setzero_si512();
         // Zero everywhere the columns do not write: the guards and the padding pair.
         let mut planes: Vec<__m512i> = Vec::with_capacity(GUARD + GROUP * STRIDE);
@@ -2249,8 +2278,7 @@ mod bitsliced {
             let range = cuts[part]..cuts[part + 1];
             for gi in range.clone() {
                 let group = &groups[gi];
-                #[cfg(test)]
-                let start = profile.then(std::time::Instant::now);
+                let start = std::time::Instant::now();
                 for j in 0..group.columns {
                     let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
                     // What the next call slices: this group's next column, else the next
@@ -2264,10 +2292,8 @@ mod bitsliced {
                     };
                     slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next_src);
                 }
-                #[cfg(test)]
-                if let Some(start) = start { times[0] += start.elapsed(); }
-                #[cfg(test)]
-                let start = profile.then(std::time::Instant::now);
+                times[0] += start.elapsed();
+                let start = std::time::Instant::now();
                 for q in 0..PAIRS {
                     accumulate_pair(
                         planes.as_ptr(),
@@ -2276,16 +2302,13 @@ mod bitsliced {
                         acc.as_mut_ptr().add(2 * q * BITS),
                     );
                 }
-                #[cfg(test)]
-                if let Some(start) = start { times[1] += start.elapsed(); }
+                times[1] += start.elapsed();
             }
-            #[cfg(test)]
-            let start = profile.then(std::time::Instant::now);
+            let start = std::time::Instant::now();
             if FUSED {
                 let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
                 write_acc(acc.as_ptr(), bias, output);
-                #[cfg(test)]
-                if let Some(start) = start { times[2] += start.elapsed(); }
+                times[2] += start.elapsed();
                 continue;
             }
             for s in 0..SLOTS {
@@ -2305,8 +2328,7 @@ mod bitsliced {
                     None => {
                         let next_buf = free.lock().unwrap().pop().unwrap_or_else(uninit_counts);
                         *slot = Some(core::mem::replace(&mut counts, next_buf));
-                        #[cfg(test)]
-                        if let Some(start) = start { times[2] += start.elapsed(); }
+                        times[2] += start.elapsed();
                         continue;
                     }
                     Some(first) => first,
@@ -2314,13 +2336,18 @@ mod bitsliced {
             };
             write_counts(&counts, Some(&first), bias, output);
             free.lock().unwrap().push(first);
-            #[cfg(test)]
-            if let Some(start) = start { times[2] += start.elapsed(); }
+            times[2] += start.elapsed();
         }
         #[cfg(test)]
         if profile {
             eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
                 worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
+        }
+        if worker < 16 {
+            use std::sync::atomic::Ordering::Relaxed;
+            super::FOLD_SLICE_US[worker].store(times[0].as_micros() as u32, Relaxed);
+            super::FOLD_ADD_US[worker].store(times[1].as_micros() as u32, Relaxed);
+            super::FOLD_OUT_US[worker].store(times[2].as_micros() as u32, Relaxed);
         }
         ran
     }

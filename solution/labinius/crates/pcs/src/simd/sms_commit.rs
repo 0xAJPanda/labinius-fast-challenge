@@ -787,12 +787,15 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                 }
             }
         }
+        let t_slice = std::time::Instant::now();
         for h in 0..LOCK {
             let cols16: [*const B128; 16] = core::array::from_fn(|l| {
                 if l < g { cols[l].as_ptr().add(8 * (b + h)) } else { ZERO8.as_ptr() }
             });
             crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut ws.idx[h]);
         }
+        SMS_SLICE_NS.fetch_add(t_slice.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let t_work = std::time::Instant::now();
         let ins: [&BinaryIndex32; LOCK] = core::array::from_fn(|h| &ws.idx[h]);
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
         // A chunk's first step cancels its public mean in the NTT domain.
@@ -818,6 +821,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         } else {
             vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
         }
+        SMS_WORK_NS.fetch_add(t_work.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let t_rec = std::time::Instant::now();
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
         let (e, cph) = (b + LOCK, chunks_per_half(np));
         let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
@@ -834,6 +839,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
             }
 
         }
+        SMS_RECON_NS.fetch_add(t_rec.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     match out {
         RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
@@ -877,6 +883,13 @@ pub static DECOUPLED_PAIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// When (microseconds into the commitment, shifted by 4) and by which waiting worker (low 4 bits)
 /// each pair decoupled.
 pub static DECOUPLED_AT: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Diagnostics of the group loop, summed over all workers in nanoseconds: the witness slicing
+/// (GHASH words to `F162` digits), the transform with its accumulation sink (including the
+/// sibling sync) and the chunk reconstruction (inverse transform, digit banks, rows).
+pub static SMS_SLICE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMS_WORK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMS_RECON_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn ns_get(a: &std::sync::atomic::AtomicU64) -> u64 { a.load(std::sync::atomic::Ordering::Relaxed) / 1000 }
 
 /// The diagnostics above as ` sms_end_us=a/b/.. sms_groups=a/b/.. sms_decoupled=n`.
 pub fn worker_report(workers: usize) -> String {
@@ -886,7 +899,12 @@ pub fn worker_report(workers: usize) -> String {
     let groups: Vec<String> = (0..w).map(|i| WORKER_GROUPS[i].load(Relaxed).to_string()).collect();
     let nd = (DECOUPLED_PAIRS.load(Relaxed) as usize).min(16);
     let at: Vec<String> = (0..nd).map(|i| { let v = DECOUPLED_AT[i].load(Relaxed); format!("{}@{}", v & 15, v >> 4) }).collect();
-    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"))
+    format!(
+        " sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} \
+         sms_slice_us={} sms_work_us={} sms_recon_us={}",
+        ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"),
+        ns_get(&SMS_SLICE_NS), ns_get(&SMS_WORK_NS), ns_get(&SMS_RECON_NS)
+    )
 }
 
 /// The commitment on sibling pairs: hyperthreads `2k`, `2k + 1` (placed on core `k`) take
