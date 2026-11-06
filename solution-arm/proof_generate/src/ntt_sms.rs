@@ -17,7 +17,7 @@
 //! a matrix below [`MIN_MARGIN`] standard deviations (as the x86 build does). Everything else is
 //! exact.
 use super::*;
-use crate::ntt::{centered, for_blocks, front_transform_bound, primes, FRONT_SCHEDULES};
+use crate::ntt::{centered, for_blocks, front_transform_bound, FRONT_SCHEDULES};
 
 #[path = "sms_lattice.rs"]
 #[allow(dead_code)]
@@ -696,26 +696,46 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
             });
-            let lanes: Vec<[i32; 4]> =
-                acc.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let devs: Vec<[i32; 4]> = dev.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let plan = &primes()[PB];
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                let mut residues = [0u32; N];
-                for (slot, value) in residues.iter_mut().enumerate() {
-                    *value = lanes[idx(slot, 0) + c / 4][c % 4].rem_euclid(P1 as i32) as u32;
-                }
-                plan.inverse(&mut residues);
-                let mut tail: Vec<i64> = a.mu.iter().map(|&v| v as i64).collect();
-                let mut e = [0i64; N];
-                for d in 0..DIGITS {
-                    for (k, v) in e.iter_mut().enumerate() {
-                        *v = devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+            // The base row of all eight columns through one vector inverse transform (row 0 is
+            // reduced, `|v| <= p`, by `sums`): centered residues out, then `[0, p)` for the CRT,
+            // the values `Prime::inverse` gives per column.
+            narrow(&acc, 0, &mut y);
+            super::inverse::<PB>(&mut y);
+            let pv = vdupq_n_s16(p);
+            let mut base = [[0u16; LANES]; N];
+            for (k, b) in base.iter_mut().enumerate() {
+                let v = y[k];
+                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+            }
+            // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]) for the eight columns at once.
+            let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
+            let mut tail = [[0i64; LANES]; N];
+            for (t, &mu) in tail.iter_mut().zip(a.mu.iter()) {
+                *t = [mu as i64; LANES];
+            }
+            for d in 0..DIGITS {
+                let (u, v) = lattice::WEIGHTS[d];
+                let (u, v) = (u as i64, v as i64);
+                let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+                for k in 0..N / 2 {
+                    for c in 0..LANES {
+                        let x = e(k, c);
+                        tail[k][c] += u * x;
+                        tail[k + N / 2][c] += v * x;
                     }
-                    add_weighted(&mut tail, d, &e);
                 }
+                for k in N / 2..N {
+                    for c in 0..LANES {
+                        let x = e(k, c);
+                        tail[k - N / 2][c] -= v * x;
+                        tail[k][c] += (u + v) * x;
+                    }
+                }
+            }
+            for (c, column) in target.chunks_exact_mut(N).enumerate() {
                 for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(residues[k], tail[k].rem_euclid(TAIL as i64) as u32);
+                    *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
                 }
             }
         }
