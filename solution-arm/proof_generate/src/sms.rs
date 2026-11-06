@@ -3,13 +3,14 @@
 //! unlike hybrid.rs, this is a statistical guarantee for fresh uniform tables.
 use crate::ntt::{self, N, centered, for_blocks};
 use labinius::fields::scalar::B128;
+use std::borrow::Cow;
 pub const P:i64=9721;
 pub const TAIL:i64=1<<22;
 pub const MODULUS:u128=P as u128*TAIL as u128;
 pub const DIGITS:usize=6;
 pub const STREAMS:usize=DIGITS+1;
 pub const CHUNK:usize=64;
-pub struct Chunk {pub elements:usize,pub data:Vec<i16>,pub means:Vec<i32>,pub margin:f64}
+pub struct Chunk {pub elements:usize,pub data:Cow<'static,[i16]>,pub sums:Cow<'static,[i32]>,pub margin:f64}
 impl Chunk {pub fn key(&self,b:usize,j:usize,s:usize)->&[i16] {&self.data[((b*N+j)*STREAMS+s)*8..][..8]}}
 pub struct Matrix {pub elements:usize,pub chunks:Vec<Chunk>}
 pub fn digits(mut x:i64)->[i8;DIGITS] {
@@ -33,11 +34,11 @@ fn moments(l:&[i8;N],s1:&mut [i64;N],s2:&mut [i64;N]) {
     }
 }
 pub fn matrix(elements:usize,workers:usize)->Matrix {
-    let mut chunks:Vec<Chunk>=(0..elements.div_ceil(CHUNK)).map(|c|Chunk {elements:(elements-c*CHUNK).min(CHUNK),data:Vec::new(),means:Vec::new(),margin:f64::INFINITY}).collect();
+    let mut chunks:Vec<Chunk>=(0..elements.div_ceil(CHUNK)).map(|c|Chunk {elements:(elements-c*CHUNK).min(CHUNK),data:Vec::new().into(),sums:Vec::new().into(),margin:f64::INFINITY}).collect();
     for_blocks(&mut chunks,1,1,workers,|first,blocks| {
         for (ci,chunk) in blocks.iter_mut().enumerate() {
             let start=(first+ci)*CHUNK;
-            chunk.data=vec![0i16;chunk.elements.div_ceil(8)*N*STREAMS*8];
+            let mut data=vec![0i16;chunk.elements.div_ceil(8)*N*STREAMS*8];
             let mut s1=vec![[0i64;N];DIGITS];let mut s2=s1.clone();
             let mut coeff=vec![[0u128;N];8];let mut ds=vec![[[0i8;DIGITS];N];8];
             for base in (0..chunk.elements).step_by(8) {
@@ -55,15 +56,17 @@ pub fn matrix(elements:usize,workers:usize)->Matrix {
                         lanes[j][e]=if stream==0 {centered((coeff[e][j]%P as u128) as i64,P as u32)} else {ds[e][j][stream-1] as i16};
                     }}
                     ntt::transform_lanes(1,lanes.as_mut_slice().try_into().unwrap(),count);
-                    for e in 0..count {for j in 0..N {chunk.data[((base/8*N+j)*STREAMS+stream)*8+e]=centered(lanes[j][e] as i64,P as u32);}}
+                    for e in 0..count {for j in 0..N {data[((base/8*N+j)*STREAMS+stream)*8+e]=centered(lanes[j][e] as i64,P as u32);}}
                 }
             }
-            chunk.means=vec![0i32;DIGITS*N];
+            let mut sums=vec![0i32;DIGITS*N];
             for d in 0..DIGITS {for j in 0..N {
-                let mean=s1[d][j].div_euclid(2);chunk.means[d*N+j]=mean as i32;
+                // Retain the exact sum so each column can center at its observed density.
+                sums[d*N+j]=i32::try_from(s1[d][j]).unwrap();
                 if s2[d][j]!=0 {chunk.margin=chunk.margin.min(4859.0/(s2[d][j] as f64/4.0).sqrt());}
             }}
             assert!(chunk.margin>=8.5,"insufficient reconstruction margin: {}",chunk.margin);
+            chunk.data=data.into();chunk.sums=sums.into();
         }
     });
     eprintln!("sms digits={DIGITS} chunk={CHUNK} min_margin={:.3}",chunks.iter().map(|c|c.margin).fold(f64::INFINITY,f64::min));
@@ -104,6 +107,19 @@ pub fn commit(values:&[B128],a:&Matrix,workers:usize)->Vec<u128> {
             let values:Vec<B128>=(0..4*elements*9).map(|_| {
                 let lo=ntt::tests::xorshift(&mut s);let hi=ntt::tests::xorshift(&mut s);B128(lo as u128|((hi as u128)<<64))
             }).collect();
+            let raw=crate::rq::ajtai_matrix(MODULUS,elements);
+            assert_eq!(commit(&values,&a,2),crate::commit_reference(&values,&raw,MODULUS));
+        }
+    }
+    #[test] fn density_extremes_match_reference() {
+        for elements in [1,3,65] {
+            let a=matrix(elements,2);
+            let mut values=vec![B128(0);4*elements*5];
+            values[4*elements..8*elements].fill(B128(u128::MAX));
+            values[8*elements]=B128(1);
+            values[16*elements-1]=B128(1<<127);
+            values[16*elements..].fill(B128(u128::MAX));
+            values[16*elements]=B128(u128::MAX-1);
             let raw=crate::rq::ajtai_matrix(MODULUS,elements);
             assert_eq!(commit(&values,&a,2),crate::commit_reference(&values,&raw,MODULUS));
         }

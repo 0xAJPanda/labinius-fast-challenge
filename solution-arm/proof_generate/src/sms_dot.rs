@@ -1,5 +1,10 @@
 //! SVE halfword dot products, four ring elements per i64 accumulator lane.
 use super::*;
+const _: () = {
+    let bound=super::super::transform_bound(PRIMES[1],SCHEDULES[1]) as u64;
+    assert!(8*bound*4860 < i32::MAX as u64);
+    assert!(4096*bound*4860 < (1u64<<41));
+};
 #[inline(always)]
 unsafe fn pack(a:int16x8_t,b:int16x8_t,c:int16x8_t,d:int16x8_t)->[int16x8_t;4] {
     let ab0=vreinterpretq_s32_s16(vzip1q_s16(a,b));
@@ -15,6 +20,7 @@ unsafe fn dot(acc:&mut [int64x2_t],a:[int16x8_t;4],b:[int16x8_t;4],key:int16x8_t
     let k0=vreinterpretq_s16_s64(vdupq_laneq_s64::<0>(vreinterpretq_s64_s16(key)));
     let k1=vreinterpretq_s16_s64(vdupq_laneq_s64::<1>(vreinterpretq_s64_s16(key)));
     let(mut s0,mut s1,mut s2,mut s3)=(acc[0],acc[1],acc[2],acc[3]);
+    #[cfg(target_feature="sve")]
     core::arch::asm!(
         "sdot z0.d, z4.h, z12.h", "sdot z1.d, z5.h, z12.h",
         "sdot z2.d, z6.h, z12.h", "sdot z3.d, z7.h, z12.h",
@@ -26,6 +32,18 @@ unsafe fn dot(acc:&mut [int64x2_t],a:[int16x8_t;4],b:[int16x8_t;4],key:int16x8_t
         in("v12") k0, in("v13") k1,
         options(pure,nomem,nostack,preserves_flags)
     );
+    #[cfg(not(target_feature="sve"))]
+    {
+        let term=|x:int16x8_t,k:int16x8_t| {
+            let lo=vmull_s16(vget_low_s16(x),vget_low_s16(k));
+            let hi=vmull_high_s16(x,k);
+            vpaddlq_s32(vpaddq_s32(lo,hi))
+        };
+        s0=vaddq_s64(s0,vaddq_s64(term(a[0],k0),term(b[0],k1)));
+        s1=vaddq_s64(s1,vaddq_s64(term(a[1],k0),term(b[1],k1)));
+        s2=vaddq_s64(s2,vaddq_s64(term(a[2],k0),term(b[2],k1)));
+        s3=vaddq_s64(s3,vaddq_s64(term(a[3],k0),term(b[3],k1)));
+    }
     acc[..4].copy_from_slice(&[s0,s1,s2,s3]);
 }
 pub(super) unsafe fn tile(chunk:&crate::sms::Chunk,batch:usize,x:&[[int16x8_t;N]],acc:&mut [int64x2_t]) {
@@ -58,7 +76,7 @@ pub(super) unsafe fn inverse(stream:usize,acc:&[int64x2_t],x:&mut [int16x8_t;N])
         use std::hint::black_box;
         let s=crate::sms::STREAMS;
         let key:Vec<i16>=(0..N*s*8).map(|i|((i*1337+7)%9721)as i16-4860).collect();
-        let chunk=crate::sms::Chunk{elements:8,data:key,means:vec![],margin:0.0};
+        let chunk=crate::sms::Chunk{elements:8,data:key.into(),sums:vec![].into(),margin:0.0};
         let x:Vec<[int16x8_t;N]>=(0..8).map(|e|core::array::from_fn(|j| {
             let v:[i16;8]=core::array::from_fn(|c|((j*199+c*117+e*31)%9721)as i16-4860);vld1q_s16(v.as_ptr())
         })).collect();

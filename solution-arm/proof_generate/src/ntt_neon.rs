@@ -812,6 +812,11 @@ pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128>
             acc.fill(z32);low.fill([0;8]);let here=target.len()/N;
             let words:[(*const u8,usize);8]=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
             for (ci,chunk) in a.chunks.iter().enumerate() {
+                let counts:[i64;8]=core::array::from_fn(|c| {
+                    if c>=here {return 0;}
+                    let start=(first+batch*8+c)*len+4*ci*CHUNK;
+                    values[start..start+4*chunk.elements].iter().map(|v|v.0.count_ones() as i64).sum()
+                });
                 for j in 0..N {for s in 1..STREAMS {let at=4*(j*STREAMS+s);acc[at..at+4].fill(z32);}}
                 for base in (0..chunk.elements).step_by(8) {
                     let count=(chunk.elements-base).min(8);
@@ -826,8 +831,9 @@ pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128>
                 for d in 0..DIGITS {
                     sms_dot::inverse(d+1,&acc,&mut inv);
                     for j in 0..N {
-                        let residues:[i16;8]=core::mem::transmute(inv[j]);let mean=chunk.means[d*N+j] as i64;
+                        let residues:[i16;8]=core::mem::transmute(inv[j]);let sum=chunk.sums[d*N+j] as i64;
                         for c in 0..here {
+                            let mean=(sum*counts[c]).div_euclid((512*chunk.elements) as i64);
                             let delta=(residues[c] as i64-mean+P/2).rem_euclid(P)-P/2;
                             low[j][c]=(low[j][c]+((mean+delta)<<(4*d)))&(TAIL-1);
                         }
