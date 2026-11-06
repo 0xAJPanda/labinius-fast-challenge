@@ -1,15 +1,17 @@
-//! The portable track's prover: the same CLI, transcript, and proof bytes as the x86 track's
-//! `labinius-fast`, computed without AVX-512.
+//! The ARM track's prover: the CLI, transcript and proof format of the x86 track's `labinius-fast`,
+//! computed without AVX-512.
 //!
-//! The commitment `C_j = A W_j` is computed directly in `R_Q` rather than through the library's
-//! per-prime NTT kernels. A witness ring element is binary, so `A_m W_{j,m}` is a sum of shifted
-//! copies of `A_m`; grouping eight consecutive coefficients turns each group into one lookup of a
-//! 256-entry table of precomputed partial sums (the "four Russians" trick). The field switch,
-//! row evaluation, and fold follow the checker's reference prover.
+//! The default commitment modulus is `Q = 3889 * 9721 * 17497` ([`ntt::MODULUS`]). Every factor is
+//! `1 mod 1944`, so the commitment `C_j = A W_j` is computed per prime through number-theoretic
+//! transforms of `R_648` and recombined by the Chinese remainder theorem ([`ntt`]). Any other
+//! modulus the checker accepts takes the earlier paths: below [`FAST_MODULUS`] a binary witness
+//! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
+//! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
+//! product. The field switch, row evaluation, and fold follow the checker's reference prover.
+mod ntt;
 #[allow(dead_code)]
 mod rq;
 
-use bincode::Options;
 use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
 use labinius::fields::{
@@ -30,8 +32,8 @@ const COLUMN_LEN: usize = 1 << ROW_LOG;
 const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 const LIMIT: u64 = 64 * 1024 * 1024;
 const MIN_MODULUS: u128 = 34_816_965_049;
-/// The x86 track's default, so both tracks write the same proof for the same seed.
-const MODULUS: u128 = 40_772_829_184;
+/// The default commitment modulus: the product of the three transform primes.
+const MODULUS: u128 = ntt::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
 const GROUP: usize = 8;
@@ -45,6 +47,15 @@ const RAW: usize = (GROUPS - 1) * GROUP + ROW;
 /// Largest modulus [`commit`]'s `u64` accumulator holds: a raw coefficient sums at most
 /// `WITNESS_COEFFICIENTS * RING_ELEMENTS = 2^21` residues below `Q`.
 const FAST_MODULUS: u128 = 1 << 43;
+/// Raw coefficients [`commit`] sums in registers per pass over a column's groups.
+const BLOCK: usize = 32;
+/// A table row stored between a block of zeros on either side, so that every block-sized
+/// window a group can reach reads in bounds, zeros outside the row.
+const PADDED: usize = BLOCK + ROW + BLOCK;
+/// Output blocks per column, covering the raw product.
+const BLOCKS: usize = RAW.div_ceil(BLOCK);
+/// How many blocks ahead [`add_block`] prefetches each group's table window; 0 disables it.
+const PREFETCH_BLOCKS: usize = 1;
 
 #[derive(Serialize)]
 struct Proof {
@@ -58,7 +69,9 @@ struct Proof {
     folded: Vec<u8>,
 }
 
-fn codec() -> impl Options {
+#[cfg(test)]
+fn codec() -> impl bincode::Options {
+    use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(LIMIT)
@@ -85,20 +98,40 @@ fn parse_modulus(text: &str) -> Result<u128, String> {
 }
 
 fn threads() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get())
+    labinius::par::threads()
 }
 
+/// The witness table, read by the workers in contiguous slices straight into the words it is
+/// used as (little-endian `u128`, the file's encoding), so the pages are filled in parallel and
+/// the bytes are copied once.
 fn read_table(path: &str) -> Vec<B128> {
-    let bytes = std::fs::read(path).expect("read witness table");
-    assert_eq!(
-        bytes.len(),
-        (1 << LOG_VARS) / 8,
-        "witness table has the wrong length"
-    );
-    bytes
-        .chunks_exact(16)
-        .map(|chunk| B128(u128::from_le_bytes(chunk.try_into().unwrap())))
-        .collect()
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path).expect("read witness table");
+    let len = file.metadata().expect("read witness table").len();
+    assert_eq!(len, (1u64 << LOG_VARS) / 8, "witness table has the wrong length");
+    let n = (1usize << LOG_VARS) / 128;
+    let mut words = vec![0u128; n];
+    let per = n.div_ceil(threads());
+    std::thread::scope(|scope| {
+        for (i, chunk) in words.chunks_mut(per).enumerate() {
+            let file = &file;
+            scope.spawn(move || {
+                // SAFETY: the bytes of initialized `u128`s; every pattern is a valid `u128`.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(chunk.as_mut_ptr() as *mut u8, 16 * chunk.len())
+                };
+                file.read_exact_at(bytes, (16 * per * i) as u64)
+                    .expect("read witness table");
+            });
+        }
+    });
+    #[cfg(target_endian = "big")]
+    for w in words.iter_mut() {
+        *w = u128::from_le(*w);
+    }
+    let mut words = std::mem::ManuallyDrop::new(words);
+    // SAFETY: `B128` is `repr(transparent)` over `u128`: same size, alignment and validity.
+    unsafe { Vec::from_raw_parts(words.as_mut_ptr() as *mut B128, words.len(), words.capacity()) }
 }
 
 fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
@@ -113,16 +146,78 @@ fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
 
 /// The table of group `pattern`s for ring element `element` of `A`: row `s` is the sum of
 /// `A_m X^r` over the set bits `r` of `s`. Each row is a previous row plus one shifted copy.
+/// Row `s` occupies `table[s * PADDED..][..PADDED]` with its `ROW` coefficients from `BLOCK`.
+/// The table starts zeroed and only the coefficients are written, so row 0 and the padding
+/// stay zero; each row is written in one pass from the previous one.
 fn build_table(table: &mut [u64], element: &[u64]) {
-    table[..ROW].fill(0);
     for s in 1usize..1 << GROUP {
         let r = s.ilog2() as usize;
-        let (done, rest) = table.split_at_mut(s * ROW);
-        let row = &mut rest[..ROW];
-        row.copy_from_slice(&done[(s & !(1 << r)) * ROW..][..ROW]);
-        for (slot, &a) in row[r..r + rq::N].iter_mut().zip(element) {
-            *slot += a;
+        let (done, rest) = table.split_at_mut(s * PADDED);
+        let src = &done[(s & !(1 << r)) * PADDED + BLOCK..][..ROW];
+        let dst = &mut rest[BLOCK..BLOCK + ROW];
+        dst[..r].copy_from_slice(&src[..r]);
+        for ((d, &x), &a) in dst[r..r + rq::N].iter_mut().zip(&src[r..r + rq::N]).zip(element) {
+            *d = x + a;
         }
+        dst[r + rq::N..].copy_from_slice(&src[r + rq::N..]);
+    }
+}
+
+/// The groups whose shifted rows reach output block `b`: group `g` adds row coefficient `i - 8g`
+/// to output coefficient `i`, nonzero for `0 <= i - 8g < ROW`.
+const fn group_range(b: usize) -> (usize, usize) {
+    let first = b * BLOCK;
+    let lo = if first + 1 > ROW { (first + 1 - ROW).div_ceil(GROUP) } else { 0 };
+    let hi = (first + BLOCK - 1) / GROUP;
+    (lo, if hi < GROUPS - 1 { hi } else { GROUPS - 1 })
+}
+
+/// `acc += sum_g table[start_g + first..][..BLOCK]` for output block `b` of one column, with
+/// `start_g` the padded row of group `g`'s pattern moved back by its shift `8g`; the block's
+/// sums stay in registers across the groups.
+#[inline(always)]
+fn add_block(acc: &mut [u64], table: &[u64], starts: &[usize; GROUPS], b: usize) {
+    let (lo, hi) = group_range(b);
+    let first = b * BLOCK;
+    let out: &mut [u64; BLOCK] = (&mut acc[first..first + BLOCK]).try_into().unwrap();
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let mut sum: [uint64x2_t; BLOCK / 2] =
+            core::array::from_fn(|i| vld1q_u64(out.as_ptr().add(2 * i)));
+        for &start in &starts[lo..=hi] {
+            let at = start.wrapping_add(first);
+            if PREFETCH_BLOCKS > 0 {
+                // The same row's window `PREFETCH_BLOCKS` blocks on; a hint, never a fault.
+                let ahead = table.as_ptr().wrapping_add(at + PREFETCH_BLOCKS * BLOCK);
+                for line in 0..BLOCK / 8 {
+                    core::arch::asm!(
+                        "prfm pldl1keep, [{p}]",
+                        p = in(reg) ahead.wrapping_add(8 * line),
+                        options(nostack, preserves_flags, readonly)
+                    );
+                }
+            }
+            let row: &[u64; BLOCK] = table[at..at + BLOCK].try_into().unwrap();
+            for (i, s) in sum.iter_mut().enumerate() {
+                *s = vaddq_u64(*s, vld1q_u64(row.as_ptr().add(2 * i)));
+            }
+        }
+        for (i, s) in sum.iter().enumerate() {
+            vst1q_u64(out.as_mut_ptr().add(2 * i), *s);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = *out;
+        for &start in &starts[lo..=hi] {
+            let at = start.wrapping_add(first);
+            let row: &[u64; BLOCK] = table[at..at + BLOCK].try_into().unwrap();
+            for (s, &x) in sum.iter_mut().zip(row) {
+                *s += x;
+            }
+        }
+        *out = sum;
     }
 }
 
@@ -162,7 +257,15 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 
 /// Every column's commitment, flattened. Columns go out over the cores; each worker walks the
 /// ring elements once, building that element's table and applying it to all of its columns.
+/// Per column the raw product is summed block by block: each `BLOCK` of output coefficients
+/// takes the slices of every group's table row that land on it while the block's sums stay in
+/// registers, so the accumulator is read and written once per block instead of once per group.
+///
+/// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
+    if modulus == ntt::MODULUS {
+        return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
+    }
     let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
     if modulus >= FAST_MODULUS {
         return commit_reference(values, &matrix, modulus);
@@ -176,27 +279,24 @@ fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
             let matrix = &matrix;
             scope.spawn(move || {
                 let count = block.len() / rq::N;
-                let mut table = vec![0u64; ROW << GROUP];
-                let mut raw = vec![0u64; count * RAW];
+                let mut table = vec![0u64; PADDED << GROUP];
+                let width = BLOCKS * BLOCK;
+                let mut raw = vec![0u64; count * width];
                 for (m, element) in matrix.chunks_exact(rq::N).enumerate() {
                     build_table(&mut table, element);
-                    for (c, acc) in raw.chunks_exact_mut(RAW).enumerate() {
+                    for (c, acc) in raw.chunks_exact_mut(width).enumerate() {
                         let base = (first + c) * COLUMN_LEN + 4 * m;
                         let words: [u128; 4] = core::array::from_fn(|k| values[base + k].0);
-                        for g in 0..GROUPS {
-                            let s = pattern(&words, g);
-                            if s == 0 {
-                                continue;
-                            }
-                            let row = &table[s * ROW..][..ROW];
-                            for (slot, &t) in acc[g * GROUP..][..ROW].iter_mut().zip(row) {
-                                *slot += t;
-                            }
+                        let starts: [usize; GROUPS] = core::array::from_fn(|g| {
+                            (pattern(&words, g) * PADDED + BLOCK).wrapping_sub(GROUP * g)
+                        });
+                        for b in 0..BLOCKS {
+                            add_block(acc, &table, &starts, b);
                         }
                     }
                 }
-                for (target, acc) in block.chunks_exact_mut(rq::N).zip(raw.chunks_exact(RAW)) {
-                    target.copy_from_slice(&reduce(acc, q));
+                for (target, acc) in block.chunks_exact_mut(rq::N).zip(raw.chunks_exact(width)) {
+                    target.copy_from_slice(&reduce(&acc[..RAW], q));
                 }
             });
         }
@@ -206,17 +306,19 @@ fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
 
 /// The checker's schoolbook commitment, for a modulus too wide for [`commit`]'s `u64` lanes.
 fn commit_reference(values: &[B128], matrix: &[u128], modulus: u128) -> Vec<u128> {
-    let per = COLUMNS.div_ceil(threads());
-    let mut out = vec![0u128; COLUMNS * rq::N];
+    let column_len = 4 * (matrix.len() / rq::N);
+    let columns = values.len() / column_len;
+    let per = columns.div_ceil(threads());
+    let mut out = vec![0u128; columns * rq::N];
     std::thread::scope(|scope| {
         for (block, columns) in out
             .chunks_mut(per * rq::N)
-            .zip(values.chunks(per * COLUMN_LEN))
+            .zip(values.chunks(per * column_len))
         {
             scope.spawn(move || {
                 for (target, column) in block
                     .chunks_mut(rq::N)
-                    .zip(columns.chunks_exact(COLUMN_LEN))
+                    .zip(columns.chunks_exact(column_len))
                 {
                     let witness: Vec<F162> = column.iter().map(|&x| F162::from_b128(x)).collect();
                     target.copy_from_slice(&rq::commit_binary_column(matrix, &witness, modulus));
@@ -311,7 +413,96 @@ fn fold_element(values: &[B128], challenges: &[ShortChallenge], m: usize) -> Rin
     element
 }
 
+/// [`fold_element`] in narrow lanes: a raw coefficient gains at most one `+-1` per challenge
+/// term, so `sum_j weight_j <= i16::MAX` bounds every `i16` sum, and the latest columns are
+/// summed in `i8` lanes, sixteen to a vector, until their terms could reach `i8::MAX`. A column's
+/// bits become `0 / -1` byte masks in coefficient order; the ring reduction runs in `i32`.
+fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize) -> RingElement648 {
+    let mut raw = [0i16; 2 * rq::N];
+    let mut near = [0i8; 2 * rq::N];
+    let mut pending = 0usize;
+    let mut mask = [0i8; WITNESS_COEFFICIENTS];
+    for (j, challenge) in challenges.iter().enumerate() {
+        if pending + challenge.weight > i8::MAX as usize {
+            flush(&mut raw, &mut near);
+            pending = 0;
+        }
+        pending += challenge.weight;
+        expand_mask(&values[j * COLUMN_LEN + 4 * m..][..4], &mut mask);
+        for t in 0..challenge.weight {
+            let position = challenge.positions[t] as usize;
+            let negative = ((challenge.signs >> t) & 1 == 1) ^ (position % 2 == 1);
+            let window = &mut near[4 * position..][..WITNESS_COEFFICIENTS];
+            if negative {
+                for (slot, &b) in window.iter_mut().zip(&mask) {
+                    *slot = slot.wrapping_add(b);
+                }
+            } else {
+                for (slot, &b) in window.iter_mut().zip(&mask) {
+                    *slot = slot.wrapping_sub(b);
+                }
+            }
+        }
+    }
+    flush(&mut raw, &mut near);
+    let mut wide = [0i32; 2 * rq::N];
+    for (w, &r) in wide.iter_mut().zip(&raw) {
+        *w = r as i32;
+    }
+    for k in (rq::N..2 * rq::N - 1).rev() {
+        let value = wide[k];
+        wide[k - rq::SPLIT] += value;
+        wide[k - rq::N] -= value;
+    }
+    let mut element = RingElement648::zero(Representation::Coefficients);
+    for (slot, &value) in element.v.iter_mut().zip(&wide[..rq::N]) {
+        *slot = i16::try_from(value).expect("a fold coefficient does not fit the wire codec");
+    }
+    element
+}
+
+/// `raw += near`, then `near = 0`.
+#[inline(always)]
+fn flush(raw: &mut [i16; 2 * rq::N], near: &mut [i8; 2 * rq::N]) {
+    for (r, n) in raw.iter_mut().zip(near.iter_mut()) {
+        *r = r.wrapping_add(*n as i16);
+        *n = 0;
+    }
+}
+
+/// `mask[4p + k] = -1` where bit `p` of `words[k]` is set, else `0`: witness coefficient order.
+#[inline(always)]
+fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
+    assert_eq!(words.len(), 4);
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let bits = vld1q_u8(bits.as_ptr());
+        let w: [uint8x16_t; 4] = core::array::from_fn(|k| vld1q_u8(words.as_ptr().add(k) as *const u8));
+        // Chunk c holds bits 16c..16c+16 of each word: bytes 2c and 2c+1, each spread over
+        // eight lanes and tested bit by bit, then interleaved word by word.
+        for c in 0..8u8 {
+            let idx = vcombine_u8(vdup_n_u8(2 * c), vdup_n_u8(2 * c + 1));
+            let v = uint8x16x4_t(
+                vtstq_u8(vqtbl1q_u8(w[0], idx), bits),
+                vtstq_u8(vqtbl1q_u8(w[1], idx), bits),
+                vtstq_u8(vqtbl1q_u8(w[2], idx), bits),
+                vtstq_u8(vqtbl1q_u8(w[3], idx), bits),
+            );
+            vst4q_u8(mask.as_mut_ptr().add(64 * c as usize) as *mut u8, v);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for (k, w) in words.iter().enumerate() {
+        for p in 0..128 {
+            mask[4 * p + k] = -(((w.0 >> p) & 1) as i8);
+        }
+    }
+}
+
 fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    let narrow = challenges.iter().map(|c| c.weight).sum::<usize>() <= i16::MAX as usize;
     let per = RING_ELEMENTS.div_ceil(threads());
     let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
         .map(|_| RingElement648::zero(Representation::Coefficients))
@@ -320,7 +511,11 @@ fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
         for (block, base) in out.chunks_mut(per).zip((0..).step_by(per)) {
             scope.spawn(move || {
                 for (i, slot) in block.iter_mut().enumerate() {
-                    *slot = fold_element(values, challenges, base + i);
+                    *slot = if narrow {
+                        fold_element_narrow(values, challenges, base + i)
+                    } else {
+                        fold_element(values, challenges, base + i)
+                    };
                 }
             });
         }
@@ -329,13 +524,54 @@ fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
 }
 
 fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 * rq::N * folded.elements().len());
-    for e in folded.elements() {
-        for &c in &e.v {
-            out.extend_from_slice(&(c as i32).to_le_bytes());
+    let elements = folded.elements();
+    let mut out = vec![0u8; 4 * rq::N * elements.len()];
+    for (chunk, e) in out.chunks_exact_mut(4 * rq::N).zip(elements) {
+        for (slot, &c) in chunk.chunks_exact_mut(4).zip(&e.v) {
+            slot.copy_from_slice(&(c as i32).to_le_bytes());
         }
     }
     out
+}
+
+impl Proof {
+    /// The proof's bincode encoding under [`codec`]'s options (fixed-width little-endian
+    /// integers, `u64` sequence lengths, arrays without one), written field by field with
+    /// whole-slice copies; serde would hand bincode the byte vectors one `u8` at a time.
+    fn encode(&self) -> Vec<u8> {
+        let size = 4
+            + 16
+            + (8 + self.commitment.len())
+            + (8 + 16 * self.partials.len())
+            + (8 + 48 * self.rounds.len())
+            + 24
+            + (8 + self.row.len())
+            + (8 + self.folded.len());
+        assert!(size as u64 <= LIMIT, "serialize proof: the proof exceeds the size limit");
+        let mut out = Vec::with_capacity(size);
+        let len = |out: &mut Vec<u8>, n: usize| out.extend_from_slice(&(n as u64).to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.extend_from_slice(&self.modulus.to_le_bytes());
+        len(&mut out, self.commitment.len());
+        out.extend_from_slice(&self.commitment);
+        len(&mut out, self.partials.len());
+        for p in &self.partials {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
+        len(&mut out, self.rounds.len());
+        for x in self.rounds.iter().flatten().flatten() {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        for x in &self.opened {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        len(&mut out, self.row.len());
+        out.extend_from_slice(&self.row);
+        len(&mut out, self.folded.len());
+        out.extend_from_slice(&self.folded);
+        assert_eq!(out.len(), size);
+        out
+    }
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
@@ -415,7 +651,7 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
-    let bytes = codec().serialize(&proof).expect("serialize proof");
+    let bytes = proof.encode();
     std::fs::write(&args[2], bytes).expect("write proof");
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
@@ -441,10 +677,68 @@ mod tests {
             .collect()
     }
 
-    /// The table lookup agrees with the checker's coefficient-by-coefficient commitment.
+    /// The direct encoding is byte for byte bincode's under the proof codec.
+    #[test]
+    fn encoding_matches_bincode() {
+        use bincode::Options;
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for n in [0usize, 1, 3, 300] {
+            let proof = Proof {
+                version: next() as u32,
+                modulus: (next() as u128) << 64 | next() as u128,
+                commitment: (0..n).map(|_| next() as u8).collect(),
+                partials: (0..n).map(|_| (next() as u128) << 64 | next() as u128).collect(),
+                rounds: (0..n)
+                    .map(|_| [[next(), next(), next()], [next(), next(), next()]])
+                    .collect(),
+                opened: [next(), next(), next()],
+                row: (0..2 * n).map(|_| next() as u8).collect(),
+                folded: (0..3 * n + 1).map(|_| next() as u8).collect(),
+            };
+            assert_eq!(proof.encode(), codec().serialize(&proof).unwrap(), "n {n}");
+        }
+    }
+
+    /// The narrow fold agrees with the `i32` fold, on dense random columns and on all-ones
+    /// columns (every coefficient takes every term).
+    #[test]
+    fn narrow_fold_matches_wide() {
+        let mut t = Transcript::new(b"labinius-fast/test");
+        let challenges: Vec<ShortChallenge> = (0..COLUMNS)
+            .map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+            .collect();
+        let mut values = vec![B128::ZERO; COLUMNS * COLUMN_LEN];
+        let elements = [0usize, 1, 17, 2048, RING_ELEMENTS - 1];
+        for (e, &m) in elements.iter().enumerate() {
+            for j in 0..COLUMNS {
+                let col = column((e * COLUMNS + j) as u64 + 11);
+                for k in 0..4 {
+                    values[j * COLUMN_LEN + 4 * m + k] =
+                        if m == 2048 { B128(u128::MAX) } else { col[k] };
+                }
+            }
+        }
+        for m in elements {
+            assert_eq!(
+                fold_element_narrow(&values, &challenges, m).v,
+                fold_element(&values, &challenges, m).v,
+                "element {m}"
+            );
+        }
+    }
+
+    /// The table lookup agrees with the checker's coefficient-by-coefficient commitment, at the
+    /// earlier default modulus, which the four-Russians path still serves.
     #[test]
     fn grouped_commit_matches_reference() {
-        let modulus = MODULUS;
+        let modulus = 40_772_829_184;
+        assert!(modulus < FAST_MODULUS && modulus != ntt::MODULUS);
         let values: Vec<B128> = (0..COLUMNS as u64)
             .flat_map(|j| {
                 if j < 2 {
@@ -468,5 +762,89 @@ mod tests {
             );
         }
         assert!(fast[2 * rq::N..].iter().all(|&x| x == 0));
+    }
+
+    /// Columns of `elements` ring elements for the transform tests: dense random columns and the
+    /// edge cases (all zero, all ones, single bits at coefficients 0 and 511 of the first and the
+    /// last element), `count` columns in all, so the last batch of eight is partial.
+    fn edge_columns(elements: usize, count: usize) -> Vec<B128> {
+        let len = 4 * elements;
+        let mut out = Vec::with_capacity(count * len);
+        for j in 0..count {
+            let mut col = vec![B128::ZERO; len];
+            match j % 8 {
+                1 => col.fill(B128(u128::MAX)),
+                2 => {}
+                // coefficient 0 of the first element: bit 0 of word 0
+                3 => col[0] = B128(1),
+                // coefficient 511 = 4 * 127 + 3 of the last element: bit 127 of word 3
+                4 => col[len - 1] = B128(1 << 127),
+                5 => {
+                    col[3] = B128(1 << 127);
+                    col[len - 4] = B128(1);
+                }
+                _ => {
+                    let dense = column(j as u64 * 7 + 3);
+                    for (c, &d) in col.iter_mut().zip(dense.iter().cycle()) {
+                        *c = d;
+                    }
+                }
+            }
+            out.extend(col);
+        }
+        out
+    }
+
+    /// The transform commitment agrees with the checker's schoolbook commitment at full size, on
+    /// one, three and eight workers, through the matrix transformed on as many.
+    #[test]
+    fn ntt_commit_matches_reference() {
+        let values = edge_columns(RING_ELEMENTS, 11);
+        let matrix = rq::ajtai_matrix(ntt::MODULUS, RING_ELEMENTS);
+        let want = commit_reference(&values, &matrix, ntt::MODULUS);
+        assert!(want.iter().all(|&x| x < ntt::MODULUS));
+        assert!(want[2 * rq::N..3 * rq::N].iter().all(|&x| x == 0));
+        for workers in [1, 3, 8] {
+            let transformed = ntt::transform_matrix(&matrix, workers);
+            assert_eq!(ntt::commit(&values, &transformed, workers), want, "workers {workers}");
+            if workers == 3 {
+                assert_eq!(ntt::scalar_commit(&values, &transformed, workers), want);
+            }
+        }
+    }
+
+    /// The matrix built element by element and transformed eight at a time is the scalar
+    /// transform of `rq::ajtai_matrix`, for element counts around the vector width and on one,
+    /// three and eight workers.
+    #[test]
+    fn fused_matrix_matches_scalar_transform() {
+        for elements in [1usize, 7, 8, 9, 23, 64] {
+            let want = ntt::transform_matrix(&rq::ajtai_matrix(ntt::MODULUS, elements), 3);
+            for workers in [1, 3, 8] {
+                let got = ntt::matrix(elements, workers);
+                assert!(got.data == want.data, "elements {elements} workers {workers}");
+            }
+        }
+        let full = ntt::matrix(RING_ELEMENTS, 8);
+        let want = ntt::transform_matrix(&rq::ajtai_matrix(ntt::MODULUS, RING_ELEMENTS), 8);
+        assert!(full.data == want.data);
+    }
+
+    /// The same on short columns, many cases, column counts around the batch width.
+    #[test]
+    fn ntt_commit_matches_reference_short_columns() {
+        for (elements, count) in [(1usize, 1usize), (3, 8), (5, 9), (7, 17), (2, 23)] {
+            let values = edge_columns(elements, count);
+            let matrix = rq::ajtai_matrix(ntt::MODULUS, elements);
+            let want = commit_reference(&values, &matrix, ntt::MODULUS);
+            for workers in [1, 3, 8] {
+                let transformed = ntt::transform_matrix(&matrix, workers);
+                assert_eq!(
+                    ntt::commit(&values, &transformed, workers),
+                    want,
+                    "elements {elements} columns {count} workers {workers}"
+                );
+            }
+        }
     }
 }
