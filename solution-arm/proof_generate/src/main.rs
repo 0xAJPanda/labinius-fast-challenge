@@ -105,6 +105,19 @@ fn parse_modulus(text: &str) -> Result<u128, String> {
     Ok(q)
 }
 
+/// The precomputed hybrid matrix of the default modulus (`build.rs`), 64-byte aligned.
+#[repr(C, align(64))]
+struct Aligned<T: ?Sized>(T);
+static HYBRID_KEY: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-key.bin")));
+
+/// [`HYBRID_KEY`] as the `i16` array it encodes (little-endian, as this target is).
+fn embedded_key() -> &'static [i16] {
+    let bytes = &HYBRID_KEY.0;
+    assert!(cfg!(target_endian = "little") || bytes.is_empty());
+    // SAFETY: 64-byte aligned bytes of `i16`s; every bit pattern is a valid `i16`.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i16, bytes.len() / 2) }
+}
+
 fn threads() -> usize {
     labinius::par::threads()
 }
@@ -272,7 +285,9 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     if modulus == hybrid::MODULUS {
-        return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
+        let m = hybrid::from_image(embedded_key(), RING_ELEMENTS)
+            .unwrap_or_else(|| hybrid::matrix(RING_ELEMENTS, threads()));
+        return hybrid::commit(values, &m, threads());
     }
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
@@ -700,6 +715,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key `build.rs` embeds is the matrix `hybrid::matrix` computes at run time.
+    #[test]
+    fn embedded_key_matches_runtime_matrix() {
+        let embedded = hybrid::from_image(embedded_key(), RING_ELEMENTS).expect("embedded key");
+        let built = hybrid::matrix(RING_ELEMENTS, 8);
+        assert!(embedded.data[..] == built.data[..]);
+    }
 
     fn column(seed: u64) -> Vec<B128> {
         let mut state = seed;

@@ -7,7 +7,7 @@ pub const MODULUS: u128 = PRODUCT as u128 * 1024;
 pub const CHUNK: usize = 256;
 const _: () = assert!(MODULUS >= 34_816_965_049 && MODULUS < (1u128 << 96));
 
-pub struct Matrix { pub elements: usize, pub data: Vec<i16> }
+pub struct Matrix { pub elements: usize, pub data: std::borrow::Cow<'static, [i16]> }
 impl Matrix {
     pub fn row(&self, e: usize, p: usize, tail: usize) -> &[i16] {
         &self.data[(4*e+2*p+tail)*ROW..][..ROW]
@@ -99,7 +99,12 @@ pub fn matrix(elements: usize, workers: usize) -> Matrix {
             certificate(&raw);
         }
     });
-    Matrix {elements,data}
+    Matrix {elements,data:data.into()}
+}
+
+/// [`matrix`] from its precomputed image (`build.rs`), if the image has that shape.
+pub fn from_image(image: &'static [i16], elements: usize) -> Option<Matrix> {
+    (image.len() == 4*elements*ROW).then(|| Matrix {elements, data: std::borrow::Cow::Borrowed(image)})
 }
 
 #[inline]
