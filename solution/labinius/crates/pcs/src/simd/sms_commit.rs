@@ -427,6 +427,8 @@ const INPUT_PREFETCH: bool = false;
 
 const PREFETCH_SLOTS: usize = 7;
 
+const ACC_PREFETCH_SLOTS: usize = 2;
+
 /// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
 /// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
 /// every eight lockstep products).
@@ -494,6 +496,12 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
                 while p < hi {
                     _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
                     p += 64;
+                }
+            }
+            if ACC_PREFETCH_SLOTS > 0 {
+                let pa = a.wrapping_add(ACC_PREFETCH_SLOTS * STREAMS * 16) as *const i8;
+                for line in 0..(STREAMS * 16 * 4) / 64 {
+                    _mm_prefetch::<_MM_HINT_T0>(pa.wrapping_add(64 * line));
                 }
             }
             macro_rules! call {
