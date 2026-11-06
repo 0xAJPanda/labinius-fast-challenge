@@ -487,8 +487,8 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
-            if PREFETCH_SLOTS > 0 && j + PREFETCH_SLOTS < N {
-                let lo = k.add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
+            if PREFETCH_SLOTS > 0 {
+                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
                 let hi = lo + STREAMS * LOCK * 4;
                 let mut p = (lo + 63) & !63;
                 while p < hi {
