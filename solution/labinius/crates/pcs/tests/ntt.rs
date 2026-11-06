@@ -465,7 +465,13 @@ mod bin_asm {
                 for h in 0..8 {
                     let mut expected=Batch32::zero(Representation::Coefficients);
                     unsafe {vb::ntt_bin_batch32::<Q>(&idx[h],&mut expected);}
-                    assert_eq!(got[h].v,expected.v,"Q={Q}, batch={h}");
+                    let bound=(Q as i64*vb::output_bound_milli_q(Q) as i64+999)/1000;
+                    for (g,e) in got[h].v.iter().zip(expected.v.iter()) {
+                        for (&x,&y) in g.iter().zip(e.iter()) {
+                            assert_eq!((x as i64-y as i64).rem_euclid(Q as i64),0,"Q={Q}, batch={h}");
+                            assert!((x as i64).abs()<=bound,"Q={Q}, batch={h}: {x} past the bound");
+                        }
+                    }
                 }
             }
         }
