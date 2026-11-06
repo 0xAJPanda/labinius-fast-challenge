@@ -14,7 +14,7 @@ macro_rules! mont_mem {
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
             "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
-            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm31\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
         )
@@ -63,7 +63,7 @@ macro_rules! level6_mem {
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
             "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
-            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm31\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
         )
@@ -155,6 +155,7 @@ unsafe fn tail27_mem_b(
     core::arch::asm!(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
+            "vmovdqa64 zmm31, [{c}+64]\n",
             tail27_mem!(lut, barrett),
         ),
         i = in(reg) bp,
@@ -194,6 +195,7 @@ unsafe fn tail27_mem_b(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
+        out("zmm31") _,
         options(nostack)
     );
 }
