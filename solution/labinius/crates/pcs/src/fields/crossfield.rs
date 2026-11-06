@@ -1861,6 +1861,64 @@ unsafe fn materialize_prefix_range(
     }
 }
 
+/// Materialize paired ranges in both halves and compute the next message from
+/// their final values. `range` covers whole tiles in `0 .. len / 2`.
+unsafe fn materialize_prefix_message_range(
+    words: *const B128, len: usize, weights: &[[__m512i; 4]],
+    dst: [*mut u64; 3], eq: EqSrc,
+    ml: &[[u64; 16]; 24], mlp: &[[u64; 16]; 24],
+    range: core::ops::Range<usize>,
+) -> [F162; 2] {
+    let hh = len / 2;
+    let mut acc0 = [_mm512_setzero_si512(); 12];
+    let mut acci = [_mm512_setzero_si512(); 12];
+    let mut av = [[_mm512_setzero_si512(); 8]; 3];
+    let mut apv = [[_mm512_setzero_si512(); 8]; 3];
+    let mut buf = EqTile([B128::ZERO; TILE]);
+    let mut j0 = range.start;
+    while j0 < range.end {
+        let j1 = (j0 + BIND_STRETCH).min(range.end);
+        for (s, ws) in weights.chunks(BIND_WAYS).enumerate() {
+            let q0 = s * BIND_WAYS;
+            let last = q0 + ws.len() == weights.len();
+            for tile in (j0..j1).step_by(TILE) {
+                if last {
+                    map_tile2(eq.tile(tile, &mut buf), ml, mlp, &mut av, &mut apv);
+                }
+                for g in 0..8 {
+                    let j = tile + 8 * g;
+                    let v: [[__m512i; 3]; 2] = core::array::from_fn(|side| {
+                        let j = j + side * hh;
+                        let a0 = words.wrapping_add(j + MATERIALIZE_AHEAD + q0 * len) as *const i8;
+                        _mm_prefetch::<_MM_HINT_T0>(a0);
+                        _mm_prefetch::<_MM_HINT_T0>(a0.wrapping_add(64));
+                        let mut acc = prods_word10(ws[0], split_words(words.add(j + q0 * len)));
+                        for (i, &weight) in ws.iter().enumerate().skip(1) {
+                            let q = q0 + i;
+                            let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q * len) as *const i8;
+                            _mm_prefetch::<_MM_HINT_T0>(a);
+                            _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
+                            mac_word10(&mut acc, weight, split_words(words.add(j + q * len)));
+                        }
+                        let mut v = reduce_word10(acc);
+                        if s > 0 {
+                            v = xor3p(v, load_p(Src::Planes(dst.map(|p| p as *const u64)), j));
+                        }
+                        store_p(dst, j, v);
+                        v
+                    });
+                    if last {
+                        super::f162::mac_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], v[0]);
+                        super::f162::mac_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(v[0], v[1]));
+                    }
+                }
+            }
+        }
+        j0 = j1;
+    }
+    [horiz8(acc0), horiz8(acci)]
+}
+
 /// Blocks one sweep of the binding pass reads at once (see [`materialize_prefix_range`]). Few
 /// streams with long runs each (64 KB per block and sweep) suit the memory best, which pays for
 /// the extra reductions: 32 blocks over 2^19 outputs measured 5.0 ms at 2 x 4096, 5.1 ms at
@@ -2411,6 +2469,36 @@ impl<'a> LeanSwitch<'a> {
             let weights: Vec<_> = weights.into_iter().map(|w| unsafe { bcast4(w) }).collect();
             let words = self.pi0.as_ptr() as usize;
             let dst = dst.map(|p| p as usize);
+            if hh >= TILE {
+                let eq = self.eq.src();
+                let ml = eq_matrices(&self.l);
+                let mlp = eq_matrices(&self.lp);
+                let chunk = (hh / (16 * self.threads)).clamp(TILE, 1 << 12) & !(TILE - 1);
+                let chunks = hh.div_ceil(chunk);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let ways = if chunks % 4 == 0 { 4 } else { 1 };
+                let parts = crate::par::pool().map(self.threads.min(chunks), |_| {
+                    let mut m = [F162::ZERO; 2];
+                    loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if k >= chunks {
+                            break;
+                        }
+                        let c = (k % ways) * (chunks / ways) + k / ways;
+                        let p = unsafe {
+                            materialize_prefix_message_range(words as *const B128, half, &weights,
+                                dst.map(|p| p as *mut u64), eq, &ml, &mlp,
+                                c * chunk..((c + 1) * chunk).min(hh))
+                        };
+                        m[0] += p[0];
+                        m[1] += p[1];
+                    }
+                    m
+                });
+                self.pending = Some(parts.into_iter().fold([F162::ZERO; 2], |a, p| [a[0] + p[0], a[1] + p[1]]));
+                self.round += 1;
+                return;
+            }
             // Handed out in chunks from a shared counter, like the partials' rows: a runner
             // that starts late or shares its core takes fewer of them.
             let chunk = (half / (16 * self.threads)).clamp(8, 1 << 12) & !7;
