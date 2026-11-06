@@ -192,6 +192,13 @@ pub unsafe fn reduce_cheap(a: int16x8_t, k: int16x8_t) -> int16x8_t {
     vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<14>(a), k)
 }
 
+/// `a - round(a / 2^13) p`: one multiplication, `|result| <= round13_bound(p, |a|)`, for the
+/// prime close to `2^13` (the reduction of [`FIRST13`]).
+#[inline(always)]
+unsafe fn reduce_round13(a: int16x8_t, k: int16x8_t) -> int16x8_t {
+    vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<13>(a), k)
+}
+
 /// Reduces the level's inputs the schedule asks for: all of them (the multiplied ones cheaply
 /// when `cheap`), or only those at `first`, the butterflies' inputs that are not multiplied by
 /// a twiddle.
@@ -774,6 +781,9 @@ pub struct InverseKernel {
     t: Vec<[i16; 8]>,
     /// The trinomial unsplit: `[inv_split, zeta^324, 0, 0]`.
     u: [i16; 8],
+    /// [`t`](Self::t) without `r^-1`, for [`inverse_folded`]: `[1, tau^-1, tau^-2, eps^-1]` for a
+    /// radix-3 node (lane pair 0 unused), `[1, tau^-1, 0, 0]` for a radix-2 node.
+    f: Vec<[i16; 8]>,
 }
 
 impl InverseKernel {
@@ -781,28 +791,32 @@ impl InverseKernel {
         use super::{ORDER, RADICES};
         let plan = &primes()[index];
         let (p, pp) = (plan.p, plan.p as u64);
-        let mut t = Vec::new();
-        for level in (0..RADICES.len()).rev() {
-            let r = RADICES[level];
-            let ir = plan.inv_radix[r] as u64;
-            for &e in &plan.exps[level] {
-                let tau = e as usize / r;
-                let mut row = [0i16; 8];
-                for i in 0..r {
-                    let s = plan.root(ORDER - tau * i % ORDER) * ir % pp;
-                    row[2 * i..2 * i + 2].copy_from_slice(&twiddle(p, s));
+        // `scaled`: with `r^-1` folded in ([`inverse`]) or not ([`inverse_folded`])
+        let rows = |scaled: bool| {
+            let mut t = Vec::new();
+            for level in (0..RADICES.len()).rev() {
+                let r = RADICES[level];
+                let ir = if scaled { plan.inv_radix[r] as u64 } else { 1 };
+                for &e in &plan.exps[level] {
+                    let tau = e as usize / r;
+                    let mut row = [0i16; 8];
+                    for i in 0..r {
+                        let s = plan.root(ORDER - tau * i % ORDER) * ir % pp;
+                        row[2 * i..2 * i + 2].copy_from_slice(&twiddle(p, s));
+                    }
+                    if r == 3 {
+                        row[6..8].copy_from_slice(&twiddle(p, plan.root(ORDER - ORDER / 3)));
+                    }
+                    t.push(row);
                 }
-                if r == 3 {
-                    row[6..8].copy_from_slice(&twiddle(p, plan.root(ORDER - ORDER / 3)));
-                }
-                t.push(row);
             }
-        }
-        assert_eq!(t.len(), 216 + 72 + 24 + 8 + 4 + 2);
+            assert_eq!(t.len(), 216 + 72 + 24 + 8 + 4 + 2);
+            t
+        };
         let mut u = [0i16; 8];
         u[..2].copy_from_slice(&twiddle(p, plan.inv_split as u64));
         u[2..4].copy_from_slice(&twiddle(p, plan.root(super::HALF)));
-        InverseKernel { t, u }
+        InverseKernel { t: rows(true), u, f: rows(false) }
     }
 }
 
@@ -935,6 +949,115 @@ pub unsafe fn inverse<const P: usize>(x: &mut [int16x8_t; N]) {
         }
         let b = center(reduce(mulc::<0, 1>(vsubq_s16(u, v), uv, k), k), h, k);
         let a = center(reduce(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), k), h, k);
+        store(x, j, a);
+        store(x, j + N / 2, b);
+    }
+}
+
+/// The product of the radices of levels 1 to 6, `2^2 3^4`: [`inverse_folded`] is this many times
+/// [`inverse`].
+pub const FOLD: u32 = {
+    let mut f = 1;
+    let mut level = 0;
+    while level < super::RADICES.len() {
+        f *= super::RADICES[level] as u32;
+        level += 1;
+    }
+    f
+};
+const _: () = assert!(FOLD == 324);
+
+/// Whether [`inverse_folded`] stays inside `i16` from inputs `|x| <= p`, and its trinomial step's
+/// two Barrett products land inside [`center`]'s range `|a| <= p + (p - 1) / 2`. Without `1 / r`
+/// the first output of a butterfly is the bare sum `s0` (radix 2: `y0 + y1`), reduced by
+/// `a - round(a / 2^13) p` ([`reduce_round13`], one multiplication); the others stay Barrett
+/// products. `b` bounds every slot after a level.
+const fn inverse_folded_fits(p: u32) -> bool {
+    use super::{product_bound, round13_bound, RADICES};
+    const MAX: u32 = i16::MAX as u32;
+    let mut b = p;
+    let mut level = RADICES.len();
+    while level > 0 {
+        level -= 1;
+        // radix 3: s0 = y0 + y1 + y2, s1/s2 = (y0 - y2/y1) +- eps^-1 (y1 - y2); radix 2: y0 +- y1
+        let (s0, s) = if RADICES[level] == 3 { (3 * b, 2 * b + product_bound(p, 2 * b)) } else { (2 * b, 2 * b) };
+        if s0 > MAX || s > MAX {
+            return false;
+        }
+        let a0 = round13_bound(p, s0);
+        let a = product_bound(p, s);
+        b = if a0 > a { a0 } else { a };
+    }
+    // b = center((u - v) inv_split), a = center(u - w b) with |b| <= (p - 1) / 2 after center
+    let c = p + (p - 1) / 2;
+    2 * b <= MAX && product_bound(p, 2 * b) <= c && b + product_bound(p, (p - 1) / 2) <= c
+}
+
+// The SMS prime 9721 (`|1 - p / 2^13| < 0.19`): the tightest point is level 3's `s0`, `3 * 10,814 =
+// 32,442`. The other two primes are too far from `2^13` and keep [`inverse`].
+const _: () = assert!(inverse_folded_fits(PRIMES[1]) && !inverse_folded_fits(PRIMES[0]) && !inverse_folded_fits(PRIMES[2]));
+
+/// [`inverse_radix3`] without `1 / r`: `a_0 = sum_k y_k` (reduced by [`reduce_round13`]),
+/// `a_i = tau^-i sum_k eps^-(k i) y_k`.
+#[inline(always)]
+unsafe fn inverse_radix3_folded(x: &mut [int16x8_t; N], t: &[[i16; 8]], len: usize, k: int16x8_t) {
+    debug_assert_eq!(t.len() * 3 * len, N);
+    for (node, tw) in t.iter().enumerate() {
+        let tv = vld1q_s16(tw.as_ptr());
+        let base = 3 * len * node;
+        for j in base..base + len {
+            let (y0, y1, y2) = (load(x, j), load(x, j + len), load(x, j + 2 * len));
+            let s0 = vaddq_s16(vaddq_s16(y0, y1), y2);
+            let e = mulc::<6, 7>(vsubq_s16(y1, y2), tv, k);
+            let s1 = vaddq_s16(vsubq_s16(y0, y2), e);
+            let s2 = vsubq_s16(vsubq_s16(y0, y1), e);
+            store(x, j, reduce_round13(s0, k));
+            store(x, j + len, mulc::<2, 3>(s1, tv, k));
+            store(x, j + 2 * len, mulc::<4, 5>(s2, tv, k));
+        }
+    }
+}
+
+/// [`inverse_radix2`] without `1 / 2`: `a_0 = y0 + y1` (reduced by [`reduce_round13`]),
+/// `a_1 = tau^-1 (y0 - y1)`.
+#[inline(always)]
+unsafe fn inverse_radix2_folded(x: &mut [int16x8_t; N], t: &[[i16; 8]], len: usize, k: int16x8_t) {
+    debug_assert_eq!(t.len() * 2 * len, N);
+    for (node, tw) in t.iter().enumerate() {
+        let tv = vld1q_s16(tw.as_ptr());
+        let base = 2 * len * node;
+        for j in base..base + len {
+            let (y0, y1) = (load(x, j), load(x, j + len));
+            store(x, j, reduce_round13(vaddq_s16(y0, y1), k));
+            store(x, j + len, mulc::<2, 3>(vsubq_s16(y0, y1), tv, k));
+        }
+    }
+}
+
+/// [`FOLD`] `= 324` times [`inverse`], for inputs that already carry `324^-1`: the SMS key's
+/// transformed rows do ([`sms::matrix`]), so the commitment's inverses need no `1 / r`. Values
+/// congruent to the transform with `|x| <= p` in, centered residues out, `|x| <= (p - 1) / 2`
+/// exactly: the same output as [`inverse`] of `324 x`. The trinomial step's two Barrett
+/// reductions are dropped as well, since [`center`] takes both products directly. Only for a
+/// prime close to `2^13` ([`inverse_folded_fits`]).
+#[inline(never)]
+pub unsafe fn inverse_folded<const P: usize>(x: &mut [int16x8_t; N]) {
+    const { assert!(P < 3 && inverse_folded_fits(PRIMES[P])) };
+    let k = vld1q_s16(kernels()[P].k.as_ptr());
+    let inv = &inverse_kernels()[P];
+    let t = &inv.f[..];
+    inverse_radix3_folded(x, &t[..216], 1, k);
+    inverse_radix3_folded(x, &t[216..288], 3, k);
+    inverse_radix3_folded(x, &t[288..312], 9, k);
+    inverse_radix3_folded(x, &t[312..320], 27, k);
+    inverse_radix2_folded(x, &t[320..324], 81, k);
+    inverse_radix2_folded(x, &t[324..326], 162, k);
+    let uv = vld1q_s16(inv.u.as_ptr());
+    let h = vdupq_n_s16(((PRIMES[P] - 1) / 2) as i16);
+    for j in 0..N / 2 {
+        let (u, v) = (load(x, j), load(x, j + N / 2));
+        let b = center(mulc::<0, 1>(vsubq_s16(u, v), uv, k), h, k);
+        let a = center(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), h, k);
         store(x, j, a);
         store(x, j + N / 2, b);
     }
@@ -1205,6 +1328,62 @@ mod tests {
         }
     }
 
+    /// The one-multiply reduction of [`FIRST13`] and [`inverse_folded`], over every `i16`, for the
+    /// prime close to `2^13`: congruent, and within [`super::super::round13_bound`] of `|a|`.
+    #[test]
+    fn round13_reduction_is_exact_and_bounded() {
+        let p = PRIMES[1] as i32;
+        let k = unsafe { vld1q_s16(kernels()[1].k.as_ptr()) };
+        for a in every_i16() {
+            let r = lanes(unsafe { reduce_round13(a, k) });
+            for (x, y) in lanes(a).into_iter().zip(r) {
+                assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
+                let bound = super::super::round13_bound(p as u32, x.unsigned_abs() as u32);
+                assert!(y.unsigned_abs() as u32 <= bound, "{x} -> {y}");
+            }
+        }
+    }
+
+    /// The folded inverse is [`FOLD`] `= 324` times the scalar inverse, centered, for the SMS
+    /// prime, on random inputs in `[-p, p]`, on the extremes `+-p` and on random inputs in the
+    /// range the commitment feeds it (`|x| <= 4861`); and it is exactly [`inverse`] of `324 x`.
+    #[test]
+    fn inverse_folded_matches_scalar() {
+        let mut state = 13u64;
+        let plan = &primes()[1];
+        let p = plan.p as i64;
+        for case in 0..16 {
+            let x: [[i16; 8]; N] = core::array::from_fn(|_| {
+                core::array::from_fn(|l| match (case, l % 2) {
+                    (0, _) => p as i16,
+                    (1, _) => -p as i16,
+                    (2, 0) | (3, 1) => p as i16,
+                    (2, _) | (3, _) => -p as i16,
+                    (4, _) | (5, _) => if xorshift(&mut state) & 1 == 0 { p as i16 } else { -p as i16 },
+                    (6, _) | (7, _) => ((xorshift(&mut state) % 9723) as i64 - 4861) as i16,
+                    _ => ((xorshift(&mut state) % (2 * p + 1) as u64) as i64 - p) as i16,
+                })
+            });
+            let y = unsafe {
+                let mut v: [int16x8_t; N] = core::array::from_fn(|j| vld1q_s16(x[j].as_ptr()));
+                inverse_folded::<1>(&mut v);
+                core::array::from_fn::<[i16; 8], N, _>(|j| lanes(v[j]))
+            };
+            let scaled: [[i16; 8]; N] = core::array::from_fn(|j| {
+                core::array::from_fn(|c| super::super::centered(FOLD as i64 * x[j][c] as i64, plan.p))
+            });
+            assert_eq!(y, run_inverse(1, &scaled), "case {case}: inverse of 324 x");
+            for c in 0..8 {
+                let mut s: [u32; N] = core::array::from_fn(|j| (x[j][c] as i64).rem_euclid(p) as u32);
+                plan.inverse(&mut s);
+                for j in 0..N {
+                    let want = super::super::centered(FOLD as i64 * s[j] as i64, plan.p);
+                    assert_eq!(y[j][c], want, "case {case} lane {c} coefficient {j}");
+                }
+            }
+        }
+    }
+
     /// Rough timing of one `inverse::<1>` call: `cargo test --release inverse_timing -- --ignored
     /// --nocapture`.
     #[test]
@@ -1223,6 +1402,12 @@ mod tests {
         }
         let ns = start.elapsed().as_nanos() as f64 / iters as f64;
         println!("inverse::<1>: {ns:.0} ns per call (8 lanes)");
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe { inverse_folded::<1>(core::hint::black_box(&mut v)) };
+        }
+        let ns = start.elapsed().as_nanos() as f64 / iters as f64;
+        println!("inverse_folded::<1>: {ns:.0} ns per call (8 lanes)");
     }
 
     /// The vector transform of eight binary elements agrees lane by lane with the scalar

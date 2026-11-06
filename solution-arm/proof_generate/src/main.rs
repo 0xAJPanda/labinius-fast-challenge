@@ -9,6 +9,8 @@
 //! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
 mod hugealloc;
+mod output;
+use output::{Output, ProofParts};
 mod ntt;
 
 #[global_allocator]
@@ -25,6 +27,7 @@ use labinius::fields::{
 use labinius::ring::Representation;
 use labinius::scheme::FoldingSource;
 use labinius::{wire, FoldedWitness, RingElement648, RowEvaluation, Transcript};
+#[cfg(test)]
 use serde::Serialize;
 
 const LOG_VARS: usize = 31;
@@ -79,6 +82,7 @@ const BLOCKS: usize = RAW.div_ceil(BLOCK);
 /// How many blocks ahead [`add_block`] prefetches each group's table window; 0 disables it.
 const PREFETCH_BLOCKS: usize = 1;
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct Proof {
     version: u32,
@@ -161,27 +165,6 @@ impl Drop for Table {
         if let Self::Mapped { ptr, len } = self {
             unsafe { table_sys::munmap(*ptr, 16 * *len) };
         }
-    }
-}
-
-impl Table {
-    fn release_during<R>(self, work: impl FnOnce() -> R) -> R {
-        #[cfg(all(target_os = "linux", target_endian = "little"))]
-        if let Self::Mapped { ptr, len } = self {
-            core::mem::forget(self);
-            let (base, bytes) = (ptr as usize, 16 * len);
-            let part = bytes.div_ceil(threads()).next_multiple_of(2 << 20).max(2 << 20);
-            return std::thread::scope(|scope| {
-                for start in (0..bytes).step_by(part) {
-                    let n = part.min(bytes - start);
-                    scope.spawn(move || unsafe { table_sys::munmap((base + start) as *mut u8, n) });
-                }
-                work()
-            });
-        }
-        let out = work();
-        drop(self);
-        out
     }
 }
 
@@ -778,40 +761,24 @@ fn fold_bytes(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement
     out
 }
 
-/// Each coefficient as a little-endian `i32`, on all workers over disjoint runs of elements
-/// (the 14 MB buffer is fresh, so its pages are also faulted in parallel).
+#[cfg(test)]
 fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
     let elements = folded.elements();
     let mut out = vec![0u8; 4 * rq::N * elements.len()];
-    let workers = threads().clamp(1, elements.len().max(1));
-    let per = elements.len().div_ceil(workers).max(1);
-    std::thread::scope(|scope| {
-        for (dst, src) in out.chunks_mut(per * 4 * rq::N).zip(elements.chunks(per)) {
-            scope.spawn(move || {
-                for (chunk, e) in dst.chunks_exact_mut(4 * rq::N).zip(src) {
-                    for (slot, &c) in chunk.chunks_exact_mut(4).zip(&e.v) {
-                        slot.copy_from_slice(&(c as i32).to_le_bytes());
-                    }
-                }
-            });
+    for (chunk, e) in out.chunks_exact_mut(4 * rq::N).zip(elements) {
+        for (slot, &c) in chunk.chunks_exact_mut(4).zip(&e.v) {
+            slot.copy_from_slice(&(c as i32).to_le_bytes());
         }
-    });
+    }
     out
 }
 
+#[cfg(test)]
 impl Proof {
     /// The proof's bincode encoding under [`codec`]'s options (fixed-width little-endian
     /// integers, `u64` sequence lengths, arrays without one), written field by field with
     /// whole-slice copies; serde would hand bincode the byte vectors one `u8` at a time.
     fn encode(&self) -> Vec<u8> {
-        let mut out = self.encode_head();
-        out.extend_from_slice(&self.folded);
-        out
-    }
-
-    /// [`Self::encode`] without the trailing `folded` bytes (their length prefix included), so
-    /// the 14 MB body can be written from where it is instead of being copied behind the head.
-    fn encode_head(&self) -> Vec<u8> {
         let size = 4
             + 16
             + (8 + self.commitment.len())
@@ -819,8 +786,8 @@ impl Proof {
             + (8 + 48 * self.rounds.len())
             + 24
             + (8 + self.row.len())
-            + 8;
-        assert!((size + self.folded.len()) as u64 <= LIMIT, "serialize proof: the proof exceeds the size limit");
+            + (8 + self.folded.len());
+        assert!(size as u64 <= LIMIT, "serialize proof: the proof exceeds the size limit");
         let mut out = Vec::with_capacity(size);
         let len = |out: &mut Vec<u8>, n: usize| out.extend_from_slice(&(n as u64).to_le_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -841,6 +808,7 @@ impl Proof {
         len(&mut out, self.row.len());
         out.extend_from_slice(&self.row);
         len(&mut out, self.folded.len());
+        out.extend_from_slice(&self.folded);
         assert_eq!(out.len(), size);
         out
     }
@@ -892,9 +860,14 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
+    let coefficients = commit(values, modulus);
+    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
+    std::mem::forget(coefficients);
     timer.lap("commit");
+    // No output prefault here: the switch that follows runs on every core from its first
+    // round, and idle population workers measurably slowed it. The final encode faults the
+    // file pages itself, in parallel.
     let mut t = transcript(seed, modulus, &commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
@@ -907,15 +880,14 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     let challenges = folding_challenges(&mut t, &row);
     let folded = FoldedWitness::of(fold(values, &challenges));
     timer.lap("fold");
-    Proof {
-        version: 1,
+    ProofParts {
         modulus,
         commitment,
         partials: partials.iter().map(|v| v.0).collect(),
         rounds,
         opened: opened.0,
         row: wire::pack_row_evaluation(&row),
-        folded: pack_folded(&folded),
+        folded,
     }
 }
 
@@ -946,18 +918,18 @@ fn main() {
         MODULUS
     };
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
+    let output = Output::start(&args[2], modulus);
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
-    let proof = prove(&seed, modulus, &values, &mut timer);
-    values.release_during(|| {
-        use std::io::Write;
-        let mut file = std::fs::File::create(&args[2]).expect("write proof");
-        file.write_all(&proof.encode_head()).expect("write proof");
-        file.write_all(&proof.folded).expect("write proof");
-    });
+    let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    // The proof file is complete. Let process teardown release the large allocations and
+    // mappings together, instead of walking their Rust destructors first.
+    std::mem::forget((values, proof, output));
+    std::process::exit(0);
 }
 
 #[cfg(test)]

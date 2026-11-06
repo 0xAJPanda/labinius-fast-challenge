@@ -431,6 +431,12 @@ pub fn canonical_inf_norm_sq(c: &ShortChallenge) -> f64 {
     unsafe { norm_sq_blocks(c) }
 }
 
+/// Build the public phase and signing tables off the prover's critical path.
+pub fn warm() {
+    LazyLock::force(&PHASE);
+    LazyLock::force(&SIGN_KEY);
+}
+
 /// `canonical_inf_norm_sq(c) <= bound_sq`, one block of roots at a time so that a rejection stops
 /// as soon as some root exceeds the bound. This is what the rejection loop calls: at the default
 /// bound the great majority of attempts die in the first block.

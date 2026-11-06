@@ -59,8 +59,9 @@ const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) *
 
 /// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is
 /// `data[(((m / 8) N + j) ROWS + r) 8 + m % 8]`, centered residues, so that one vector holds the
-/// eight elements of a tile, each residue negated because the forward kernel transforms `-s`; per
-/// chunk and digit the centered residue
+/// eight elements of a tile, each residue negated because the forward kernel transforms `-s` and
+/// multiplied by [`KEY_SCALE`] `= 324^-1` so that the inverses need no `1 / r`; per chunk and digit
+/// the centered residue
 /// of the mean modulo 9721; and the weighted sum of all means modulo `M`.
 pub struct SmsMatrix {
     pub elements: usize,
@@ -300,7 +301,7 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
                 super::transform_general(PB, lanes);
                 for (j, l) in lanes.iter().enumerate() {
                     for e in 0..here {
-                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64, p);
+                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64 * KEY_SCALE, p);
                     }
                 }
             }
@@ -309,6 +310,14 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
+
+/// `324^-1 mod p` (`324 = 2^2 3^4`, [`super::FOLD`], the product of the radices), carried by every
+/// transformed key row: the slot sums then carry it too, and [`super::inverse_folded`] (no `1 / r`)
+/// inverts them to the same coefficients as [`super::inverse`] of the unscaled sums. The
+/// certificate's moments, the means and `mu` are of the coefficient rows and do not change; only
+/// the key image does.
+const KEY_SCALE: i64 = crate::ntt::pow_mod(super::FOLD as u64, P1 as u64 - 2, P1 as u64) as i64;
+const _: () = assert!(KEY_SCALE * super::FOLD as i64 % P1 as i64 == 1 && KEY_SCALE == 9691);
 
 /// Elements per vector of the key image, and of a tile of the slot-wise products.
 const LOCK: usize = 8;
@@ -365,6 +374,105 @@ const SINK: usize = 4;
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP == 2 * PASS);
 
+/// [`slot_sink`]'s body; `$rows13` and `$rows46` start rows 1-3 (v20-v31) and rows 4-6
+/// (v16-v27): loaded from `acc`, or zeroed for a chunk's first sweep ([`slot_sink_fresh`]).
+#[cfg(target_feature = "sve")]
+macro_rules! slot_sink_body {
+    ($acc:expr, $z:expr, $k:expr, $groups:expr, [$($rows13:literal),*], [$($rows46:literal),*]) => {
+        core::arch::asm!(
+        "ldp q16, q17, [{a}, #0]",
+        "ldp q18, q19, [{a}, #32]",
+        $($rows13,)*
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+        "mov {n}, {g}",
+        "2:",
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        "stp q16, q17, [{a}, #0]",
+        "stp q18, q19, [{a}, #32]",
+        "stp q20, q21, [{a}, #64]",
+        "stp q22, q23, [{a}, #96]",
+        "stp q24, q25, [{a}, #128]",
+        "stp q26, q27, [{a}, #160]",
+        "stp q28, q29, [{a}, #192]",
+        "stp q30, q31, [{a}, #224]",
+        $($rows46,)*
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+        "mov {n}, {g}",
+        "3:",
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "subs {n}, {n}, #1",
+        "b.ne 3b",
+        "stp q16, q17, [{a}, #256]",
+        "stp q18, q19, [{a}, #288]",
+        "stp q20, q21, [{a}, #320]",
+        "stp q22, q23, [{a}, #352]",
+        "stp q24, q25, [{a}, #384]",
+        "stp q26, q27, [{a}, #416]",
+            a = in(reg) $acc,
+            z = in(reg) $z,
+            k = in(reg) $k,
+            g = in(reg) $groups,
+            xs4 = in(reg) 4 * XS,
+            ks = in(reg) KS,
+            xs1 = const XS,
+            xs2 = const 2 * XS,
+            xs3 = const 3 * XS,
+            zp = out(reg) _,
+            kp = out(reg) _,
+            n = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack)
+        )
+    };
+}
+
 /// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
 /// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
 /// elements each) of transforms starting at `z` (transform stride `XS`, the [`pass_words`] lane
@@ -378,121 +486,39 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
     const XS: usize = N * 16;
     const KS: usize = N * ROWS * LOCK * 2;
     debug_assert!((1..=SINK).contains(&groups));
-    core::arch::asm!(
-    "ldp q16, q17, [{a}, #0]",
-    "ldp q18, q19, [{a}, #32]",
-    "ldp q20, q21, [{a}, #64]",
-    "ldp q22, q23, [{a}, #96]",
-    "ldp q24, q25, [{a}, #128]",
-    "ldp q26, q27, [{a}, #160]",
-    "ldp q28, q29, [{a}, #192]",
-    "ldp q30, q31, [{a}, #224]",
-    "mov {zp}, {z}",
-    "mov {kp}, {k}",
-    "mov {n}, {g}",
-    "2:",
-    "ldp q0, q1, [{kp}]",
-    "ldp q2, q3, [{kp}, #32]",
-    "ldr q4, [{zp}]",
-    "ldr q5, [{zp}, #{xs1}]",
-    "ldr q6, [{zp}, #{xs2}]",
-    "ldr q7, [{zp}, #{xs3}]",
-    "add {zp}, {zp}, {xs4}",
-    "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-    "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-    "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-    "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
-    "ldr q4, [{zp}]",
-    "ldr q5, [{zp}, #{xs1}]",
-    "ldr q6, [{zp}, #{xs2}]",
-    "ldr q7, [{zp}, #{xs3}]",
-    "add {zp}, {zp}, {xs4}",
-    "add {kp}, {kp}, {ks}",
-    "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-    "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-    "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-    "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
-    "subs {n}, {n}, #1",
-    "b.ne 2b",
-    "stp q16, q17, [{a}, #0]",
-    "stp q18, q19, [{a}, #32]",
-    "stp q20, q21, [{a}, #64]",
-    "stp q22, q23, [{a}, #96]",
-    "stp q24, q25, [{a}, #128]",
-    "stp q26, q27, [{a}, #160]",
-    "stp q28, q29, [{a}, #192]",
-    "stp q30, q31, [{a}, #224]",
-    "ldp q16, q17, [{a}, #256]",
-    "ldp q18, q19, [{a}, #288]",
-    "ldp q20, q21, [{a}, #320]",
-    "ldp q22, q23, [{a}, #352]",
-    "ldp q24, q25, [{a}, #384]",
-    "ldp q26, q27, [{a}, #416]",
-    "mov {zp}, {z}",
-    "mov {kp}, {k}",
-    "mov {n}, {g}",
-    "3:",
-    "ldp q0, q1, [{kp}, #64]",
-    "ldr q2, [{kp}, #96]",
-    "ldr q4, [{zp}]",
-    "ldr q5, [{zp}, #{xs1}]",
-    "ldr q6, [{zp}, #{xs2}]",
-    "ldr q7, [{zp}, #{xs3}]",
-    "add {zp}, {zp}, {xs4}",
-    "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-    "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-    "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-    "ldr q4, [{zp}]",
-    "ldr q5, [{zp}, #{xs1}]",
-    "ldr q6, [{zp}, #{xs2}]",
-    "ldr q7, [{zp}, #{xs3}]",
-    "add {zp}, {zp}, {xs4}",
-    "add {kp}, {kp}, {ks}",
-    "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-    "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-    "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-    "subs {n}, {n}, #1",
-    "b.ne 3b",
-    "stp q16, q17, [{a}, #256]",
-    "stp q18, q19, [{a}, #288]",
-    "stp q20, q21, [{a}, #320]",
-    "stp q22, q23, [{a}, #352]",
-    "stp q24, q25, [{a}, #384]",
-    "stp q26, q27, [{a}, #416]",
-        a = in(reg) acc,
-        z = in(reg) z,
-        k = in(reg) k,
-        g = in(reg) groups,
-        xs4 = in(reg) 4 * XS,
-        ks = in(reg) KS,
-        xs1 = const XS,
-        xs2 = const 2 * XS,
-        xs3 = const 3 * XS,
-        zp = out(reg) _,
-        kp = out(reg) _,
-        n = out(reg) _,
-        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-        options(nostack)
-    );
+    slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
+}
+
+/// [`slot_sink`] for a chunk's first sweep: the digit rows' sums (rows 1-6) start from zero instead
+/// of being loaded, and are stored as usual, so the chunk end needs no zeroing pass; the base
+/// row (row 0) accumulates as in [`slot_sink`].
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
+    const XS: usize = N * 16;
+    const KS: usize = N * ROWS * LOCK * 2;
+    debug_assert!((1..=SINK).contains(&groups));
+    slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
 }
 
 /// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile
 /// `g`) with the key tiles at `keys` (`N ROWS LOCK` entries apart), every slot and row; the sums of
-/// [`dot`] per tile, in another order. A tile past the column's end has zero keys.
+/// [`dot`] per tile, in another order. A tile past the column's end has zero keys. With `FRESH` (a
+/// chunk's first sweep) the digit rows' sums are overwritten instead of added to, so the chunk end
+/// needs no zeroing pass; the base row always accumulates.
 #[inline(never)]
-unsafe fn sink(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     let accp = acc.as_mut_ptr();
     #[cfg(target_feature = "sve")]
     {
         let z = xs.as_ptr() as *const int16x8_t;
         for s in 0..N {
-            slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+            if FRESH {
+                slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+            } else {
+                slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+            }
         }
     }
     #[cfg(not(target_feature = "sve"))]
@@ -502,6 +528,11 @@ unsafe fn sink(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x
             let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
+                if FRESH && g == 0 && r > 0 {
+                    for q in 0..4 {
+                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
+                    }
+                }
                 dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
             }
         }
@@ -541,6 +572,36 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
         let lo = vcombine_s32(narrow_sum(acc[at]), narrow_sum(acc[at + 1]));
         let hi = vcombine_s32(narrow_sum(acc[at + 2]), narrow_sum(acc[at + 3]));
         *o = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
+    }
+}
+
+/// The largest product of a key slot (a centered residue) and a transform slot.
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
+/// `2^16 mod p`, centered.
+const C16: i32 = centered(1 << 16, P1) as i32;
+/// `round(2^31 / p)`.
+const V31: i32 = ((1u64 << 32) / P1 as u64).div_ceil(2) as i32;
+// a chunk's digit sums `v` (|v| <= CHUNK PRODUCT): `(v >> 16) C16 + (v mod 2^16)` fits i32
+const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535 < i32::MAX as u64);
+
+/// [`narrow`] for a chunk's digit rows, in integers: `v = h 2^16 + l`, `l = v mod 2^16`, so
+/// `v = h (2^16 mod p) + l (mod p)` within `i32`, then a 32-bit Barrett reduction to
+/// `|r| <= 0.65 p` (the inverse takes `|x| <= p`). After the k6 chunk end (dadon line).
+#[inline(always)]
+unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
+    let c = vdupq_n_s32(C16);
+    let low = vdupq_n_s32(0xFFFF);
+    let half = |a: int64x2_t, b: int64x2_t| -> int32x4_t {
+        let h = vshrn_high_n_s64::<16>(vshrn_n_s64::<16>(a), b);
+        let l = vandq_s32(vmovn_high_s64(vmovn_s64(a), b), low);
+        let t = vmlaq_s32(l, h, c);
+        vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
+    };
+    for (s, o) in out.iter_mut().enumerate() {
+        let at = idx(s, r);
+        let lo = half(*acc.get_unchecked(at), *acc.get_unchecked(at + 1));
+        let hi = half(*acc.get_unchecked(at + 2), *acc.get_unchecked(at + 3));
+        *o = vmovn_high_s32(vmovn_s32(lo), hi);
     }
 }
 
@@ -588,23 +649,22 @@ unsafe fn sums(
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            sink(xs, keys, acc, groups);
+            // the chunk's first sweep starts the digit rows' sums afresh
+            if e % CHUNK == 0 {
+                sink::<true>(xs, keys, acc, groups);
+            } else {
+                sink::<false>(xs, keys, acc, groups);
+            }
             e += l;
         }
         for d in 0..DIGITS {
-            narrow(acc, 1 + d, y);
-            super::inverse::<PB>(y);
+            narrow_digits(acc, 1 + d, y);
+            super::inverse_folded::<PB>(y);
             chunk((end - 1) / CHUNK, d, y);
-        }
-        for s in 0..N {
-            for d in 0..DIGITS {
-                let at = idx(s, 1 + d);
-                acc[at..at + 4].fill(vdupq_n_s64(0));
-            }
         }
     }
     narrow(acc, 0, y);
-    super::inverse::<PB>(y);
+    super::inverse_folded::<PB>(y);
 }
 
 /// `r mod 9721` and `t mod M` into `[0, Q)`.
@@ -661,7 +721,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 let mr = a.mean_residues(c, d);
                 let dv = &mut dev[d * 2 * N..][..2 * N];
                 for s in 0..N {
-                    let v = canonical(vsubq_s16(r[s], vdupq_n_s16(mr[s])), p);
+                    let v = canonical(vsubq_s16(r[s], vdupq_n_s16(mr[s])), P1 as i16);
                     dv[2 * s] = vaddw_s16(dv[2 * s], vget_low_s16(v));
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
@@ -716,6 +776,68 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
 mod tests {
     use super::*;
 
+    /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
+    /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.
+    #[test]
+    fn digit_narrowing_is_exact() {
+        let bound = (CHUNK as u64 * PRODUCT) as i64;
+        let mut state = 5u64;
+        let edge = [bound, -bound, bound - 1, -bound + 1, 0, 1, -1, 65535, -65536, 65536, 4860, -4861];
+        let mut want = vec![0i64; ROWS * 8 * N];
+        for (i, w) in want.iter_mut().enumerate() {
+            *w = if i < edge.len() { edge[i] } else { (crate::ntt::tests::xorshift(&mut state) % (2 * bound as u64 + 1)) as i64 - bound };
+        }
+        let mut acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+        unsafe {
+            core::ptr::copy_nonoverlapping(want.as_ptr() as *const int64x2_t, acc.as_mut_ptr(), acc.len());
+            for r in 0..ROWS {
+                let mut out = [vdupq_n_s16(0); N];
+                narrow_digits(&acc, r, &mut out);
+                for s in 0..N {
+                    let o: [i16; 8] = core::mem::transmute(out[s]);
+                    for c in 0..8 {
+                        let v = want[2 * idx(s, r) + c];
+                        assert_eq!((o[c] as i64 - v).rem_euclid(P1 as i64), 0, "{v}");
+                        assert!((o[c] as i64).abs() <= P1 as i64);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A fresh sweep ([`sink`]`::<true>`) over accumulators holding garbage in the digit rows equals
+    /// an accumulating sweep over the same accumulators with those rows zeroed, bit for bit, and the
+    /// base row accumulates in both: one to four tiles, random keys and transforms.
+    #[test]
+    fn fresh_sweep_overwrites_the_digit_rows() {
+        use core::arch::aarch64::*;
+        let mut state = 23u64;
+        let mut next = move || crate::ntt::tests::xorshift(&mut state);
+        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        for groups in 1..=SINK {
+            let keys: Vec<i16> = (0..groups * N * ROWS * LOCK).map(|_| ((next() % 9721) as i64 - 4860) as i16).collect();
+            for x in xs.iter_mut().flatten() {
+                let v: [i16; 8] = core::array::from_fn(|_| next() as i16);
+                *x = unsafe { vld1q_s16(v.as_ptr()) };
+            }
+            let garbage: Vec<i64> = (0..ROWS * 8 * N).map(|_| (next() >> 24) as i64 - (1 << 39)).collect();
+            let mut fresh = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+            unsafe { core::ptr::copy_nonoverlapping(garbage.as_ptr() as *const int64x2_t, fresh.as_mut_ptr(), fresh.len()) };
+            let mut zeroed = fresh.clone();
+            for s in 0..N {
+                for r in 1..ROWS {
+                    zeroed[idx(s, r)..idx(s, r) + 4].fill(unsafe { vdupq_n_s64(0) });
+                }
+            }
+            unsafe {
+                sink::<true>(&xs, keys.as_ptr(), &mut fresh, groups);
+                sink::<false>(&xs, keys.as_ptr(), &mut zeroed, groups);
+            }
+            let words = |v: &[int64x2_t]| -> Vec<[i64; 2]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
+            assert!(words(&fresh) == words(&zeroed), "{groups} tiles");
+        }
+    }
+
     /// `sum_d W_d L_d = A (mod M)` on random matrix elements, coefficient by coefficient.
     #[test]
     fn digits_reconstruct_the_element() {
@@ -732,6 +854,61 @@ mod tests {
             }
             for k in 0..N {
                 assert_eq!(acc[k].rem_euclid(TAIL as i64) as u128, c[k] % TAIL as u128, "element {index} coefficient {k}");
+            }
+        }
+    }
+
+    /// The folded path (key times [`KEY_SCALE`], [`super::super::inverse_folded`]) against the
+    /// unscaled one ([`super::super::inverse`], the path before the fold), bit for bit, on every
+    /// row of one chunk: random key vectors (centered residues, and the extremes `+-(p - 1) / 2`),
+    /// random transforms over all of `i16`, [`CHUNK`]` / `[`SWEEP`] full sweeps through [`sink`] and
+    /// a last one of one to three tiles (on SVE hosts, [`slot_sink`]'s `sdot`), then [`narrow`] and
+    /// the inverse.
+    #[test]
+    fn folded_key_matches_unscaled_path() {
+        use core::arch::aarch64::*;
+        let h = (P1 as i64 - 1) / 2;
+        let mut state = 17u64;
+        let mut next = move || crate::ntt::tests::xorshift(&mut state);
+        let lanes = |v: &[int16x8_t; N]| -> Vec<[i16; 8]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
+        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        for case in 0..3 {
+            let mut old_acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+            let mut new_acc = old_acc.clone();
+            for sweep in 0..=CHUNK / SWEEP {
+                let groups = if sweep < CHUNK / SWEEP { SINK } else { 1 + case };
+                let old: Vec<i16> = (0..groups * N * ROWS * LOCK)
+                    .map(|_| match case {
+                        1 => if next() & 1 == 0 { h as i16 } else { -h as i16 },
+                        _ => ((next() % (2 * h as u64 + 1)) as i64 - h) as i16,
+                    })
+                    .collect();
+                let new: Vec<i16> = old.iter().map(|&k| centered(k as i64 * KEY_SCALE, P1)).collect();
+                for x in xs.iter_mut().flatten() {
+                    let v: [i16; 8] = core::array::from_fn(|_| match case {
+                        2 => if next() & 1 == 0 { i16::MAX } else { i16::MIN },
+                        _ => next() as i16,
+                    });
+                    *x = unsafe { vld1q_s16(v.as_ptr()) };
+                }
+                unsafe {
+                    sink::<false>(&xs, old.as_ptr(), &mut old_acc, groups);
+                    sink::<false>(&xs, new.as_ptr(), &mut new_acc, groups);
+                }
+            }
+            let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);
+            for r in 0..ROWS {
+                unsafe {
+                    narrow(&old_acc, r, &mut y);
+                    super::super::inverse::<PB>(&mut y);
+                }
+                let want = lanes(&y);
+                unsafe {
+                    narrow(&new_acc, r, &mut y);
+                    super::super::inverse_folded::<PB>(&mut y);
+                }
+                assert!(lanes(&y) == want, "case {case} row {r}");
+                assert!(want.iter().flatten().all(|&v| v as i64 >= -h && v as i64 <= h));
             }
         }
     }
