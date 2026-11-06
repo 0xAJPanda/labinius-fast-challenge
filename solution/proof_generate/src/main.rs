@@ -1223,12 +1223,11 @@ impl ProofLayout {
 
 /// The codec's encoding of `parts`, written into `out` (`layout.len()` bytes): the small
 /// fields on this thread, the commitment and the folded witness (`i32` little-endian per
-/// coefficient) in parallel on the pool.
 ///
 /// # Safety
 /// `out` must be valid for writes of `layout.len()` bytes, and `layout` must be
 /// [`ProofLayout::of_parts`]`(parts)`.
-unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
+unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8, commitment_written: bool) {
     let put = |at: &mut usize, bytes: &[u8]| {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
         *at += bytes.len();
@@ -1268,7 +1267,7 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     );
     // A few commitment slices and many folded runs, taken dynamically.
     let ctasks = 4;
-    let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
+    let cruns = if commitment_written { Vec::new() } else { labinius::par::ranges(parts.commitment.len(), ctasks, 4096) };
     let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
@@ -1320,6 +1319,7 @@ struct Output {
     populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
     /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
     commitment: std::sync::Mutex<Option<Vec<u8>>>,
+    copied_from: std::sync::OnceLock<(usize, usize, usize)>,
 }
 
 struct OutputState {
@@ -1329,7 +1329,10 @@ struct OutputState {
     /// Faulting the pages in failed (a kernel without `MADV_POPULATE_WRITE`): the encoding
     /// faults them itself.
     populate_failed: std::sync::atomic::AtomicBool,
+    copied: std::sync::atomic::AtomicUsize,
 }
+
+const COPY_PIECE: usize = 128 << 10;
 
 struct Mapped {
     _file: std::fs::File,
@@ -1429,6 +1432,7 @@ impl Output {
             layout,
             map: std::sync::OnceLock::new(),
             populate_failed: std::sync::atomic::AtomicBool::new(false),
+            copied: std::sync::atomic::AtomicUsize::new(0),
         });
         // Idle work for the workers while the key is set up: create and map the file, build
         // the challenge sampler's tables (needed ~290 ms in, by the folding challenges), read
@@ -1455,6 +1459,7 @@ impl Output {
             job,
             populate: std::sync::OnceLock::new(),
             commitment: std::sync::Mutex::new(Some(commitment)),
+            copied_from: std::sync::OnceLock::new(),
         }
     }
 
@@ -1464,24 +1469,40 @@ impl Output {
         self.commitment.lock().unwrap().take()
     }
 
-    /// Fault the file's pages in on the idle workers, 2 MB per chunk. Called where the main
     /// thread is about to work alone (the transcript absorbing the commitment): a worker still
     /// in a chunk when a dispatch arrives delays it, and the commitment's coarse work units
     /// turn any delay at its start into a delay of its end.
     ///
     /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
     /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
-    fn populate(&self, first: Vec<(usize, usize)>) {
+    ///
+    fn populate(&self, first: Vec<(usize, usize)>, commitment: &[u8]) {
         let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
+        let (from, len) = (commitment.as_ptr() as usize, commitment.len());
+        let pieces = if len == self.state.layout.commitment_bytes { len.div_ceil(COPY_PIECE) } else { 0 };
+        let _ = self.copied_from.set((from, len, pieces));
         let worker_state = self.state.clone();
-        let job = labinius::par::pool().idle(first.len() + chunks, move |i| match first.get(i) {
+        let job = labinius::par::pool().idle(first.len() + chunks + pieces, move |i| match first.get(i) {
             #[cfg(target_os = "linux")]
             Some(&(addr, len)) => unsafe {
                 sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
             },
             #[cfg(not(target_os = "linux"))]
             Some(_) => {}
-            None => worker_state.chunk(i - first.len() + 1),
+            None if i - first.len() < chunks => worker_state.chunk(i - first.len() + 1),
+            None => {
+                let Some(m) = worker_state.mapped() else { return };
+                let at = (i - first.len() - chunks) * COPY_PIECE;
+                let n = COPY_PIECE.min(len - at);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (from + at) as *const u8,
+                        (m.addr + ProofLayout::HEAD + at) as *mut u8,
+                        n,
+                    );
+                }
+                worker_state.copied.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
         });
         let _ = self.populate.set(job);
     }
@@ -1496,7 +1517,13 @@ impl Output {
         let layout = ProofLayout::of_parts(&parts);
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
-                unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
+                let copied = self.copied_from.get().is_some_and(|&(from, len, pieces)| {
+                    pieces > 0
+                        && from == parts.commitment.as_ptr() as usize
+                        && len == parts.commitment.len()
+                        && self.state.copied.load(std::sync::atomic::Ordering::Acquire) == pieces
+                });
+                unsafe { encode_into(&parts, &layout, m.addr as *mut u8, copied) };
                 // The pages are the file's; the exit unmaps them.
                 return;
             }
@@ -1729,7 +1756,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             let (addr, _) = p.region();
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
-        output.populate(first.collect());
+        output.populate(first.collect(), &commitment);
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -2129,7 +2156,11 @@ mod tests {
             };
             let layout = ProofLayout::of_parts(&parts);
             let mut out = vec![0xA5u8; layout.len()];
-            unsafe { encode_into(&parts, &layout, out.as_mut_ptr()) };
+            unsafe { encode_into(&parts, &layout, out.as_mut_ptr(), false) };
+            let mut pre = vec![0xA5u8; layout.len()];
+            pre[layout.commitment_at()..layout.middle_at()].copy_from_slice(&parts.commitment);
+            unsafe { encode_into(&parts, &layout, pre.as_mut_ptr(), true) };
+            assert_eq!(pre, out);
             assert_eq!(out, codec().serialize(&parts.into_proof()).unwrap());
         }
         assert_eq!(ProofLayout::of_instance(MODULUS).len(), 13_958_612, "the default proof's length");
