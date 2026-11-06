@@ -1770,43 +1770,48 @@ mod bitsliced {
     /// slot keeps the six low counter bits of a 64-input tree in registers, plus a three-bit
     /// counter of the trees' weight-64 carries; every seventh chunk that counter is added into
     /// the nine upper counter bits in memory. The `pos` entries add their planes, the `neg`
-    /// entries their complements (leaf full adders by [`csa_neg`]).
     #[target_feature(enable = "avx512f")]
     #[inline(never)]
-    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
+    unsafe fn accumulate_pair<const FIRST: bool>(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
         let planes = planes as *const u64;
         let (even, odd) = (acc, acc.add(BITS));
-        let mut s0: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(even.add(b)));
-        let mut s1: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(odd.add(b)));
+        let zero = _mm512_setzero_si512();
+        let mut s0: [__m512i; 6] =
+            core::array::from_fn(|b| if FIRST { zero } else { _mm512_load_si512(even.add(b)) });
+        let mut s1: [__m512i; 6] =
+            core::array::from_fn(|b| if FIRST { zero } else { _mm512_load_si512(odd.add(b)) });
         // The weight-64 carries of up to seven chunks, in registers at weights 64, 128 and 256;
         // every seventh chunk they are added into the nine upper counter bits in memory.
-        let zero = _mm512_setzero_si512();
         let (mut h0, mut h1) = ([zero; 3], [zero; 3]);
         let mut pending = 0usize;
+        let mut upper_live = !FIRST;
+        macro_rules! ld {
+            ($p:expr) => { if upper_live { _mm512_load_si512($p) } else { zero } };
+        }
         macro_rules! flush {
             ($slot:ident, $h:ident) => {{
                 let p = $slot.add(6);
-                let m6 = _mm512_load_si512(p);
+                let m6 = ld!(p);
                 _mm512_store_si512(p, _mm512_xor_si512(m6, $h[0]));
                 let mut carry = _mm512_and_si512(m6, $h[0]);
                 let p = $slot.add(7);
-                let m7 = _mm512_load_si512(p);
+                let m7 = ld!(p);
                 let x = _mm512_ternarylogic_epi64::<0x96>(m7, $h[1], carry);
                 _mm512_store_si512(p, x);
                 carry = _mm512_ternarylogic_epi64::<0xb2>($h[1], x, carry);
                 let p = $slot.add(8);
-                let m8 = _mm512_load_si512(p);
+                let m8 = ld!(p);
                 let x = _mm512_ternarylogic_epi64::<0x96>(m8, $h[2], carry);
                 _mm512_store_si512(p, x);
                 carry = _mm512_ternarylogic_epi64::<0xb2>($h[2], x, carry);
                 for b in 9..BITS - 1 {
                     let p = $slot.add(b);
-                    let old = _mm512_load_si512(p);
+                    let old = ld!(p);
                     _mm512_store_si512(p, _mm512_xor_si512(old, carry));
                     carry = _mm512_and_si512(old, carry);
                 }
                 let p = $slot.add(BITS - 1);
-                _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
+                _mm512_store_si512(p, _mm512_xor_si512(ld!(p), carry));
             }};
         }
         let mut t: *const u16;
@@ -1865,6 +1870,7 @@ mod bitsliced {
                     h0 = [zero; 3];
                     h1 = [zero; 3];
                     pending = 0;
+                    upper_live = true;
                 }
             }};
         }
@@ -1934,6 +1940,11 @@ mod bitsliced {
         if pending != 0 {
             flush!(even, h0);
             flush!(odd, h1);
+        } else if !upper_live {
+            for b in 6..BITS {
+                _mm512_store_si512(even.add(b), zero);
+                _mm512_store_si512(odd.add(b), zero);
+            }
         }
         for b in 0..6 {
             _mm512_store_si512(even.add(b), s0[b]);
@@ -2243,10 +2254,12 @@ mod bitsliced {
             }
             ran += 1;
             let (block, part) = (task / parts, task % parts);
-            for p in 0..2 * PAIRS * BITS {
-                _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
-            }
             let range = cuts[part]..cuts[part + 1];
+            if range.is_empty() {
+                for p in 0..2 * PAIRS * BITS {
+                    _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
+                }
+            }
             for gi in range.clone() {
                 let group = &groups[gi];
                 #[cfg(test)]
@@ -2268,13 +2281,18 @@ mod bitsliced {
                 if let Some(start) = start { times[0] += start.elapsed(); }
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
+                let acc_ptr = acc.as_mut_ptr();
                 for q in 0..PAIRS {
-                    accumulate_pair(
-                        planes.as_ptr(),
+                    let (pos, neg) = (
                         &group.terms[group.offsets[q]..group.mid[q]],
                         &group.terms[group.mid[q]..group.offsets[q + 1]],
-                        acc.as_mut_ptr().add(2 * q * BITS),
                     );
+                    let slot = acc_ptr.add(2 * q * BITS);
+                    if gi == range.start {
+                        accumulate_pair::<true>(planes.as_ptr(), pos, neg, slot);
+                    } else {
+                        accumulate_pair::<false>(planes.as_ptr(), pos, neg, slot);
+                    }
                 }
                 #[cfg(test)]
                 if let Some(start) = start { times[1] += start.elapsed(); }
@@ -2509,7 +2527,7 @@ mod bitsliced {
                                 }
                             }
                         }
-                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
+                        accumulate_pair::<false>(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
                     }
                     for slot in 0..2 {
                         let mut got = [0i16; LANES];
