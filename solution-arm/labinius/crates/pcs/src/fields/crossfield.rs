@@ -1,8 +1,7 @@
 use super::bitmat::{transpose_tile, untranspose_planes, GF_IDENT};
 use super::scalar::{B128, F162};
-use crate::arch::*;
-use crate::par;
 use crate::simd::transpose_f162::transpose8x8_q;
+use crate::arch::*;
 
 pub const LOG_PACK: usize = 7;
 pub const PACK: usize = 1 << LOG_PACK;
@@ -84,47 +83,10 @@ pub fn eq_expand_b128(r: &[B128]) -> Vec<B128> {
     t
 }
 
-/// Leading variables [`eq_expand_b128_into`] expands on one thread before it splits the table.
-const EXPAND_TOP: usize = 8;
-
 /// The expansion in place, doubling from the back so no entry is read after it is written.
-///
-/// After the first [`EXPAND_TOP`] rounds, every later round maps entry `i` to entries `2i` and
-/// `2i + 1` only, so each of the `2^EXPAND_TOP` entries grows its own contiguous block of the
-/// final table. The blocks are expanded on the workers with the same per-entry operations as
-/// the single-threaded doubling, so the table is identical.
 pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
     assert_eq!(t.len(), 1 << r.len());
-    let parts = par::workers(t.len(), 1 << 16);
-    if parts <= 1 || r.len() <= EXPAND_TOP {
-        expand_from(r, t, B128::ONE);
-        return;
-    }
-    let (top, low) = r.split_at(EXPAND_TOP);
-    let mut prefix = [B128::ZERO; 1 << EXPAND_TOP];
-    expand_from(top, &mut prefix, B128::ONE);
-    let size = 1usize << low.len();
-    let edges: Vec<(usize, usize)> = (0..parts)
-        .map(|w| par::block(1 << EXPAND_TOP, parts, w, 1))
-        .collect();
-    let scaled: Vec<(usize, usize)> = edges.iter().map(|&(s, e)| (s * size, e * size)).collect();
-    let chunks = par::split_mut(t, &scaled);
-    let prefix = &prefix;
-    std::thread::scope(|scope| {
-        for (chunk, &(s, _)) in chunks.into_iter().zip(&edges) {
-            scope.spawn(move || {
-                for (i, block) in chunk.chunks_exact_mut(size).enumerate() {
-                    expand_from(low, block, prefix[s + i]);
-                }
-            });
-        }
-    });
-}
-
-/// The doubling of [`eq_expand_b128_into`] from a root value `start`.
-fn expand_from(r: &[B128], t: &mut [B128], start: B128) {
-    assert_eq!(t.len(), 1 << r.len());
-    t[0] = start;
+    t[0] = B128::ONE;
     for (round, &ri) in r.iter().enumerate() {
         for i in (0..1 << round).rev() {
             let hi = t[i] * ri;
@@ -179,50 +141,13 @@ unsafe fn xor3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
 
 const TILE: usize = 64;
 
-/// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product. The tiles are
-/// split over the workers and the per-worker sums added (XOR), then the last partial tile.
+/// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product: per tile the
+/// bit-transposed bytes of `pi0` are the matrices, those of `eq_hi` the vectors, and
+/// `acc[h][kb].qword[i].byte[t].bit[k']` sums `V[8kb + 7 - k'][8(8h + i) + t]`.
 fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     assert_eq!(pi0.len(), eq_hi.len());
     let n = pi0.len();
     let tiles = n / TILE;
-    let parts = par::workers(tiles, 256);
-    let sums = par::map_blocks(tiles, parts, 1, |_, t0, t1| {
-        tile_sums(&pi0[TILE * t0..TILE * t1], &eq_hi[TILE * t0..TILE * t1])
-    });
-    let mut v = vec![B128::ZERO; PACK];
-    for s in sums {
-        for (vk, sk) in v.iter_mut().zip(s) {
-            *vk = *vk + sk;
-        }
-    }
-    for (&p, &e) in pi0[TILE * tiles..].iter().zip(&eq_hi[TILE * tiles..]) {
-        for (k, vk) in v.iter_mut().enumerate() {
-            if p.bit(k) {
-                *vk = *vk + e;
-            }
-        }
-    }
-    v
-}
-
-/// [`partial_evals`] over whole tiles, natively on AArch64.
-#[cfg(target_arch = "aarch64")]
-fn tile_sums(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
-    super::neon::partial_evals_rows(pi0, eq_hi)
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn tile_sums(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
-    partial_evals_tiles(pi0, eq_hi)
-}
-
-/// The sums of [`partial_evals`] over whole tiles: per tile the bit-transposed bytes of `pi0`
-/// are the matrices, those of `eq_hi` the vectors, and `acc[h][kb].qword[i].byte[t].bit[k']`
-/// sums `V[8kb + 7 - k'][8(8h + i) + t]`.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn partial_evals_tiles(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
-    assert_eq!(pi0.len(), eq_hi.len());
-    let tiles = pi0.len() / TILE;
     let mut v = vec![B128::ZERO; PACK];
     unsafe {
         let ident = _mm512_set1_epi64(GF_IDENT);
@@ -266,6 +191,13 @@ fn partial_evals_tiles(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
             }
         }
     }
+    for (&p, &e) in pi0[TILE * tiles..].iter().zip(&eq_hi[TILE * tiles..]) {
+        for (k, vk) in v.iter_mut().enumerate() {
+            if p.bit(k) {
+                *vk = *vk + e;
+            }
+        }
+    }
     v
 }
 
@@ -286,40 +218,19 @@ unsafe fn split_words(x: *const B128) -> (__m512i, __m512i) {
 fn poly_from_b128(pi0: &[B128], out: &mut super::sumcheck::Poly) {
     let n = pi0.len();
     assert_eq!(out.n, n);
-    let parts = par::workers(n, 1 << 16);
-    let edges: Vec<(usize, usize)> = (0..parts).map(|t| par::block(n, parts, t, 8)).collect();
-    let [w0, w1, w2] = &mut out.w;
-    let (c0, c1, c2) = (
-        par::split_mut(w0, &edges),
-        par::split_mut(w1, &edges),
-        par::split_mut(w2, &edges),
-    );
-    std::thread::scope(|scope| {
-        for (((x0, x1), x2), &(s, e)) in c0.into_iter().zip(c1).zip(c2).zip(&edges) {
-            #[cfg(target_arch = "aarch64")]
-            scope.spawn(move || super::neon::poly_from_b128_rows(&pi0[s..e], [x0, x1, x2]));
-            #[cfg(not(target_arch = "aarch64"))]
-            scope.spawn(move || poly_from_b128_block(&pi0[s..e], [x0, x1, x2]));
-        }
-    });
-}
-
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn poly_from_b128_block(pi0: &[B128], w: [&mut [u64]; 3]) {
-    let n = pi0.len();
-    let [w0, w1, w2] = w;
-    w2.fill(0);
+    let w = &mut out.w;
+    w[2].fill(0);
     let blocks = n / 8;
     unsafe {
         for b in 0..blocks {
             let (lo, hi) = split_words(pi0.as_ptr().add(8 * b));
-            _mm512_storeu_si512(w0.as_mut_ptr().add(8 * b) as *mut __m512i, lo);
-            _mm512_storeu_si512(w1.as_mut_ptr().add(8 * b) as *mut __m512i, hi);
+            _mm512_storeu_si512(w[0].as_mut_ptr().add(8 * b) as *mut __m512i, lo);
+            _mm512_storeu_si512(w[1].as_mut_ptr().add(8 * b) as *mut __m512i, hi);
         }
     }
     for j in 8 * blocks..n {
-        w0[j] = pi0[j].0 as u64;
-        w1[j] = (pi0[j].0 >> 64) as u64;
+        w[0][j] = pi0[j].0 as u64;
+        w[1][j] = (pi0[j].0 >> 64) as u64;
     }
 }
 
@@ -346,51 +257,14 @@ fn eq_matrices(batch: &[F162]) -> [[u64; 16]; 24] {
 fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumcheck::Poly) {
     let n = eqs[0].len();
     assert_eq!(out.n, n);
-    let ms: Vec<[[u64; 16]; 24]> = batches.iter().map(|b| eq_matrices(b)).collect();
-    let parts = par::workers(n, 1 << 16);
-    let edges: Vec<(usize, usize)> = (0..parts).map(|t| par::block(n, parts, t, TILE)).collect();
-    let [w0, w1, w2] = &mut out.w;
-    let (c0, c1, c2) = (
-        par::split_mut(w0, &edges),
-        par::split_mut(w1, &edges),
-        par::split_mut(w2, &edges),
-    );
-    let ms = &ms;
-    #[cfg(target_arch = "aarch64")]
-    let tabs: Vec<super::neon::ByteTables> =
-        batches.iter().map(|b| super::neon::ByteTables::new(b)).collect();
-    #[cfg(target_arch = "aarch64")]
-    let tabs = &tabs;
-    std::thread::scope(|scope| {
-        for (((x0, x1), x2), &(s, e)) in c0.into_iter().zip(c1).zip(c2).zip(&edges) {
-            let views: Vec<&[B128]> = eqs.iter().map(|eq| &eq[s..e]).collect();
-            #[cfg(target_arch = "aarch64")]
-            scope.spawn(move || {
-                let _ = (batches, ms);
-                super::neon::poly_from_eq_rows(&views, tabs, [x0, x1, x2])
-            });
-            #[cfg(not(target_arch = "aarch64"))]
-            scope.spawn(move || poly_from_eq_block(&views, batches, ms, [x0, x1, x2]));
-        }
-    });
-}
-
-/// [`poly_from_eq`] on one block: whole tiles through the byte planes, the rest through [`psi`].
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
-fn poly_from_eq_block(
-    eqs: &[&[B128]],
-    batches: &[Vec<F162>],
-    ms: &[[[u64; 16]; 24]],
-    w: [&mut [u64]; 3],
-) {
-    let n = eqs[0].len();
-    let mut w = w;
+    let w = &mut out.w;
     let tiles = n / TILE;
+    let ms: Vec<[[u64; 16]; 24]> = batches.iter().map(|b| eq_matrices(b)).collect();
     unsafe {
         let mut xe = [_mm512_setzero_si512(); 16];
         for t in 0..tiles {
             let mut acc = [_mm512_setzero_si512(); 24];
-            for (eq, m) in eqs.iter().zip(ms.iter()) {
+            for (eq, m) in eqs.iter().zip(&ms) {
                 transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
                 for (a, row) in acc.iter_mut().zip(m) {
                     for k in (0..16).step_by(2) {
@@ -765,67 +639,6 @@ mod tests {
         let (v1, m1, f1, ws) = run(Workspace::new(l, 1));
         let (v2, m2, f2, _) = run(ws);
         assert_eq!((v1, m1, f1), (v2, m2, f2));
-    }
-
-    /// The worker split of every switch pass, on sizes large enough for several workers and
-    /// with partial tiles: the parallel results against single-threaded references.
-    #[test]
-    fn parallel_passes_match_the_references() {
-        let mut x = 0x0F1E_2D3C_4B5A_6978_8796_A5B4_C3D2_E1F0u128;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x.wrapping_mul(0x2545F4914F6CDD1D_9E3779B97F4A7C15) ^ (x >> 64)
-        };
-        // eq expansion: subtrees on the workers against the plain doubling.
-        let r: Vec<B128> = (0..18).map(|_| B128(next())).collect();
-        let mut par_t = vec![B128::ZERO; 1 << 18];
-        eq_expand_b128_into(&r, &mut par_t);
-        let mut seq_t = vec![B128::ZERO; 1 << 18];
-        expand_from(&r, &mut seq_t, B128::ONE);
-        assert!(par_t == seq_t, "eq expansion");
-        // partial evaluations: workers + tail against the emulated tiles and the bitwise sum.
-        let n = 3 * (1 << 14) + 13;
-        let pi0: Vec<B128> = (0..n).map(|_| B128(next())).collect();
-        let eq: Vec<B128> = (0..n).map(|_| B128(next())).collect();
-        let got = partial_evals(&pi0, &eq);
-        let tiles = n / TILE;
-        let mut emu = partial_evals_tiles(&pi0[..TILE * tiles], &eq[..TILE * tiles]);
-        for (&p, &e) in pi0[TILE * tiles..].iter().zip(&eq[TILE * tiles..]) {
-            for (k, vk) in emu.iter_mut().enumerate() {
-                if p.bit(k) {
-                    *vk = *vk + e;
-                }
-            }
-        }
-        assert_eq!(got, emu, "partial evaluations vs emulated");
-        assert_eq!(got, reference(&pi0, &eq), "partial evaluations vs bitwise");
-        // the sumcheck's polynomials.
-        let n = (1 << 17) + 13;
-        let batch: Vec<F162> = (0..PACK)
-            .map(|_| F162([next() as u64, next() as u64, (next() as u64) & M34_TEST]))
-            .collect();
-        let tab = psi_table(&batch);
-        let eq: Vec<B128> = (0..n).map(|_| B128(next())).collect();
-        let mut poly = super::super::sumcheck::Poly::zero(n);
-        poly_from_eq(&[&eq], &[batch.clone()], &mut poly);
-        assert!((0..n).all(|j| poly.get(j) == psi(&tab, eq[j])), "poly_from_eq");
-        let mut emu = super::super::sumcheck::Poly::zero(n);
-        {
-            let ms = [eq_matrices(&batch)];
-            let [w0, w1, w2] = &mut emu.w;
-            poly_from_eq_block(&[&eq], &[batch.clone()], &ms, [&mut w0[..], &mut w1[..], &mut w2[..]]);
-        }
-        assert!(emu.w == poly.w, "poly_from_eq vs emulated");
-        let p: Vec<B128> = (0..n).map(|_| B128(next())).collect();
-        poly_from_b128(&p, &mut poly);
-        assert!((0..n).all(|j| poly.get(j) == F162::from_b128(p[j])), "poly_from_b128");
-        {
-            let [w0, w1, w2] = &mut emu.w;
-            poly_from_b128_block(&p, [&mut w0[..], &mut w1[..], &mut w2[..]]);
-        }
-        assert!(emu.w == poly.w, "poly_from_b128 vs emulated");
     }
 
     #[test]

@@ -11,7 +11,5 @@
 pub mod bitmat;
 pub mod crossfield;
 pub mod f162;
-#[cfg(target_arch = "aarch64")]
-mod neon;
 pub mod scalar;
 pub mod sumcheck;

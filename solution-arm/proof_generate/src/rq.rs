@@ -112,24 +112,6 @@ impl Expansion {
 /// prime and transform. `A` depends on the fixed seed and on `q` alone, never on
 /// `LABINIUS_SEED`, so a prover may precompute it.
 pub fn ajtai_matrix(q: u128, elements: usize) -> Vec<u128> {
-    let workers = labinius::par::threads();
-    let per = elements.div_ceil(workers);
-    let mut matrix = vec![0u128; elements * N];
-    std::thread::scope(|scope| {
-        for (block, base) in matrix.chunks_mut(per * N).zip((0..).step_by(per)) {
-            scope.spawn(move || {
-                for (i, element) in block.chunks_mut(N).enumerate() {
-                    ajtai_element(q, elements, base + i, element);
-                }
-            });
-        }
-    });
-    matrix
-}
-
-/// Element `index` of [`ajtai_matrix`]`(q, elements)`: its `N` coefficients, written to `out`.
-pub fn ajtai_element(q: u128, elements: usize, index: usize, out: &mut [u128]) {
-    assert_eq!(out.len(), N);
     let width = coefficient_bytes(q);
     let bits = modulus_bits(q);
     let mask = if bits == 128 {
@@ -137,16 +119,28 @@ pub fn ajtai_element(q: u128, elements: usize, index: usize, out: &mut [u128]) {
     } else {
         (1u128 << bits) - 1
     };
-    let mut expansion = Expansion::new(q, elements, index);
-    for slot in out.iter_mut() {
-        loop {
-            let candidate = expansion.draw(width) & mask;
-            if candidate < q {
-                *slot = candidate;
-                break;
-            }
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = elements.div_ceil(workers);
+    let mut matrix = vec![0u128; elements * N];
+    std::thread::scope(|scope| {
+        for (block, base) in matrix.chunks_mut(per * N).zip((0..).step_by(per)) {
+            scope.spawn(move || {
+                for (i, element) in block.chunks_mut(N).enumerate() {
+                    let mut expansion = Expansion::new(q, elements, base + i);
+                    for slot in element.iter_mut() {
+                        loop {
+                            let candidate = expansion.draw(width) & mask;
+                            if candidate < q {
+                                *slot = candidate;
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
         }
-    }
+    });
+    matrix
 }
 
 /// Fold a raw polynomial product of degree below `2 N - 1` into `R_Q`, using
