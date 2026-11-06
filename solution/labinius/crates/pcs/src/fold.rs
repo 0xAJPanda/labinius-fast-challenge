@@ -2371,7 +2371,10 @@ mod bitsliced {
         let out_addr = out.as_mut_ptr() as usize;
         let t0 = std::time::Instant::now();
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
-        crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
+        let runners = workers.clamp(1, tasks);
+        let placement = crate::par::CorePlacement::for_logical(runners);
+        crate::par::pool().run(runners, |worker| unsafe {
+            let _affinity = placement.as_ref().and_then(|p| p.pin(worker));
             let ran = run_worker::<GROUP, FUSED>(
                 worker,
                 words,
