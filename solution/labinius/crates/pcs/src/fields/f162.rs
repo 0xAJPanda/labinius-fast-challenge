@@ -49,6 +49,16 @@ pub unsafe fn mac_soa8(acc: &mut [__m512i; 12], a: [__m512i; 3], b: [__m512i; 3]
 
 #[inline(always)]
 pub unsafe fn reduce_soa8(p: [__m512i; 12]) -> [__m512i; 3] {
+    reduce_soa8_idx(p, idx_lo(), idx_hi())
+}
+
+#[inline(always)]
+pub unsafe fn reduce_soa8_halves(p: [__m512i; 12]) -> [__m512i; 3] {
+    reduce_soa8_idx(p, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15))
+}
+
+#[inline(always)]
+unsafe fn reduce_soa8_idx(p: [__m512i; 12], lo: __m512i, hi: __m512i) -> [__m512i; 3] {
     let m17 = _mm512_set1_epi64(((1u64 << 17) - 1) as i64);
     let m34 = _mm512_set1_epi64(((1u64 << 34) - 1) as i64);
     let (m0e, m0o, m1e, m1o, m2e, m2o) = (p[0], p[1], p[2], p[3], p[4], p[5]);
@@ -61,8 +71,6 @@ pub unsafe fn reduce_soa8(p: [__m512i; 12]) -> [__m512i; 3] {
     let d2e = _mm512_xor_si512(x3(k02e, m0e, m2e), m1e);
     let d2o = _mm512_xor_si512(x3(k02o, m0o, m2o), m1o);
 
-    let lo = idx_lo();
-    let hi = idx_hi();
     let p0 = _mm512_permutex2var_epi64(m0e, lo, m0o);
     let p1 = _mm512_xor_si512(
         _mm512_permutex2var_epi64(m0e, hi, m0o),

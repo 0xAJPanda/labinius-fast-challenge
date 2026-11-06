@@ -1785,26 +1785,32 @@ unsafe fn bcast4(x: F162) -> [__m512i; 4] {
     [w0, w1, w2, _mm512_xor_si512(w0, w1)]
 }
 
+///
+/// # Safety
 #[inline(always)]
-unsafe fn prods_word10(a: [__m512i; 4], (b0, b1): (__m512i, __m512i)) -> [__m512i; 10] {
-    let sb = _mm512_xor_si512(b0, b1);
+unsafe fn prods_word10(a: [__m512i; 4], x: *const B128) -> [__m512i; 10] {
+    let q = x as *const u8;
+    let lo = _mm512_loadu_si512(q as *const __m512i);
+    let hi = _mm512_loadu_si512(q.add(64) as *const __m512i);
+    let slo = _mm512_xor_si512(lo, _mm512_loadu_si512(q.add(8) as *const __m512i));
+    let shi = _mm512_xor_si512(hi, _mm512_loadu_si512(q.add(56) as *const __m512i));
     [
-        _mm512_clmulepi64_epi128::<0x00>(a[0], b0),
-        _mm512_clmulepi64_epi128::<0x11>(a[0], b0),
-        _mm512_clmulepi64_epi128::<0x00>(a[1], b1),
-        _mm512_clmulepi64_epi128::<0x11>(a[1], b1),
-        _mm512_clmulepi64_epi128::<0x00>(a[3], sb),
-        _mm512_clmulepi64_epi128::<0x11>(a[3], sb),
-        _mm512_clmulepi64_epi128::<0x00>(a[2], b0),
-        _mm512_clmulepi64_epi128::<0x11>(a[2], b0),
-        _mm512_clmulepi64_epi128::<0x00>(a[2], b1),
-        _mm512_clmulepi64_epi128::<0x11>(a[2], b1),
+        _mm512_clmulepi64_epi128::<0x00>(a[0], lo),
+        _mm512_clmulepi64_epi128::<0x00>(a[0], hi),
+        _mm512_clmulepi64_epi128::<0x11>(a[1], lo),
+        _mm512_clmulepi64_epi128::<0x11>(a[1], hi),
+        _mm512_clmulepi64_epi128::<0x00>(a[3], slo),
+        _mm512_clmulepi64_epi128::<0x11>(a[3], shi),
+        _mm512_clmulepi64_epi128::<0x00>(a[2], lo),
+        _mm512_clmulepi64_epi128::<0x00>(a[2], hi),
+        _mm512_clmulepi64_epi128::<0x11>(a[2], lo),
+        _mm512_clmulepi64_epi128::<0x11>(a[2], hi),
     ]
 }
 
 #[inline(always)]
-unsafe fn mac_word10(acc: &mut [__m512i; 10], a: [__m512i; 4], b: (__m512i, __m512i)) {
-    let p = prods_word10(a, b);
+unsafe fn mac_word10(acc: &mut [__m512i; 10], a: [__m512i; 4], x: *const B128) {
+    let p = prods_word10(a, x);
     for i in 0..10 {
         acc[i] = _mm512_xor_si512(acc[i], p[i]);
     }
@@ -1813,7 +1819,7 @@ unsafe fn mac_word10(acc: &mut [__m512i; 10], a: [__m512i; 4], b: (__m512i, __m5
 #[inline(always)]
 unsafe fn reduce_word10(acc: [__m512i; 10]) -> [__m512i; 3] {
     let z = _mm512_setzero_si512();
-    super::f162::reduce_soa8([
+    super::f162::reduce_soa8_halves([
         acc[0],
         acc[1],
         acc[2],
@@ -1842,13 +1848,13 @@ unsafe fn materialize_prefix_range(
                 let a0 = words.wrapping_add(j + MATERIALIZE_AHEAD + q0 * len) as *const i8;
                 _mm_prefetch::<_MM_HINT_T0>(a0);
                 _mm_prefetch::<_MM_HINT_T0>(a0.wrapping_add(64));
-                let mut acc = prods_word10(ws[0], split_words(words.add(j + q0 * len)));
+                let mut acc = prods_word10(ws[0], words.add(j + q0 * len));
                 for (i, &weight) in ws.iter().enumerate().skip(1) {
                     let q = q0 + i;
                     let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q * len) as *const i8;
                     _mm_prefetch::<_MM_HINT_T0>(a);
                     _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
-                    mac_word10(&mut acc, weight, split_words(words.add(j + q * len)));
+                    mac_word10(&mut acc, weight, words.add(j + q * len));
                 }
                 let mut v = reduce_word10(acc);
                 if s > 0 {
