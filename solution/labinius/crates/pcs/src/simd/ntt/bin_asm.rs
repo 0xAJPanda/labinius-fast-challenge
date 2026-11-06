@@ -1412,7 +1412,11 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
             ) };
             for h in 0..core::hint::black_box(H) {
                 let bpj = bps[h].add(32 * 27 * j);
-                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
+                if Q == 9721 {
+                    tail27_sms_regcall(bpj, os[h], t4, t5, t6);
+                } else {
+                    tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
+                }
             }
         }
         for j in 0..6 {
@@ -1551,3 +1555,4 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
 }
 
 include!("twiddle_expanded.rs");
+include!("sms_tail_regcall.rs");

@@ -307,10 +307,12 @@ unsafe fn horizontal_word10(acc: [__m512i; 10]) -> F162 {
 
 type F162Word = crate::fields::scalar::B128;
 
+/// [`dot`] against a run of `n` `B128` words read as their lifts.
 ///
 /// # Safety
-unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162 {
-    debug_assert!(a.n >= from + n && from % 8 == 0);
+/// `b` addresses `n` words and `a` holds at least `n` elements.
+unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
+    debug_assert!(a.n >= n);
     let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
     let (mut acc, blocks) = ([_mm512_setzero_si512(); 10], n / 8);
@@ -322,9 +324,9 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
         let x = [
-            _mm512_loadu_si512(a.w[0].as_ptr().add(from + 8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[1].as_ptr().add(from + 8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[2].as_ptr().add(from + 8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
         let sa = _mm512_xor_si512(x[0], x[1]);
         mac_word10(&mut acc, x, sa, load_words2(b.add(8 * t), lo, hi));
@@ -335,7 +337,7 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
         F162::ZERO
     };
     for k in 8 * blocks..n {
-        out += a.get(from + k) * F162::from_b128(*b.add(k));
+        out += a.get(k) * F162::from_b128(*b.add(k));
     }
     out
 }
@@ -345,8 +347,9 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
 /// are prefetched 1 KB ahead.
 ///
 /// # Safety
-unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
-    debug_assert!(a.n >= from + n && from % 8 == 0);
+/// `b0` and `b1` each address `n` words and `a` holds at least `n` elements.
+unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
+    debug_assert!(a.n >= n);
     let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
     let mut acc0 = [_mm512_setzero_si512(); 10];
@@ -360,9 +363,9 @@ unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1.wrapping_add(64));
         let x = [
-            _mm512_loadu_si512(a.w[0].as_ptr().add(from + 8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[1].as_ptr().add(from + 8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[2].as_ptr().add(from + 8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
         let sa = _mm512_xor_si512(x[0], x[1]);
         mac_word10(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
@@ -374,7 +377,7 @@ unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162
         [F162::ZERO; 2]
     };
     for k in 8 * blocks..n {
-        let ak = a.get(from + k);
+        let ak = a.get(k);
         out[0] += ak * F162::from_b128(*b0.add(k));
         out[1] += ak * F162::from_b128(*b1.add(k));
     }
@@ -439,45 +442,38 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     // up, and each pair of columns in a chunk shares one pass over `eq` via `dot_words2`.
     let chunk = columns.div_ceil(32 * workers.max(1)).max(2).next_multiple_of(2);
     let chunks = columns.div_ceil(chunk);
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
-    let split = (wdim - wdim / TAIL_PARTS) & !7;
-    for (from, n, add) in [(0, split, false), (split, wdim - split, true)] {
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let put = |j: usize, v: F162| unsafe {
-            let p = (out_addr as *mut F162).add(j);
-            if add { *p += v } else { p.write(v) }
-        };
-        crate::par::pool().run(workers.clamp(1, chunks), |_| loop {
-            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if k >= chunks {
-                break;
+    crate::par::pool().run(workers.clamp(1, chunks), |_| loop {
+        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if k >= chunks {
+            break;
+        }
+        // Chunk `k` owns `out[k * chunk ..]`.
+        let end = ((k + 1) * chunk).min(columns);
+        let mut j = k * chunk;
+        while j + 1 < end {
+            let [v0, v1] = unsafe {
+                dot_words2(
+                    &eq,
+                    words.as_ptr().add(j * wdim),
+                    words.as_ptr().add((j + 1) * wdim),
+                    wdim,
+                )
+            };
+            unsafe {
+                (out_addr as *mut F162).add(j).write(v0);
+                (out_addr as *mut F162).add(j + 1).write(v1);
             }
-            // Chunk `k` owns `out[k * chunk ..]`.
-            let end = ((k + 1) * chunk).min(columns);
-            let mut j = k * chunk;
-            while j + 1 < end {
-                let [v0, v1] = unsafe {
-                    dot_words2(
-                        &eq,
-                        from,
-                        words.as_ptr().add(j * wdim + from),
-                        words.as_ptr().add((j + 1) * wdim + from),
-                        n,
-                    )
-                };
-                put(j, v0);
-                put(j + 1, v1);
-                j += 2;
-            }
-            if j < end {
-                put(j, unsafe { dot_words(&eq, from, words.as_ptr().add(j * wdim + from), n) });
-            }
-        });
-    }
+            j += 2;
+        }
+        if j < end {
+            let value = unsafe { dot_words(&eq, words.as_ptr().add(j * wdim), wdim) };
+            unsafe { (out_addr as *mut F162).add(j).write(value) };
+        }
+    });
     out
 }
-
-const TAIL_PARTS: usize = 4;
 
 #[cfg(test)]
 mod word_tests {
