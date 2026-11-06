@@ -314,11 +314,11 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
     let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
     let (mut acc, blocks) = ([_mm512_setzero_si512(); 10], n / 8);
+    let last = blocks.saturating_sub(1);
     for t in 0..blocks {
         // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
         // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
-        // the phase; 4 KB and 16 KB ahead are no better). A prefetch past the end is harmless.
-        let ahead = b.wrapping_add(8 * t + 64) as *const i8;
+        let ahead = b.wrapping_add(8 * (t + 8).min(last)) as *const i8;
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
         let x = [
@@ -352,11 +352,13 @@ unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162
     let mut acc0 = [_mm512_setzero_si512(); 10];
     let mut acc1 = [_mm512_setzero_si512(); 10];
     let blocks = n / 8;
+    let last = blocks.saturating_sub(1);
     for t in 0..blocks {
-        let ahead0 = b0.wrapping_add(8 * t + 64) as *const i8;
+        let at = 8 * (t + 8).min(last);
+        let ahead0 = b0.wrapping_add(at) as *const i8;
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0.wrapping_add(64));
-        let ahead1 = b1.wrapping_add(8 * t + 64) as *const i8;
+        let ahead1 = b1.wrapping_add(at) as *const i8;
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1.wrapping_add(64));
         let x = [
