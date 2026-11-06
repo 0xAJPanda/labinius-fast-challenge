@@ -425,16 +425,16 @@ const fn radix3_bound(p: u32, mut b: u32, s: Schedule, first: usize) -> u32 {
 /// [`neon::pass_ab`]), whose levels 0 to 2 are table lookups: each level-2 output is the sum of
 /// two centered table entries, so at most `p - 1`, and the level-3 twiddles are in the tables,
 /// so level 3 is the bare radix-3 butterfly ([`front_transform_bound`]) and reduces nothing.
-/// Prime 9721 (the SMS transform): Barrett-reduced first inputs at level 4 and the
-/// one-multiplication [`FIRST13`] reductions at levels 5 and 6; 19 elements per accumulator
-/// reduction ([`front_accumulator_bound`]).
+/// Prime 9721 (the SMS transform): the one-multiplication [`FIRST13`] reductions of the first
+/// inputs at levels 4 to 6; the SVE path's sums are `i64` (no reductions), the NEON fallback's
+/// `i32` sums are reduced every 15 elements at most ([`front_accumulator_bound`]).
 pub const FRONT_SCHEDULES: [Schedule; 2] = [
     Schedule { before: [NONE; 7], reduce_d: false, cheap: false, accumulate: 37 },
     Schedule {
-        before: [NONE, NONE, NONE, NONE, FIRST13, FIRST13, FIRST],
+        before: [NONE, NONE, NONE, NONE, FIRST13, FIRST13, FIRST13],
         reduce_d: false,
         cheap: false,
-        accumulate: 19,
+        accumulate: 15,
     },
 ];
 

@@ -457,8 +457,28 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
     }
 }
 
+/// `sum[k] += sum_x tabs[x][pats[x][k]]` for a full pass of [`PASS`] tables (A3-03).
+///
+/// The same GF(2) sum as the generic loop in [`partial_evals_sets`], in a different order. That loop
+/// runs over a dynamic `count`, so LLVM keeps it rolled: six instructions per lookup (post-indexed
+/// `ldrb`, `subs`, `ldr q`, `add`, `eor`, `b.ne`) and one serial `eor` chain through all eight tables
+/// of an entry. Here the eight lookups are unrolled: indices come from immediate-offset byte loads,
+/// the eight tables are fixed base registers, and the XORs form a balanced tree.
+#[inline(always)]
+unsafe fn lookup_pass(tabs: &[[uint8x16_t; 256]], pats: &[[u8; 128]; PASS], sum: &mut [uint8x16_t; 128]) {
+    debug_assert!(tabs.len() >= PASS);
+    let t: [*const uint8x16_t; PASS] = core::array::from_fn(|x| tabs.get_unchecked(x).as_ptr());
+    let p = pats.as_ptr() as *const u8;
+    for k in 0..128 {
+        let v = |x: usize| *t[x].add(*p.add(128 * x + k) as usize);
+        let a = veorq_u8(veorq_u8(v(0), v(1)), veorq_u8(v(2), v(3)));
+        let b = veorq_u8(veorq_u8(v(4), v(5)), veorq_u8(v(6), v(7)));
+        let s = sum.get_unchecked_mut(k);
+        *s = veorq_u8(*s, veorq_u8(a, b));
+    }
+}
+
 /// Partial sets share one equality block and its lookup tables across all word blocks.
-const SPASS: usize = 4;
 pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end: usize) -> Vec<Vec<B128>> {
     let stride = eq.len();
     assert_eq!(words.len() % stride, 0);
@@ -466,16 +486,20 @@ pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end:
     let blocks = words.len() / stride;
     unsafe {
         let mut sums = vec![[vdupq_n_u8(0); 128]; blocks];
-        let mut tabs = vec![[vdupq_n_u8(0); 256]; SPASS];
-        let mut pats = [[0u8; 128]; SPASS];
-        for base in (start..end).step_by(GROUP * SPASS) {
-            let count = ((end - base) / GROUP).min(SPASS);
+        let mut tabs = vec![[vdupq_n_u8(0); 256]; PASS];
+        let mut pats = [[0u8; 128]; PASS];
+        for base in (start..end).step_by(GROUP * PASS) {
+            let count = ((end - base) / GROUP).min(PASS);
             for x in 0..count {
                 combinations(eq.as_ptr().add(base + GROUP * x), &mut tabs[x]);
             }
             for (q, sum) in sums.iter_mut().enumerate() {
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
+                }
+                if count == PASS {
+                    lookup_pass(&tabs, &pats, sum);
+                    continue;
                 }
                 for k in 0..128 {
                     let mut a = sum[k];
@@ -614,6 +638,29 @@ mod tests {
                 }
             }
             assert_eq!(partial_evals_rows(&pi0, &eq), want, "n {n}");
+        }
+    }
+
+    #[test]
+    fn partial_sets_match_the_bitwise_sum() {
+        let mut rng = Rng(0x0A03_0A03_1357_9BDF_2468_ACE0_FDB9_7531);
+        for (stride, blocks, start, end) in [(64usize, 1usize, 0usize, 64usize), (128, 3, 0, 128), (200, 2, 64, 200), (1024, 4, 512, 1024), (72, 2, 0, 72)] {
+            let words: Vec<B128> = (0..stride * blocks).map(|_| B128(rng.next())).collect();
+            let eq: Vec<B128> = (0..stride).map(|_| B128(rng.next())).collect();
+            let (start, end) = (start / GROUP * GROUP, end / GROUP * GROUP);
+            let got = partial_evals_sets(&words, &eq, start, end);
+            for q in 0..blocks {
+                let mut want = vec![B128::ZERO; 128];
+                for j in start..end {
+                    let p = words[q * stride + j];
+                    for (k, w) in want.iter_mut().enumerate() {
+                        if p.bit(k) {
+                            *w = *w + eq[j];
+                        }
+                    }
+                }
+                assert_eq!(got[q], want, "stride {stride} block {q}");
+            }
         }
     }
 

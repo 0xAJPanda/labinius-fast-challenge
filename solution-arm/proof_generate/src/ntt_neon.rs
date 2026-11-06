@@ -39,6 +39,9 @@ pub struct Kernel {
     c: [[i16; 16]; 24],
     /// Level 6, per two level-5 nodes: their radix-3 pairs.
     d: [[i16; 8]; 108],
+    /// Levels 5 and 6 per level-4 node `m` ([`pass_56`]): its radix-3 pair, then those of its
+    /// three children (level-5 nodes `3 m + r`).
+    e: [[i16; 16]; 72],
     /// `round(2^31 / p)` for the reduction of the `i32` sums.
     v32: i32,
 }
@@ -83,6 +86,13 @@ impl Kernel {
                 slot[4 + 4 * k..8 + 4 * k].copy_from_slice(&r3(plan.exps[4][3 * n + k]));
             }
         }
+        let mut e = [[0i16; 16]; 72];
+        for (m, slot) in e.iter_mut().enumerate() {
+            slot[..4].copy_from_slice(&r3(plan.exps[4][m]));
+            for r in 0..3 {
+                slot[4 + 4 * r..8 + 4 * r].copy_from_slice(&r3(plan.exps[5][3 * m + r]));
+            }
+        }
         let mut d = [[0i16; 8]; 108];
         for (q, slot) in d.iter_mut().enumerate() {
             slot[..4].copy_from_slice(&r3(plan.exps[5][2 * q]));
@@ -95,6 +105,7 @@ impl Kernel {
             b,
             c: cc,
             d,
+            e,
             v32: ((1u64 << 32) / p as u64).div_ceil(2) as i32,
         }
     }
@@ -707,6 +718,81 @@ unsafe fn pass_c2<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
+/// [`pass_ab`] and level 4 in one pass: per level-2 node `n2` and `j0 < 9`, the level-3
+/// butterflies at `j + 27 i` for `j = j0, j0 + 9, j0 + 18` (all in registers), then the level-4
+/// butterflies of the three level-3 nodes `3 n2 + i` at `j0, j0 + 9, j0 + 18` of each; one store of
+/// the nine level-4 outputs.
+#[inline(always)]
+unsafe fn pass_ab4<const S: usize>(idx: &[uint8x16_t; 162], x: &mut [int16x8_t; N], kern: &Kernel, front: &Front) {
+    const { assert!(schedule(S).before[3] == super::NONE && !schedule(S).reduce_d) };
+    let s: Schedule = schedule(S);
+    let k = vld1q_s16(kern.k.as_ptr());
+    let table = |t: &[i16; 16]| {
+        let p = t.as_ptr() as *const u8;
+        uint8x16x2_t(vld1q_u8(p), vld1q_u8(p.add(16)))
+    };
+    for n2 in 0..8 {
+        let tt: [[uint8x16x2_t; 2]; 3] = core::array::from_fn(|i| core::array::from_fn(|h| table(&front.t[n2][i][h])));
+        let t4: [int16x8_t; 3] = core::array::from_fn(|i| vld1q_s16(kern.c[3 * n2 + i].as_ptr()));
+        let base = 81 * n2;
+        for j0 in 0..9 {
+            // v[q][i]: level-3 output i (node 3 n2 + i) at j = j0 + 9 q
+            let mut v: [[int16x8_t; 3]; 3] = core::array::from_fn(|q| {
+                let j = j0 + 9 * q;
+                let w: [int16x8_t; 3] = core::array::from_fn(|i| {
+                    let a = vqtbl2q_u8(tt[i][0], *idx.get_unchecked(j + 27 * i));
+                    let b = vqtbl2q_u8(tt[i][1], *idx.get_unchecked(j + 81 + 27 * i));
+                    vaddq_s16(vreinterpretq_s16_u8(a), vreinterpretq_s16_u8(b))
+                });
+                let (y0, y1, y2) = radix3_bare(w[0], w[1], w[2], k);
+                [y0, y1, y2]
+            });
+            for i in 0..3 {
+                let mut u = [v[0][i], v[1][i], v[2][i]];
+                reduce_inputs(&mut u, s.before[4], s.cheap, &[0], k);
+                let (a, b, c) = r3!(s, 0, 1, 2, 3, u[0], u[1], u[2], t4[i], k);
+                (v[0][i], v[1][i], v[2][i]) = (a, b, c);
+            }
+            for q in 0..3 {
+                for i in 0..3 {
+                    store(x, base + 27 * i + j0 + 9 * q, v[q][i]);
+                }
+            }
+        }
+    }
+}
+
+/// Levels 5 and 6 in one pass: per level-4 node `m` (nine slots, in registers), its three
+/// level-5 butterflies at `j, j + 3, j + 6`, then the three level-6 butterflies of its children
+/// at `3 r, 3 r + 1, 3 r + 2`; one load and one store per slot.
+#[inline(always)]
+unsafe fn pass_56<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(S);
+    let k = vld1q_s16(kern.k.as_ptr());
+    for m in 0..72 {
+        let t0 = vld1q_s16(kern.e[m].as_ptr());
+        let t1 = vld1q_s16(kern.e[m].as_ptr().add(8));
+        let base = 9 * m;
+        let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, base + i));
+        reduce_inputs(&mut v, s.before[5], s.cheap, &[0, 1, 2], k);
+        for j in 0..3 {
+            let (a, b, c) = r3!(s, 0, 1, 2, 3, v[j], v[j + 3], v[j + 6], t0, k);
+            (v[j], v[j + 3], v[j + 6]) = (a, b, c);
+        }
+        reduce_inputs(&mut v, s.before[6], s.cheap, &[0, 3, 6], k);
+        let r = [
+            r3!(s, 4, 5, 6, 7, v[0], v[1], v[2], t0, k),
+            r3!(s, 0, 1, 2, 3, v[3], v[4], v[5], t1, k),
+            r3!(s, 4, 5, 6, 7, v[6], v[7], v[8], t1, k),
+        ];
+        for (g, (a, b, c)) in r.into_iter().enumerate() {
+            store(x, base + 3 * g, a);
+            store(x, base + 3 * g + 1, b);
+            store(x, base + 3 * g + 2, c);
+        }
+    }
+}
+
 /// One prime's constants for [`inverse`], as twiddle pairs `(w, round(w 2^15 / p))`.
 pub struct InverseKernel {
     /// Per node, levels 6 down to 1 in the order [`inverse`] visits them (216, 72, 24, 8, 4, 2
@@ -976,9 +1062,8 @@ unsafe fn front_transform<const P: usize, const S: usize>(words: &[*const u8; LA
     let kern = &kernels()[P];
     let mut idx = [vdupq_n_u8(0); 162];
     indices(words, &mut idx);
-    pass_ab::<S>(&idx, x, kern, &fronts()[P]);
-    pass_c2::<S>(x, kern);
-    pass_d::<S, false>(x, kern, &[], &mut []);
+    pass_ab4::<S>(&idx, x, kern, &fronts()[P]);
+    pass_56::<S>(x, kern);
 }
 
 #[cfg(test)]
