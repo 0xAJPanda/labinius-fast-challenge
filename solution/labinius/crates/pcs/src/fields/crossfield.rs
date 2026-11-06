@@ -2412,8 +2412,7 @@ impl<'a> LeanSwitch<'a> {
             let words = self.pi0.as_ptr() as usize;
             let dst = dst.map(|p| p as usize);
             // Handed out in chunks from a shared counter, like the partials' rows: a runner
-            // that starts late or shares its core takes fewer of them.
-            let chunk = (half / (16 * self.threads)).clamp(8, 1 << 12) & !7;
+            let chunk = (half / (8 * self.threads)).clamp(8, BIND_STRETCH) & !7;
             let chunks = half.div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
             // Consecutive chunks are a quarter of the output apart, so that the runners write
