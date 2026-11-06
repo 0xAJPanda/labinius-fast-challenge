@@ -396,7 +396,6 @@ pub struct SAcc {
 #[repr(C, align(64))]
 struct Blk27([i16; 27 * 32]);
 
-/// Fold-back constants as memory operands: the `vpmaddwd` weights `(1, r16c)`, the low-word sign
 /// bit, and the old masked correction (unused by the two-uop fold).
 ///
 /// The fold is `vpxord` with `0x8000` and `vpmaddwd` with `(1, r16c)`: flipping bit 15 makes the
@@ -482,6 +481,8 @@ unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *m
 impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        let fw = _mm512_load_si512(FOLD.0.as_ptr() as *const __m512i);
+        let fx = _mm512_set1_epi32(FOLD.0[16]);
         for i in r0..r1 {
             let j = 27 * blk + i;
             let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
@@ -498,7 +499,7 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             }
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    core::arch::asm!(concat!($m!($mode), "/* {fw} {fx} */"), a = in(reg) a, k = in(reg) k, fw = in(zmm_reg) fw, fx = in(zmm_reg) fx,
                         $($xn = in(zmm_reg) x[$xi],)*
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
                         out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
@@ -506,7 +507,7 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             }
             macro_rules! call_first {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    core::arch::asm!(concat!($m!($mode), "/* {fw} {fx} */"), a = in(reg) a, k = in(reg) k, fw = in(zmm_reg) fw, fx = in(zmm_reg) fx,
                         b = in(reg) self.b.add(j * DIGITS),
                         $($xn = in(zmm_reg) x[$xi],)*
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
