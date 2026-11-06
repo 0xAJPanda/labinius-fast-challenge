@@ -277,9 +277,7 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
-/// Levels 2 and 3: per level-1 node (162 slots) and `j < 27`, the six slots `j + 27 i`. Three
-/// `j` per step, loaded before any is stored (arm-big): the loads of a step do not wait on the
-/// previous group's stores, and the eighteen values give the scheduler independent butterflies.
+/// Levels 2 and 3: per level-1 node (162 slots) and `j < 27`, the six slots `j + 27 i`.
 #[inline(always)]
 unsafe fn pass_b<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(S);
@@ -471,6 +469,511 @@ pub fn transform_general(prime: usize, x: &mut [[i16; 8]; N]) {
     }
 }
 
+/// `acc` reduced to `|acc| <= p` lane by lane: `acc - round(acc v / 2^31) p`, `v = round(2^31 / p)`.
+#[inline(always)]
+unsafe fn reduce_sums(acc: &mut [int32x4_t], p: i32, v: i32) {
+    for a in acc.iter_mut() {
+        let t = vqrdmulhq_n_s32(*a, v);
+        *a = vmlsq_n_s32(*a, t, p);
+    }
+}
+
+/// One prime's slot sums for a batch: `acc[2 s + h]` lane `l` is column `4 h + l`'s sum at slot
+/// `s`, reduced to `|sum| <= p`.
+#[inline(never)]
+unsafe fn sums<const P: usize>(
+    words: &[(*const u8, usize); LANES],
+    a: &Matrix,
+    m: &mut [int16x8_t; BITS],
+    x: &mut [int16x8_t; N],
+    acc: &mut [int32x4_t],
+) {
+    const { assert!(P < 3) };
+    let kern = &kernels()[P];
+    let s: Schedule = SCHEDULES[P];
+    let p = PRIMES[P] as i32;
+    acc.fill(vdupq_n_s32(0));
+    for e in 0..a.elements {
+        let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add(e * words[c].1));
+        masks(&at, m);
+        pass_a(m, x, kern);
+        pass_b::<P>(x, kern);
+        pass_c::<P>(x, kern);
+        pass_d::<P, true>(x, kern, a.row(e, P), acc);
+        if (e + 1) % s.accumulate == 0 {
+            reduce_sums(acc, p, kern.v32);
+        }
+    }
+    reduce_sums(acc, p, kern.v32);
+}
+
+/// Zeros standing in for the missing columns of a partial batch.
+static ZERO_WORDS: [u128; 4] = [0; 4];
+
+/// The commitment of every column of `values` (columns of `4 a.elements` words).
+pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
+    let len = 4 * a.elements;
+    assert_eq!(values.len() % len, 0);
+    let columns = values.len() / len;
+    let mut out = vec![0u128; columns * N];
+    for_blocks(&mut out, N, LANES, workers, |first, block| {
+        let mut m = Box::new([unsafe { vdupq_n_s16(0) }; BITS]);
+        let mut x = Box::new([unsafe { vdupq_n_s16(0) }; N]);
+        let mut acc = vec![unsafe { vdupq_n_s32(0) }; 3 * 2 * N];
+        let count = block.len() / N;
+        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
+            let col0 = first + LANES * b;
+            let here = (count - LANES * b).min(LANES);
+            // (first word of the column, bytes per element); missing columns read zeros
+            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
+                if c < here {
+                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
+                } else {
+                    (ZERO_WORDS.as_ptr() as *const u8, 0)
+                }
+            });
+            let (a0, rest) = acc.split_at_mut(2 * N);
+            let (a1, a2) = rest.split_at_mut(2 * N);
+            unsafe {
+                sums::<0>(&words, a, &mut m, &mut x, a0);
+                sums::<1>(&words, a, &mut m, &mut x, a1);
+                sums::<2>(&words, a, &mut m, &mut x, a2);
+            }
+            // lanes back to columns: reduce to [0, p), invert, recombine
+            let lanes: Vec<[i32; 4]> =
+                acc.iter().map(|&v| unsafe { core::mem::transmute::<int32x4_t, [i32; 4]>(v) }).collect();
+            for (c, column) in target.chunks_exact_mut(N).enumerate() {
+                let mut residues = [[0u32; N]; 3];
+                for (i, r) in residues.iter_mut().enumerate() {
+                    let p = PRIMES[i] as i32;
+                    for (slot, value) in r.iter_mut().enumerate() {
+                        let v = lanes[i * 2 * N + 2 * slot + c / 4][c % 4];
+                        *value = v.rem_euclid(p) as u32;
+                    }
+                }
+                super::finish_column(&residues, column);
+            }
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{product_bound, reduced_bound, tests::xorshift};
+    use super::*;
+
+    fn lanes(v: int16x8_t) -> [i16; 8] {
+        unsafe { core::mem::transmute(v) }
+    }
+
+    fn every_i16() -> impl Iterator<Item = int16x8_t> {
+        (0..1 << 13).map(|i| unsafe {
+            let a: [i16; 8] = core::array::from_fn(|l| (i * 8 + l as i32 - 32768) as i16);
+            vld1q_s16(a.as_ptr())
+        })
+    }
+
+    /// The Barrett reduction, over every `i16`: congruent, and within [`reduced_bound`].
+    #[test]
+    fn reduction_is_exact_and_bounded() {
+        for (i, kern) in kernels().iter().enumerate() {
+            let p = PRIMES[i] as i32;
+            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
+            let mut worst = 0;
+            for a in every_i16() {
+                let r = lanes(unsafe { reduce(a, k) });
+                for (x, y) in lanes(a).into_iter().zip(r) {
+                    assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
+                    worst = worst.max((y as i32).abs());
+                }
+            }
+            assert!(worst as u32 <= reduced_bound(p as u32), "prime {p}: {worst}");
+        }
+    }
+
+    /// The cheap reduction, over every `i16`, for the primes whose schedule uses it: congruent,
+    /// and within [`super::super::cheap_bound`] of `|a|`.
+    #[test]
+    fn cheap_reduction_is_exact_and_bounded() {
+        for (i, kern) in kernels().iter().enumerate() {
+            if !SCHEDULES[i].cheap {
+                continue;
+            }
+            let p = PRIMES[i] as i32;
+            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
+            for a in every_i16() {
+                let r = lanes(unsafe { reduce_cheap(a, k) });
+                for (x, y) in lanes(a).into_iter().zip(r) {
+                    assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
+                    let bound = super::super::cheap_bound(p as u32, x.unsigned_abs() as u32);
+                    assert!(y.unsigned_abs() as u32 <= bound, "prime {p}: {x} -> {y}");
+                }
+            }
+        }
+    }
+
+    /// Every twiddle's Barrett product, over every `i16`: congruent to `a w` and within
+    /// [`product_bound`] of `|a|`.
+    #[test]
+    fn twiddle_products_are_exact_and_bounded() {
+        for (i, kern) in kernels().iter().enumerate() {
+            let p = PRIMES[i] as i64;
+            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
+            let mut pairs: Vec<[i16; 2]> = vec![[kern.k[2], kern.k[3]]];
+            for row in kern.b.iter().chain(kern.c.iter()) {
+                pairs.extend(row.chunks_exact(2).map(|c| [c[0], c[1]]));
+            }
+            for row in kern.d.iter() {
+                pairs.extend(row.chunks_exact(2).map(|c| [c[0], c[1]]));
+            }
+            for [w, wt] in pairs {
+                let t = unsafe { vld1q_s16([w, wt, 0, 0, 0, 0, 0, 0].as_ptr()) };
+                for a in every_i16() {
+                    let r = lanes(unsafe { mulc::<0, 1>(a, t, k) });
+                    for (x, y) in lanes(a).into_iter().zip(r) {
+                        assert_eq!((x as i64 * w as i64 - y as i64).rem_euclid(p), 0);
+                        assert!(y.unsigned_abs() as u32 <= product_bound(p as u32, x.unsigned_abs() as u32));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The vector transform of eight binary elements agrees lane by lane with the scalar
+    /// transform of `-s`.
+    #[test]
+    fn transform_matches_scalar() {
+        let mut state = 7u64;
+        for case in 0..12 {
+            // eight columns' words for one element: random, all ones, zero, single bits
+            let words: [[u128; 4]; 8] = core::array::from_fn(|c| {
+                core::array::from_fn(|k| match (case, c) {
+                    (0, _) => u128::MAX,
+                    (1, _) => 0,
+                    (2, 0) => (k == 0) as u128,
+                    (2, 1) => ((k == 3) as u128) << 127,
+                    (2, 2) => if k == 1 { 1 << 64 } else { 0 },
+                    _ => (xorshift(&mut state) as u128) << 64 | xorshift(&mut state) as u128,
+                })
+            });
+            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            let mut m = [unsafe { vdupq_n_s16(0) }; BITS];
+            unsafe { masks(&ptrs, &mut m) };
+            for (i, plan) in primes().iter().enumerate() {
+                let mut x = [unsafe { vdupq_n_s16(0) }; N];
+                unsafe {
+                    match i {
+                        0 => transform::<0>(&m, &mut x),
+                        1 => transform::<1>(&m, &mut x),
+                        _ => transform::<2>(&m, &mut x),
+                    }
+                }
+                for c in 0..8 {
+                    let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
+                    let mut s = [0u32; N];
+                    super::super::element_bits(&b, &mut s);
+                    plan.forward(&mut s);
+                    for (slot, &want) in s.iter().enumerate() {
+                        let got = lanes(x[slot])[c] as i64;
+                        let bound = super::super::transform_bound(plan.p, SCHEDULES[i]);
+                        assert!(got.unsigned_abs() <= bound as u64);
+                        assert_eq!(
+                            (got + want as i64).rem_euclid(plan.p as i64),
+                            0,
+                            "case {case} prime {} column {c} slot {slot}",
+                            plan.p
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Inverse butterflies across eight columns, sharing each twiddle broadcast.
+struct Inverse {
+    stages: Vec<(usize,usize,Vec<[[i16;2];3]>)>,
+    eps: [i16;2], split: [i16;2], w: [i16;2],
+}
+fn inverses() -> &'static [Inverse;2] {
+    static I: OnceLock<[Inverse;2]> = OnceLock::new();
+    I.get_or_init(|| core::array::from_fn(|p| {
+        let plan=&primes()[p];
+        let mut stages=Vec::new(); let mut len=1;
+        for level in (0..super::RADICES.len()).rev() {
+            let r=super::RADICES[level];
+            let scales=plan.exps[level].iter().map(|&e| core::array::from_fn(|i| {
+                twiddle(plan.p,plan.root(super::ORDER-(e as usize/r*i)%super::ORDER)*plan.inv_radix[r] as u64%plan.p as u64)
+            })).collect();
+            stages.push((len,r,scales)); len*=r;
+        }
+        Inverse {stages,eps:twiddle(plan.p,plan.root(2*648)),split:twiddle(plan.p,plan.inv_split as u64),w:twiddle(plan.p,plan.root(324))}
+    }))
+}
+#[inline(always)]
+unsafe fn mul_pair(a:int16x8_t,t:[i16;2],k:int16x8_t)->int16x8_t {
+    let q=vqrdmulhq_n_s16(a,t[1]);
+    vmlsq_laneq_s16::<0>(vmulq_n_s16(a,t[0]),q,k)
+}
+unsafe fn inverse_lanes(p:usize,x:&mut [int16x8_t;N]) {
+    let inv=&inverses()[p]; let k=vld1q_s16(kernels()[p].k.as_ptr());
+    for (len,r,scales) in &inv.stages {
+        for (node,scale) in scales.iter().enumerate() {
+            let base=node*len*r;
+            for j in 0..*len {
+                let a=reduce(x[base+j],k);let b=reduce(x[base+j+len],k);
+                if *r==2 {
+                    x[base+j]=mul_pair(vaddq_s16(a,b),scale[0],k);
+                    x[base+j+len]=mul_pair(vsubq_s16(a,b),scale[1],k);
+                } else {
+                    let c=reduce(x[base+j+2*len],k);
+                    let e=mul_pair(vsubq_s16(b,c),inv.eps,k);
+                    let z=[vaddq_s16(a,vaddq_s16(b,c)),vaddq_s16(vsubq_s16(a,c),e),vsubq_s16(vsubq_s16(a,b),e)];
+                    for i in 0..3 {x[base+j+i*len]=mul_pair(z[i],scale[i],k);}
+                }
+            }
+        }
+    }
+    for j in 0..N/2 {
+        let u=reduce(x[j],k);let v=reduce(x[j+N/2],k);
+        let b=reduce(mul_pair(vsubq_s16(u,v),inv.split,k),k);
+        x[j]=reduce(vsubq_s16(u,mul_pair(b,inv.w,k)),k);x[j+N/2]=b;
+    }
+}
+#[inline(always)]
+unsafe fn pass_dual<const P:usize>(x:&mut [int16x8_t;N],row:&[i16],tail:&[i16],base_acc:&mut [int32x4_t],tail_acc:&mut [int32x4_t]) {
+    let kern=&kernels()[P]; let s=schedule(P);let k=vld1q_s16(kern.k.as_ptr());
+    for q in 0..N/6 {
+        let t=vld1q_s16(kern.d[q].as_ptr());let base=6*q;
+        let mut v:[int16x8_t;6]=core::array::from_fn(|i|load(x,base+i));
+        reduce_inputs(&mut v,s.before[6],s.cheap,&[0,3],k);
+        let (y0,y1,y2)=r3!(s,0,1,2,3,v[0],v[1],v[2],t,k);
+        let (y3,y4,y5)=r3!(s,4,5,6,7,v[3],v[4],v[5],t,k);
+        let y=[y0,y1,y2,y3,y4,y5];
+        mac6(base_acc,base,&y,vld1q_s16(row.as_ptr().add(base)));
+        mac6(tail_acc,base,&y,vld1q_s16(tail.as_ptr().add(base)));
+    }
+}
+#[inline(never)]
+unsafe fn hybrid_chunk<const P:usize>(words:&[(*const u8,usize);8],a:&crate::hybrid::Matrix,start:usize,end:usize,m:&mut [int16x8_t;BITS],x:&mut [int16x8_t;N],acc:&mut [int32x4_t],tail:&mut [int32x4_t]) {
+    let kern=&kernels()[P];let s=SCHEDULES[P];
+    tail.fill(vdupq_n_s32(0));
+    for e in start..end {
+        let at=core::array::from_fn(|c|words[c].0.add(e*words[c].1));
+        masks(&at,m);pass_a(m,x,kern);pass_b::<P>(x,kern);pass_c::<P>(x,kern);
+        pass_dual::<P>(x,a.row(e,P,0),a.row(e,P,1),acc,tail);
+        if (e-start+1)%s.accumulate==0 {
+            reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+        }
+    }
+    reduce_sums(acc,PRIMES[P] as i32,kern.v32);reduce_sums(tail,PRIMES[P] as i32,kern.v32);
+}
+unsafe fn inverse_acc(p:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
+    for j in 0..N {x[j]=vcombine_s16(vmovn_s32(acc[2*j]),vmovn_s32(acc[2*j+1]));}
+    inverse_lanes(p,x);
+}
+pub fn hybrid_commit(values:&[B128],a:&crate::hybrid::Matrix,workers:usize)->Vec<u128> {
+    let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
+    let columns=values.len()/len;let mut out=vec![0u128;columns*N];
+    for_blocks(&mut out,N,8,workers,|first,block|unsafe {
+        let mut m=Box::new([vdupq_n_s16(0);BITS]);
+        let mut x=Box::new([vdupq_n_s16(0);N]);
+        let mut y=Box::new([vdupq_n_s16(0);N]);
+        let mut acc=vec![vdupq_n_s32(0);4*N];let mut tail=acc.clone();
+        let mut low=vec![[0i64;8];N];
+        for (batch,target) in block.chunks_mut(8*N).enumerate() {
+            acc.fill(vdupq_n_s32(0));low.fill([0;8]);let here=target.len()/N;
+            let words=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
+            let (a0,a1)=acc.split_at_mut(2*N);let (t0,t1)=tail.split_at_mut(2*N);
+            for start in (0..a.elements).step_by(crate::hybrid::CHUNK) {
+                let end=(start+crate::hybrid::CHUNK).min(a.elements);
+                hybrid_chunk::<0>(&words,a,start,end,&mut m,&mut x,a0,t0);
+                hybrid_chunk::<1>(&words,a,start,end,&mut m,&mut x,a1,t1);
+                inverse_acc(0,t0,&mut x);inverse_acc(1,t1,&mut y);
+                for j in 0..N {
+                    let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
+                    for c in 0..here {
+                        let z=crate::hybrid::crt_pair((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32);
+                        let z=if z>crate::hybrid::PRODUCT/2 {z-crate::hybrid::PRODUCT} else {z};
+                        low[j][c]=(low[j][c]+z)&1023;
+                    }
+                }
+            }
+            inverse_acc(0,a0,&mut x);inverse_acc(1,a1,&mut y);
+            for j in 0..N {
+                let u:[i16;8]=core::mem::transmute(x[j]);let v:[i16;8]=core::mem::transmute(y[j]);
+                for c in 0..here {target[c*N+j]=crate::hybrid::combine((u[c] as i32).rem_euclid(3889) as u32,(v[c] as i32).rem_euclid(9721) as u32,low[j][c]);}
+            }
+        }
+    });out
+}
+
+/// Consume eight completed transforms per accumulator load/store.
+/// This retains the sums while eight ring elements share a public-key vector.
+#[inline(never)]
+unsafe fn sms_tile(chunk:&crate::sms::Chunk,batch:usize,x:&[[int16x8_t;N]],acc:&mut [int32x4_t]) {
+    const S:usize=crate::sms::STREAMS;
+    for j in 0..N {for stream in 0..S {
+        let av=vld1q_s16(chunk.key(batch,j,stream).as_ptr());
+        let at=2*(j*S+stream);
+        let mut lo=acc[at];let mut hi=acc[at+1];
+        macro_rules! term {($e:literal)=>{{
+            let y=x[$e][j];
+            lo=vmlsl_laneq_s16::<$e>(lo,vget_low_s16(y),av);
+            hi=vmlsl_high_laneq_s16::<$e>(hi,y,av);
+        }}}
+        term!(0);term!(1);term!(2);term!(3);term!(4);term!(5);term!(6);term!(7);
+        acc[at]=lo;acc[at+1]=hi;
+    }}
+}
+unsafe fn sms_inverse(stream:usize,acc:&[int32x4_t],x:&mut [int16x8_t;N]) {
+    for j in 0..N {let at=2*(j*crate::sms::STREAMS+stream);x[j]=vcombine_s16(vmovn_s32(acc[at]),vmovn_s32(acc[at+1]));}
+    inverse_lanes(1,x);
+}
+// Every butterfly starts with reduced inputs. These bounds also cover the
+// un-reduced radix-three output and its Barrett product before the next stage.
+const _: () = {
+    let mut i=0;
+    while i<2 {
+        let p=PRIMES[i];let r=super::reduced_bound(p);
+        let e=super::product_bound(p,2*r);
+        assert!(3*r<32768 && 2*r+e<32768);
+        assert!(super::product_bound(p,2*r+e)<32768);
+        i+=1;
+    }
+};
+#[inline(always)]
+unsafe fn center_lane(x:int16x8_t,k:int16x8_t)->int16x8_t {
+    let r=reduce(x,k);let p=vdupq_laneq_s16::<0>(k);let half=vshrq_n_s16::<1>(p);
+    let r=vsubq_s16(r,vreinterpretq_s16_u16(vandq_u16(vcgtq_s16(r,half),vreinterpretq_u16_s16(p))));
+    vaddq_s16(r,vreinterpretq_s16_u16(vandq_u16(vcltq_s16(r,vnegq_s16(half)),vreinterpretq_u16_s16(p))))
+}
+#[inline(always)]
+unsafe fn sms_lift(residue:int16x8_t,mean:i32,k:int16x8_t)->[int32x4_t;2] {
+    // Center only a small i16 difference, then add the public integer mean.
+    // This is exactly the scalar nearest-residue lift, including negative means.
+    let m=super::centered(mean as i64,crate::sms::P as u32);
+    let delta=center_lane(vsubq_s16(residue,vdupq_n_s16(m)),k);
+    [vaddq_s32(vmovl_s16(vget_low_s16(delta)),vdupq_n_s32(mean)),
+     vaddq_s32(vmovl_high_s16(delta),vdupq_n_s32(mean))]
+}
+pub fn sms_commit(values:&[B128],a:&crate::sms::Matrix,workers:usize)->Vec<u128> {
+    use crate::sms::{CHUNK,DIGITS,STREAMS,TAIL,P};
+    let len=4*a.elements;assert!(len>0);assert_eq!(values.len()%len,0);
+    let columns=values.len()/len;let mut out=vec![0u128;columns*N];
+    for_blocks(&mut out,N,8,workers,|first,block|unsafe {
+        let zero=vdupq_n_s16(0);let z32=vdupq_n_s64(0);
+        let mut m=Box::new([zero;BITS]);let mut x=vec![[zero;N];8];
+        let mut inv=Box::new([zero;N]);let mut acc=vec![z32;STREAMS*4*N];
+        let mut low=vec![[vdupq_n_s32(0);2];DIGITS*N];let k=vld1q_s16(kernels()[1].k.as_ptr());
+        for (batch,target) in block.chunks_mut(8*N).enumerate() {
+            acc.fill(z32);low.fill([vdupq_n_s32(0);2]);let here=target.len()/N;
+            let words:[(*const u8,usize);8]=core::array::from_fn(|c|if c<here { (values[(first+batch*8+c)*len..].as_ptr() as *const u8,64) } else {(ZERO_WORDS.as_ptr() as *const u8,0)});
+            for (ci,chunk) in a.chunks.iter().enumerate() {
+                for j in 0..N {for s in 1..STREAMS {let at=4*(j*STREAMS+s);acc[at..at+4].fill(z32);}}
+                for base in (0..chunk.elements).step_by(8) {
+                    let count=(chunk.elements-base).min(8);
+                    for e in 0..count {
+                        let at=core::array::from_fn(|c|words[c].0.add((ci*CHUNK+base+e)*words[c].1));
+                        masks(&at,&mut m);transform::<1>(&m,&mut x[e]);
+                    }
+                    // Missing key lanes are zero; clear transform lanes as well for diagnostics.
+                    for e in count..8 {x[e].fill(zero);}
+                    sms_dot::tile(chunk,base/8,&x,&mut acc);
+                }
+                for d in 0..DIGITS {
+                    sms_dot::inverse(d+1,&acc,&mut inv);
+                    for j in 0..N {
+                        let lifted=sms_lift(inv[j],chunk.means[d*N+j],k);
+                        for h in 0..2 {
+                            low[d*N+j][h]=vaddq_s32(low[d*N+j][h],lifted[h]);
+                        }
+                    }
+                }
+            }
+            sms_dot::inverse(0,&acc,&mut inv);
+            // Every digit's complete integer sum fits i32: at most
+            // 4096 * 512 * 2 * MAX_DIGIT_ABS < 2^28. Weight only once,
+            // in i64, after combining all chunks.
+            for j in 0..N {let r:[i16;8]=core::mem::transmute(inv[j]);
+                let mut tails=[0i64;8];
+                for d in 0..DIGITS {
+                    let (u,v)=crate::sms::lattice::WEIGHTS[d];
+                    let at=j%(N/2);
+                    let lo:[i32;8]=core::mem::transmute(low[d*N+at]);
+                    let hi:[i32;8]=core::mem::transmute(low[d*N+at+N/2]);
+                    for c in 0..here {tails[c]+=if j<N/2 {u as i64*lo[c] as i64-v as i64*hi[c] as i64}
+                        else {v as i64*lo[c] as i64+(u+v) as i64*hi[c] as i64};}
+                }
+                for c in 0..here {target[c*N+j]=crate::sms::combine((r[c] as i64).rem_euclid(P),tails[c].rem_euclid(TAIL));}
+            }
+        }
+    });out
+}
+#[path="sms_dot.rs"]
+mod sms_dot;
+
+#[cfg(test)]
+mod sms_reconstruction_tests {
+    use super::*;
+    #[test]
+    fn sms_lift_reference() {unsafe {
+        let k=vld1q_s16(kernels()[1].k.as_ptr());
+        for mean in [-1000001,-9721,-4861,-4860,-1,0,1,4860,4861,9721,1000001] {
+            for residue in -4900i16..=4900 {
+                let got:[i32;8]=core::mem::transmute(sms_lift(vdupq_n_s16(residue),mean,k));
+                let expected=mean+(residue as i32-mean+4860).rem_euclid(9721)-4860;
+                assert_eq!(got,[expected;8]);
+            }
+        }
+    }}
+    #[test]
+    fn sms_inverse_reference() {unsafe {
+        let mut seed=9341;
+        for p in 0..2 {
+            let plan=&primes()[p];
+            let raw:[[i16;8];N]=core::array::from_fn(|_|core::array::from_fn(|_| {
+                seed=super::super::tests::xorshift(&mut seed);seed as i16
+            }));
+            let mut x:[int16x8_t;N]=core::mem::transmute(raw);
+            inverse_lanes(p,&mut x);
+            let got:[[i16;8];N]=core::mem::transmute(x);
+            for c in 0..8 {
+                let mut scalar=core::array::from_fn(|j|(raw[j][c] as i32).rem_euclid(plan.p as i32) as u32);
+                plan.inverse(&mut scalar);
+                for j in 0..N {assert_eq!((got[j][c] as i32).rem_euclid(plan.p as i32) as u32,scalar[j]);}
+            }
+        }
+    }}
+    #[test]
+    fn sms_static_inverse_reference() {unsafe {
+        let mut seed=19341;
+        for p in 0..2 {
+            let plan=&primes()[p];let modulus=plan.p as i32;
+            for case in 0..8 {
+                let raw:[[i16;8];N]=core::array::from_fn(|j|core::array::from_fn(|c| {
+                    match case {
+                        0=>modulus as i16,
+                        1=>-modulus as i16,
+                        2=>if (j+c)%2==0 {modulus as i16}else{-modulus as i16},
+                        _=>{seed=super::super::tests::xorshift(&mut seed);(seed%(2*modulus+1) as u64) as i16-modulus as i16}
+                    }
+                }));
+                let mut x:[int16x8_t;N]=core::mem::transmute(raw);
+                match p {0=>inverse::<0>(&mut x),1=>inverse::<1>(&mut x),_=>unreachable!()}
+                let got:[[i16;8];N]=core::mem::transmute(x);
+                for c in 0..8 {
+                    let mut scalar=core::array::from_fn(|j|(raw[j][c] as i32).rem_euclid(modulus) as u32);
+                    plan.inverse(&mut scalar);
+                    for j in 0..N {assert_eq!(got[j][c],super::super::centered(scalar[j] as i64,plan.p));}
+                }
+            }
+        }
+    }}
+}
+
+// Adapted from submission 2bc05382-26b0-4e2a-87b9-0b429d77503c.
 /// One prime's constants for [`inverse`], as twiddle pairs `(w, round(w 2^15 / p))`.
 pub struct InverseKernel {
     /// Per node, levels 6 down to 1 in the order [`inverse`] visits them (216, 72, 24, 8, 4, 2
@@ -645,411 +1148,3 @@ pub unsafe fn inverse<const P: usize>(x: &mut [int16x8_t; N]) {
     }
 }
 
-/// `acc` reduced to `|acc| <= p` lane by lane: `acc - round(acc v / 2^31) p`, `v = round(2^31 / p)`.
-#[inline(always)]
-unsafe fn reduce_sums(acc: &mut [int32x4_t], p: i32, v: i32) {
-    for a in acc.iter_mut() {
-        let t = vqrdmulhq_n_s32(*a, v);
-        *a = vmlsq_n_s32(*a, t, p);
-    }
-}
-
-/// One prime's slot sums for a batch: `acc[2 s + h]` lane `l` is column `4 h + l`'s sum at slot
-/// `s`, reduced to `|sum| <= p`.
-#[inline(never)]
-unsafe fn sums<const P: usize>(
-    words: &[(*const u8, usize); LANES],
-    a: &Matrix,
-    m: &mut [int16x8_t; BITS],
-    x: &mut [int16x8_t; N],
-    acc: &mut [int32x4_t],
-) {
-    const { assert!(P < 3) };
-    let kern = &kernels()[P];
-    let s: Schedule = SCHEDULES[P];
-    let p = PRIMES[P] as i32;
-    acc.fill(vdupq_n_s32(0));
-    for e in 0..a.elements {
-        let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add(e * words[c].1));
-        masks(&at, m);
-        pass_a(m, x, kern);
-        pass_b::<P>(x, kern);
-        pass_c::<P>(x, kern);
-        pass_d::<P, true>(x, kern, a.row(e, P), acc);
-        if (e + 1) % s.accumulate == 0 {
-            reduce_sums(acc, p, kern.v32);
-        }
-    }
-    reduce_sums(acc, p, kern.v32);
-}
-
-/// Zeros standing in for the missing columns of a partial batch.
-static ZERO_WORDS: [u128; 4] = [0; 4];
-
-/// The commitment of every column of `values` (columns of `4 a.elements` words).
-pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
-    let len = 4 * a.elements;
-    assert_eq!(values.len() % len, 0);
-    let columns = values.len() / len;
-    let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| {
-        let mut m = Box::new([unsafe { vdupq_n_s16(0) }; BITS]);
-        let mut x = Box::new([unsafe { vdupq_n_s16(0) }; N]);
-        let mut acc = vec![unsafe { vdupq_n_s32(0) }; 3 * 2 * N];
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
-            // (first word of the column, bytes per element); missing columns read zeros
-            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
-                if c < here {
-                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
-                } else {
-                    (ZERO_WORDS.as_ptr() as *const u8, 0)
-                }
-            });
-            let (a0, rest) = acc.split_at_mut(2 * N);
-            let (a1, a2) = rest.split_at_mut(2 * N);
-            unsafe {
-                sums::<0>(&words, a, &mut m, &mut x, a0);
-                sums::<1>(&words, a, &mut m, &mut x, a1);
-                sums::<2>(&words, a, &mut m, &mut x, a2);
-            }
-            // lanes back to columns: reduce to [0, p), invert, recombine
-            let lanes: Vec<[i32; 4]> =
-                acc.iter().map(|&v| unsafe { core::mem::transmute::<int32x4_t, [i32; 4]>(v) }).collect();
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                let mut residues = [[0u32; N]; 3];
-                for (i, r) in residues.iter_mut().enumerate() {
-                    let p = PRIMES[i] as i32;
-                    for (slot, value) in r.iter_mut().enumerate() {
-                        let v = lanes[i * 2 * N + 2 * slot + c / 4][c % 4];
-                        *value = v.rem_euclid(p) as u32;
-                    }
-                }
-                super::finish_column(&residues, column);
-            }
-        }
-    });
-    out
-}
-
-#[path = "ntt_hybrid.rs"]
-pub mod hybrid;
-
-#[path = "ntt_sms.rs"]
-pub mod sms;
-
-#[cfg(test)]
-mod tests {
-    use super::super::{product_bound, reduced_bound, tests::xorshift};
-    use super::*;
-
-    fn lanes(v: int16x8_t) -> [i16; 8] {
-        unsafe { core::mem::transmute(v) }
-    }
-
-    fn every_i16() -> impl Iterator<Item = int16x8_t> {
-        (0..1 << 13).map(|i| unsafe {
-            let a: [i16; 8] = core::array::from_fn(|l| (i * 8 + l as i32 - 32768) as i16);
-            vld1q_s16(a.as_ptr())
-        })
-    }
-
-    /// The Barrett reduction, over every `i16`: congruent, and within [`reduced_bound`].
-    #[test]
-    fn reduction_is_exact_and_bounded() {
-        for (i, kern) in kernels().iter().enumerate() {
-            let p = PRIMES[i] as i32;
-            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
-            let mut worst = 0;
-            for a in every_i16() {
-                let r = lanes(unsafe { reduce(a, k) });
-                for (x, y) in lanes(a).into_iter().zip(r) {
-                    assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
-                    worst = worst.max((y as i32).abs());
-                }
-            }
-            assert!(worst as u32 <= reduced_bound(p as u32), "prime {p}: {worst}");
-        }
-    }
-
-    /// The cheap reduction, over every `i16`, for the primes whose schedule uses it: congruent,
-    /// and within [`super::super::cheap_bound`] of `|a|`.
-    #[test]
-    fn cheap_reduction_is_exact_and_bounded() {
-        for (i, kern) in kernels().iter().enumerate() {
-            if !SCHEDULES[i].cheap {
-                continue;
-            }
-            let p = PRIMES[i] as i32;
-            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
-            for a in every_i16() {
-                let r = lanes(unsafe { reduce_cheap(a, k) });
-                for (x, y) in lanes(a).into_iter().zip(r) {
-                    assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
-                    let bound = super::super::cheap_bound(p as u32, x.unsigned_abs() as u32);
-                    assert!(y.unsigned_abs() as u32 <= bound, "prime {p}: {x} -> {y}");
-                }
-            }
-        }
-    }
-
-    /// Every twiddle's Barrett product, over every `i16`: congruent to `a w` and within
-    /// [`product_bound`] of `|a|`.
-    #[test]
-    fn twiddle_products_are_exact_and_bounded() {
-        for (i, kern) in kernels().iter().enumerate() {
-            let p = PRIMES[i] as i64;
-            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
-            let mut pairs: Vec<[i16; 2]> = vec![[kern.k[2], kern.k[3]]];
-            for row in kern.b.iter().chain(kern.c.iter()) {
-                pairs.extend(row.chunks_exact(2).map(|c| [c[0], c[1]]));
-            }
-            for row in kern.d.iter() {
-                pairs.extend(row.chunks_exact(2).map(|c| [c[0], c[1]]));
-            }
-            for [w, wt] in pairs {
-                let t = unsafe { vld1q_s16([w, wt, 0, 0, 0, 0, 0, 0].as_ptr()) };
-                for a in every_i16() {
-                    let r = lanes(unsafe { mulc::<0, 1>(a, t, k) });
-                    for (x, y) in lanes(a).into_iter().zip(r) {
-                        assert_eq!((x as i64 * w as i64 - y as i64).rem_euclid(p), 0);
-                        assert!(y.unsigned_abs() as u32 <= product_bound(p as u32, x.unsigned_abs() as u32));
-                    }
-                }
-            }
-        }
-    }
-
-    fn run_inverse(i: usize, x: &[[i16; 8]; N]) -> [[i16; 8]; N] {
-        unsafe {
-            let mut v: [int16x8_t; N] = core::array::from_fn(|j| vld1q_s16(x[j].as_ptr()));
-            match i {
-                0 => inverse::<0>(&mut v),
-                1 => inverse::<1>(&mut v),
-                _ => inverse::<2>(&mut v),
-            }
-            core::array::from_fn(|j| lanes(v[j]))
-        }
-    }
-
-    /// The vector inverse agrees lane by lane with the scalar inverse, centered, on random
-    /// inputs in `[-p, p]` and on the extremes `+-p`.
-    #[test]
-    fn inverse_matches_scalar() {
-        let mut state = 11u64;
-        for (i, plan) in primes().iter().enumerate() {
-            let p = plan.p as i64;
-            for case in 0..8 {
-                let x: [[i16; 8]; N] = core::array::from_fn(|_| {
-                    core::array::from_fn(|l| match (case, l % 2) {
-                        (0, _) => p as i16,
-                        (1, _) => -p as i16,
-                        (2, 0) | (3, 1) => p as i16,
-                        (2, _) | (3, _) => -p as i16,
-                        (4, _) => if xorshift(&mut state) & 1 == 0 { p as i16 } else { -p as i16 },
-                        _ => ((xorshift(&mut state) % (2 * p + 1) as u64) as i64 - p) as i16,
-                    })
-                });
-                let y = run_inverse(i, &x);
-                for c in 0..8 {
-                    let mut s: [u32; N] = core::array::from_fn(|j| (x[j][c] as i64).rem_euclid(p) as u32);
-                    plan.inverse(&mut s);
-                    for j in 0..N {
-                        let want = super::super::centered(s[j] as i64, plan.p);
-                        assert_eq!(y[j][c], want, "prime {p} case {case} lane {c} coefficient {j}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Scalar forward then vector inverse is the identity, centered; the transform values enter
-    /// as `[0, p)`, centered, or shifted by `-p`, by lane.
-    #[test]
-    fn inverse_round_trip() {
-        let mut state = 23u64;
-        for (i, plan) in primes().iter().enumerate() {
-            let p = plan.p as i64;
-            for _ in 0..3 {
-                let coeffs: [[u32; N]; 8] =
-                    core::array::from_fn(|_| core::array::from_fn(|_| (xorshift(&mut state) % p as u64) as u32));
-                let mut x = [[0i16; 8]; N];
-                for (c, a) in coeffs.iter().enumerate() {
-                    let mut y = *a;
-                    plan.forward(&mut y);
-                    for j in 0..N {
-                        let v = y[j] as i64;
-                        x[j][c] = match c % 3 {
-                            0 => v,
-                            1 => super::super::centered(v, plan.p) as i64,
-                            _ => v - p,
-                        } as i16;
-                    }
-                }
-                let out = run_inverse(i, &x);
-                for (c, a) in coeffs.iter().enumerate() {
-                    for j in 0..N {
-                        assert_eq!(out[j][c], super::super::centered(a[j] as i64, plan.p), "prime {p} lane {c} coefficient {j}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// Rough timing of one `inverse::<1>` call: `cargo test --release inverse_timing -- --ignored
-    /// --nocapture`.
-    #[test]
-    #[ignore]
-    fn inverse_timing() {
-        let mut state = 5u64;
-        let mut v: [int16x8_t; N] = core::array::from_fn(|_| unsafe {
-            let a: [i16; 8] = core::array::from_fn(|_| (xorshift(&mut state) % 9721) as i16);
-            vld1q_s16(a.as_ptr())
-        });
-        unsafe { inverse::<1>(&mut v) };
-        let iters = 200_000;
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            unsafe { inverse::<1>(core::hint::black_box(&mut v)) };
-        }
-        let ns = start.elapsed().as_nanos() as f64 / iters as f64;
-        println!("inverse::<1>: {ns:.0} ns per call (8 lanes)");
-    }
-
-    /// The vector transform of eight binary elements agrees lane by lane with the scalar
-    /// transform of `-s`.
-    #[test]
-    fn transform_matches_scalar() {
-        let mut state = 7u64;
-        for case in 0..12 {
-            // eight columns' words for one element: random, all ones, zero, single bits
-            let words: [[u128; 4]; 8] = core::array::from_fn(|c| {
-                core::array::from_fn(|k| match (case, c) {
-                    (0, _) => u128::MAX,
-                    (1, _) => 0,
-                    (2, 0) => (k == 0) as u128,
-                    (2, 1) => ((k == 3) as u128) << 127,
-                    (2, 2) => if k == 1 { 1 << 64 } else { 0 },
-                    _ => (xorshift(&mut state) as u128) << 64 | xorshift(&mut state) as u128,
-                })
-            });
-            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
-            let mut m = [unsafe { vdupq_n_s16(0) }; BITS];
-            unsafe { masks(&ptrs, &mut m) };
-            for (i, plan) in primes().iter().enumerate() {
-                let mut x = [unsafe { vdupq_n_s16(0) }; N];
-                unsafe {
-                    match i {
-                        0 => transform::<0>(&m, &mut x),
-                        1 => transform::<1>(&m, &mut x),
-                        _ => transform::<2>(&m, &mut x),
-                    }
-                }
-                for c in 0..8 {
-                    let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
-                    let mut s = [0u32; N];
-                    super::super::element_bits(&b, &mut s);
-                    plan.forward(&mut s);
-                    for (slot, &want) in s.iter().enumerate() {
-                        let got = lanes(x[slot])[c] as i64;
-                        let bound = super::super::transform_bound(plan.p, SCHEDULES[i]);
-                        assert!(got.unsigned_abs() <= bound as u64);
-                        assert_eq!(
-                            (got + want as i64).rem_euclid(plan.p as i64),
-                            0,
-                            "case {case} prime {} column {c} slot {slot}",
-                            plan.p
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod pass_timing {
-    use super::*;
-
-    fn xs(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
-    }
-
-    /// Per-pass timing of the binary transform: `cargo test --release pass_timing -- --ignored
-    /// --nocapture` (arm-big diagnostics).
-    #[test]
-    #[ignore]
-    fn pass_timing() {
-        let mut state = 11u64;
-        let words: [[u128; 4]; 8] =
-            core::array::from_fn(|_| core::array::from_fn(|_| (xs(&mut state) as u128) << 64 | xs(&mut state) as u128));
-        let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
-        let mut m = Box::new([unsafe { vdupq_n_s16(0) }; BITS]);
-        let mut x = Box::new([unsafe { vdupq_n_s16(0) }; N]);
-        let mut acc = vec![unsafe { vdupq_n_s32(0) }; 2 * N];
-        let row = vec![1i16; ROW];
-        let iters = 100_000;
-        macro_rules! time {
-            ($name:expr, $body:expr) => {{
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    unsafe { $body };
-                    core::hint::black_box(&mut *x);
-                }
-                let ns = start.elapsed().as_nanos() as f64 / iters as f64;
-                println!("{:>10}: {ns:7.0} ns", $name);
-            }};
-        }
-        fn kp<const P: usize>() -> &'static Kernel { &kernels()[P] }
-        // peak: 12 independent mulc chains, 1000 rounds each
-        {
-            let k = unsafe { vld1q_s16(kernels()[1].k.as_ptr()) };
-            let t = unsafe { vld1q_s16(kernels()[1].d[3].as_ptr()) };
-            let mut v: [int16x8_t; 12] = core::array::from_fn(|i| unsafe { vdupq_n_s16(i as i16 + 3) });
-            let start = std::time::Instant::now();
-            for _ in 0..iters / 10 {
-                for _ in 0..100 {
-                    for y in v.iter_mut() {
-                        *y = unsafe { mulc::<0, 1>(*y, t, k) };
-                    }
-                }
-                core::hint::black_box(&mut v);
-            }
-            let ns = start.elapsed().as_nanos() as f64 / (iters as f64 * 10.0 * 12.0);
-            println!("mulc peak: {ns:.3} ns per mulc (8 lanes)");
-            let start = std::time::Instant::now();
-            for _ in 0..iters / 10 {
-                for _ in 0..100 {
-                    for y in v.iter_mut() {
-                        *y = unsafe { vmulq_laneq_s16::<0>(*y, t) };
-                    }
-                }
-                core::hint::black_box(&mut v);
-            }
-            let ns = start.elapsed().as_nanos() as f64 / (iters as f64 * 10.0 * 12.0);
-            println!("mul peak: {ns:.3} ns per vmul (8 lanes)");
-        }
-        time!("masks", masks(&ptrs, &mut m));
-        for p in 0..2 {
-            println!("prime {}", PRIMES[p]);
-            if p == 0 {
-                time!("pass_a", pass_a(&m, &mut x, kp::<0>()));
-                time!("pass_b", pass_b::<0>(&mut x, kp::<0>()));
-                time!("pass_c", pass_c::<0>(&mut x, kp::<0>()));
-                time!("pass_d", pass_d::<0, false>(&mut x, kp::<0>(), &[], &mut []));
-                time!("pass_dmac", pass_d::<0, true>(&mut x, kp::<0>(), &row, &mut acc));
-            } else {
-                time!("pass_a", pass_a(&m, &mut x, kp::<1>()));
-                time!("pass_b", pass_b::<1>(&mut x, kp::<1>()));
-                time!("pass_c", pass_c::<1>(&mut x, kp::<1>()));
-                time!("pass_d", pass_d::<1, false>(&mut x, kp::<1>(), &[], &mut []));
-                time!("pass_dmac", pass_d::<1, true>(&mut x, kp::<1>(), &row, &mut acc));
-            }
-        }
-    }
-}

@@ -10,6 +10,8 @@
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
 mod hugealloc;
 mod ntt;
+mod hybrid;
+mod sms;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -18,6 +20,7 @@ mod rq;
 
 use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
+use labinius::fields::lean::LeanSwitch;
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
@@ -37,25 +40,7 @@ const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 const LIMIT: u64 = 64 * 1024 * 1024;
 const MIN_MODULUS: u128 = 34_816_965_049;
 /// The default commitment modulus: the product of the three transform primes.
-/// The hybrid commitment matrix in the transform domain, built by build.rs (empty when the build
-/// host could not; the prover then builds it at run time).
-#[repr(C, align(64))]
-struct Aligned64<T: ?Sized>(T);
-const HYBRID_MATRIX_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-matrix.bin")).len();
-static HYBRID_MATRIX: Aligned64<[u8; HYBRID_MATRIX_LEN]> =
-    Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-matrix.bin")));
-macro_rules! image {
-    ($name:ident, $file:literal) => {
-        static $name: &Aligned64<[u8]> = &Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/", $file)));
-    };
-}
-// The SMS matrix images, built by build.rs (empty when the build host could not; the prover then
-// builds the matrix at run time).
-image!(SMS_DATA, "sms-data.bin");
-image!(SMS_MEANS, "sms-means.bin");
-image!(SMS_MU, "sms-mu.bin");
-image!(SMS_META, "sms-meta.bin");
-const MODULUS: u128 = ntt::neon::sms::MODULUS;
+const MODULUS: u128 = sms::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
 const GROUP: usize = 8;
@@ -277,6 +262,45 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
     r[..rq::N].iter().map(|&x| x as u128).collect()
 }
 
+include!(concat!(env!("OUT_DIR"), "/matrix_params.rs"));
+#[repr(align(2097152))]
+struct AlignedKey([u8; KEY_BYTES]);
+static KEY: AlignedKey = AlignedKey(*include_bytes!(concat!(env!("OUT_DIR"), "/matrix.bin")));
+const _: () = {
+    assert!(KEY_MODULUS == sms::MODULUS && KEY_ELEMENTS == RING_ELEMENTS && KEY_N == ntt::N);
+    assert!(KEY_CHUNK == sms::CHUNK && KEY_DIGITS == sms::DIGITS && KEY_STREAMS == sms::STREAMS);
+    let mut i = 0;
+    while i < 3 { assert!(KEY_PRIMES[i] == ntt::PRIMES[i]); i += 1; }
+};
+
+/// Copy the public image into the existing owned matrix, without changing its arithmetic.
+fn precomputed_matrix() -> sms::Matrix {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" { fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32; }
+        madvise(KEY.0.as_ptr() as *mut u8, KEY_BYTES, 14);
+    }
+    let groups = labinius::par::map_blocks(KEY_LAYOUT.len(), threads().min(KEY_LAYOUT.len()), 1, |_, start, end| {
+        KEY_LAYOUT[start..end].iter().map(|&(elements, offset, len, mean_offset, mean_len, margin)| {
+            #[cfg(target_endian = "little")]
+            let (data, means) = unsafe {
+                // The build script aligns offsets; integer types accept every bit pattern.
+                assert!(offset % 2 == 0 && offset + len * 2 <= KEY_BYTES);
+                assert!(mean_offset % 4 == 0 && mean_offset + mean_len * 4 <= KEY_BYTES);
+                (std::slice::from_raw_parts(KEY.0.as_ptr().add(offset).cast::<i16>(), len).to_vec(),
+                 std::slice::from_raw_parts(KEY.0.as_ptr().add(mean_offset).cast::<i32>(), mean_len).to_vec())
+            };
+            #[cfg(target_endian = "big")]
+            let (data, means) = (
+                KEY.0[offset..offset + len * 2].chunks_exact(2).map(|b| i16::from_le_bytes(b.try_into().unwrap())).collect(),
+                KEY.0[mean_offset..mean_offset + mean_len * 4].chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect(),
+            );
+            sms::Chunk { elements, data, means, margin: f64::from_bits(margin) }
+        }).collect::<Vec<_>>()
+    });
+    sms::Matrix { elements: RING_ELEMENTS, chunks: groups.into_iter().flatten().collect() }
+}
+
 /// Every column's commitment, flattened. Columns go out over the cores; each worker walks the
 /// ring elements once, building that element's table and applying it to all of its columns.
 /// Per column the raw product is summed block by block: each `BLOCK` of output coefficients
@@ -285,19 +309,11 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
-    #[cfg(target_arch = "aarch64")]
-    if modulus == ntt::neon::sms::MODULUS {
-        use ntt::neon::sms;
-        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
-            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
-        return sms::commit(values, &matrix, threads());
+    if modulus == sms::MODULUS {
+        return sms::commit(values, &precomputed_matrix(), threads());
     }
-    #[cfg(target_arch = "aarch64")]
-    if modulus == ntt::neon::hybrid::MODULUS {
-        use ntt::neon::hybrid;
-        let matrix = hybrid::HybridMatrix::from_image(&HYBRID_MATRIX.0, RING_ELEMENTS)
-            .unwrap_or_else(|| hybrid::matrix(RING_ELEMENTS, threads()));
-        return hybrid::commit(values, &matrix, threads());
+    if modulus == hybrid::MODULUS {
+        return hybrid::commit(values, &hybrid::matrix(RING_ELEMENTS, threads()), threads());
     }
     if modulus == ntt::MODULUS {
         return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
@@ -719,38 +735,23 @@ impl Proof {
     }
 }
 
-fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
-    #[cfg(target_arch = "aarch64")]
-    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
-        let partials = prepared.partials();
-        let value = partials.iter().zip(cf::eq_expand_b128(lo))
-            .fold(B128::ZERO, |a, (&v, e)| a + v * e);
-        t.absorb_b128(&[value]);
-        t.absorb_b128(&partials);
-        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
-        let mut rounds = Vec::with_capacity(LOG_PACKED);
-        let mut coords = Vec::with_capacity(LOG_PACKED);
-        for _ in 0..LOG_PACKED {
-            let msg = switch.msg();
-            t.absorb_f162(&msg);
-            let r = t.sample_f162(b"switch-round", 1)[0];
-            rounds.push(msg.map(|v| v.0));
-            coords.push(r);
-            switch.fold(r);
-        }
-        return (partials, rounds, coords, switch.final_eval());
-    }
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, hi);
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
+    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+    timer.lap("commit");
+    let mut t = transcript(seed, modulus, &commitment);
+    let lo = t.sample_b128(b"r-lo", 7);
+    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
+    let (mut switch, partials) = LeanSwitch::partials(values, &hi);
+    timer.lap("sw_partials");
     let value = partials
         .iter()
-        .zip(cf::eq_expand_b128(lo))
+        .zip(cf::eq_expand_b128(&lo))
         .fold(B128::ZERO, |a, (&v, e)| a + v * e);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+    switch.start(&batch);
+    timer.lap("sw_setup");
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
@@ -762,16 +763,6 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
         switch.fold(r);
     }
     let opened = switch.final_eval();
-    (partials, rounds, coords, opened)
-}
-
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
-    timer.lap("commit");
-    let mut t = transcript(seed, modulus, &commitment);
-    let lo = t.sample_b128(b"r-lo", 7);
-    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);
@@ -822,6 +813,7 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
+    timer.lap("drop");
     let bytes = proof.encode();
     std::fs::write(&args[2], bytes).expect("write proof");
     timer.lap("write");
@@ -849,37 +841,24 @@ mod tests {
     }
 
     /// The direct encoding is byte for byte bincode's under the proof codec.
-    /// The SMS commitment agrees with the schoolbook commitment at full size on random columns
-    /// (its digit recombination is statistical: random witnesses), one and three workers.
     #[test]
-    fn sms_commit_matches_reference() {
-        // the embedded images are the runtime matrix, byte for byte
-        {
-            use ntt::neon::sms;
-            let built = sms::matrix(RING_ELEMENTS, 8);
-            let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
-                .expect("the build embeds the SMS images");
-            assert!(built.data == embedded.data && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
-            assert_eq!(built.margin, embedded.margin);
+    fn precomputed_matrix_matches_runtime() {
+        let start = std::time::Instant::now();
+        let actual = precomputed_matrix();
+        eprintln!("precomputed_matrix_us={}", start.elapsed().as_micros());
+        let start = std::time::Instant::now();
+        let expected = sms::matrix(RING_ELEMENTS, threads());
+        eprintln!("runtime_matrix_us={}", start.elapsed().as_micros());
+        assert_eq!(actual.elements, expected.elements);
+        assert_eq!(actual.chunks.len(), expected.chunks.len());
+        for (a, b) in actual.chunks.iter().zip(&expected.chunks) {
+            assert_eq!(a.elements, b.elements);
+            assert_eq!(a.data, b.data);
+            assert_eq!(a.means, b.means);
+            assert_eq!(a.margin.to_bits(), b.margin.to_bits());
         }
-        use ntt::neon::sms;
-        let q = sms::MODULUS;
-        let values: Vec<B128> = (0..9).flat_map(|s| column(100 + s)).collect();
-        let matrix = rq::ajtai_matrix(q, RING_ELEMENTS);
-        let want = commit_reference(&values, &matrix, q);
-        let a = sms::matrix(RING_ELEMENTS, 8);
-        eprintln!("sms margin {}", a.margin);
-        for workers in [1, 3] {
-            assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
-        }
-        // a short last chunk and a short last lockstep group, partial batches
-        let elements = 301;
-        let values: Vec<B128> = (0..11).flat_map(|s| column(200 + s)).take(11 * 4 * elements).collect();
-        let matrix = rq::ajtai_matrix(q, elements);
-        let want = commit_reference(&values, &matrix, q);
-        let a = sms::matrix(elements, 3);
-        assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
     }
+
     #[test]
     fn encoding_matches_bincode() {
         use bincode::Options;

@@ -216,7 +216,7 @@ const BASIS: Basis = Basis {
         163044099.88311526,
     ],
 };
-pub(super) const WEIGHTS: [(i32, i32); 6] = [
+pub(crate) const WEIGHTS: [(i32, i32); 6] = [
     (1, 0),
     (9479, -8074),
     (13138, 2774),
