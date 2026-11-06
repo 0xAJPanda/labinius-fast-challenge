@@ -17,7 +17,7 @@
 //! a matrix below [`MIN_MARGIN`] standard deviations (as the x86 build does). Everything else is
 //! exact.
 use super::*;
-use crate::ntt::{centered, for_blocks, primes};
+use crate::ntt::{centered, for_blocks, front_transform_bound, primes, FRONT_SCHEDULES};
 
 #[path = "sms_lattice.rs"]
 #[allow(dead_code)]
@@ -37,18 +37,18 @@ pub const DIGITS: usize = 6;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 128;
+pub const CHUNK: usize = 104;
 /// Nodes of the encoder's closest-vector search: 1 is Babai's nearest plane alone, about 2000
 /// times cheaper than the x86 build's 512 for a slightly larger digit spread (rms 3.88 against
-/// 3.55). With [`CHUNK`] 128 the smallest margin is 8.62 standard deviations, and the Hoeffding
-/// union bound over every chunk, digit and coefficient of a column is about 3e-13 (3.1e-10 per
-/// proof of 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
+/// 3.55). With [`CHUNK`] 64 the smallest margin is 12.16 standard deviations, and the Hoeffding
+/// union bound over every chunk, digit and coefficient of a column is 9.8e-30 (1.0e-26 per proof of
+/// 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
 const SEARCH: usize = 1;
 /// The smallest admissible reconstruction margin, in standard deviations.
 pub const MIN_MARGIN: f64 = 7.5;
 /// The largest admissible failure bound of one column (`sum 2 exp(-z^2 / 2)`, Hoeffding, over
-/// every chunk, digit and coefficient): 1e-12, i.e. below 1.1e-9 for a proof's 1024 columns.
-pub const MAX_COLUMN_FAILURE: f64 = 1e-12;
+/// every chunk, digit and coefficient): 1e-16, i.e. below 1e-13 for a proof's 1024 columns.
+pub const MAX_COLUMN_FAILURE: f64 = 1e-16;
 /// Unit terms of one reduced product coefficient: a witness coefficient `i < 512` times a
 /// coefficient `x < 648` folds onto coefficient `i + x` and, for `i + x >= 648`, two more.
 const TERMS: i64 = 836;
@@ -267,13 +267,18 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
 
+/// The schedule of the binary transforms: the table front end of prime [`PB`]
+/// ([`super::pass_ab`], `FRONT_SCHEDULES[PB]`).
+const FRONT: usize = 4 + PB;
+/// The largest product of a key slot (a centered residue) and a transform slot.
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * front_transform_bound(P1, FRONT_SCHEDULES[PB]) as u64;
+/// Elements whose products the SVE `i64` sums take below the `2^41` that [`sve::narrow`]'s
+/// residues need (the main-stream sum runs over every element).
+pub const MAX_ELEMENTS: usize = (((1u64 << 41) - 1) / PRODUCT) as usize;
+const _: () = assert!(MAX_ELEMENTS >= 4096);
+
 /// Elements per key group, transformed together and multiplied in one pass over the accumulators.
 pub const GROUP: usize = 8;
-/// The most elements whose SVE main-stream sum stays below `2^41` (`sve::residue`): every element
-/// adds a centered key (`<= (p - 1) / 2`) times a transform slot (`<= lut_transform_bound`).
-const MAX_ELEMENTS: usize =
-    ((1u64 << 41) / ((P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64)) as usize;
-const _: () = assert!(MAX_ELEMENTS >= 4096);
 const _: () = assert!(CHUNK % GROUP == 0);
 
 /// The accumulator pair of slot `s`, row `r`: `acc[idx..idx + 2]`, columns 0..4 then 4..8.
@@ -455,8 +460,7 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
-    m: &mut [int16x8_t; BITS],
-    nib: &mut [uint8x16_t; GROUPS],
+    ix: &mut [uint8x16_t; 162],
     xs: &mut [[int16x8_t; N]; GROUP],
     acc: &mut [int32x4_t],
     mut acc64: Option<&mut [int64x2_t]>,
@@ -464,12 +468,9 @@ unsafe fn sums(
     mut chunk: impl FnMut(usize, usize, &mut [int16x8_t; N]),
 ) {
     let kern = &kernels()[PB];
-    let s: Schedule = SCHEDULES[PB];
-    const { assert!(GROUP <= SCHEDULES[PB].accumulate) };
-    // the NEON slot sums of the table-fed transform's outputs stay inside i32 between reductions
-    const { assert!(crate::ntt::lut_accumulator_bound(P1, SCHEDULES[PB]) <= i32::MAX as u64) };
-    // the SVE main-stream sum over every element stays below 2^41 (`sve::residue`)
-    assert!(a.elements <= MAX_ELEMENTS);
+    let front = &fronts()[PB];
+    let s: Schedule = schedule(FRONT);
+    const { assert!(GROUP <= FRONT_SCHEDULES[PB].accumulate) };
     let p = P1 as i32;
     acc.fill(vdupq_n_s32(0));
     if let Some(w) = acc64.as_deref_mut() {
@@ -482,12 +483,11 @@ unsafe fn sums(
         let here = (a.elements - e0).min(GROUP);
         for i in 0..here {
             let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
-            masks(&at, m);
+            indices(&at, ix);
             let x = &mut xs[i];
-            nibbles(m, nib);
-            pass_lut::<PB>(nib, x, kern);
-            pass_c::<PB>(x, kern);
-            pass_d::<PB, false>(x, kern, &[], &mut []);
+            pass_ab::<FRONT>(ix, x, kern, front);
+            pass_c2::<FRONT>(x, kern);
+            pass_d::<FRONT, false>(x, kern, &[], &mut []);
         }
         // a missing element's keys are zero; its stale transform contributes nothing
         match acc64.as_deref_mut() {
@@ -565,11 +565,11 @@ fn crt(r: u32, t: u32) -> u128 {
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
+    assert!(a.elements <= MAX_ELEMENTS, "the i64 slot sums need |sum| < 2^41");
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
-        let mut m = Box::new([vdupq_n_s16(0); BITS]);
-        let mut nib = Box::new([vdupq_n_u8(0); GROUPS]);
+        let mut ix = Box::new([vdupq_n_u8(0); 162]);
         let mut xs = Box::new([[vdupq_n_s16(0); N]; GROUP]);
         let mut acc64 = if sve::available() { Some(vec![vdupq_n_s64(0); ROWS * 4 * N]) } else { None };
         let mut y = Box::new([vdupq_n_s16(0); N]);
@@ -589,7 +589,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, acc64.as_deref_mut(), &mut y, |c, d, r| {
+            sums(&words, a, &mut ix, &mut xs, &mut acc, acc64.as_deref_mut(), &mut y, |c, d, r| {
                 let mr = a.mean_residues(c, d);
                 let dv = &mut dev[d * 2 * N..][..2 * N];
                 for s in 0..N {
