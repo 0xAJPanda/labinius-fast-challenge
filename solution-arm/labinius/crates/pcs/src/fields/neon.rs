@@ -410,6 +410,124 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// the lean switch: block partial sets and the materialized fold
+// ---------------------------------------------------------------------------------------------
+
+/// Groups of eight `eq` rows whose tables are built per pass of [`partial_sets_rows`].
+const LPASS: usize = 4;
+
+/// `sets[u][k] = sum_j bit_k(pi0[u * stride + j0 + j]) eq[j]` for `u < blocks`, `j < eq.len()`.
+///
+/// The four-Russians tables of [`partial_evals_rows`] depend only on the `eq` rows, so each one
+/// is built once and read for all `blocks` blocks of `pi0` that share those `eq` rows.
+pub(super) fn partial_sets_rows(
+    pi0: &[B128],
+    stride: usize,
+    blocks: usize,
+    j0: usize,
+    eq: &[B128],
+) -> Vec<Vec<B128>> {
+    let m = eq.len();
+    assert!(blocks >= 1 && (blocks - 1) * stride + j0 + m <= pi0.len());
+    let groups = m / GROUP;
+    let mut out = vec![vec![B128::ZERO; 128]; blocks];
+    unsafe {
+        let mut tabs: Vec<[uint8x16_t; 256]> = vec![[vdupq_n_u8(0); 256]; LPASS];
+        let mut sums: Vec<[uint8x16_t; 128]> = vec![[vdupq_n_u8(0); 128]; blocks];
+        let mut pats = [[0u8; 128]; LPASS];
+        let mut g = 0;
+        while g < groups {
+            let count = (groups - g).min(LPASS);
+            for x in 0..count {
+                combinations(eq.as_ptr().add(GROUP * (g + x)), &mut tabs[x]);
+            }
+            let tabs = &tabs[..count];
+            for (u, sum) in sums.iter_mut().enumerate() {
+                let base = pi0.as_ptr().add(u * stride + j0);
+                for x in 0..count {
+                    patterns(base.add(GROUP * (g + x)), &mut pats[x]);
+                }
+                let pats = &pats[..count];
+                for (q, s) in sum.iter_mut().enumerate() {
+                    let mut a = vdupq_n_u8(0);
+                    for (t, p) in tabs.iter().zip(pats) {
+                        a = veorq_u8(a, *t.get_unchecked(*p.get_unchecked(q) as usize));
+                    }
+                    *s = veorq_u8(*s, a);
+                }
+            }
+            g += count;
+        }
+        for (sum, v) in sums.iter().zip(out.iter_mut()) {
+            for (q, s) in sum.iter().enumerate() {
+                let mut a = 0u128;
+                vst1q_u8(&mut a as *mut u128 as *mut u8, *s);
+                v[8 * (q % 16) + q / 16] = B128(a);
+            }
+        }
+    }
+    for (u, v) in out.iter_mut().enumerate() {
+        let rows = &pi0[u * stride + j0..][..m];
+        for (&p, &e) in rows[GROUP * groups..].iter().zip(&eq[GROUP * groups..]) {
+            for (k, vk) in v.iter_mut().enumerate() {
+                if p.bit(k) {
+                    *vk = *vk + e;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `out[.][j] = sum_u w[u] lift(pi0[u * stride + j0 + j])`, products accumulated unreduced and
+/// reduced once per entry.
+///
+/// # Safety
+/// The CPU must have PMULL ([`pmull`]).
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn lift_combine_rows(
+    pi0: &[B128],
+    stride: usize,
+    w: &[F162],
+    j0: usize,
+    out: [&mut [u64]; 3],
+) {
+    let [o0, o1, o2] = out;
+    let m = o0.len();
+    assert!(o1.len() == m && o2.len() == m);
+    assert!(!w.is_empty() && (w.len() - 1) * stride + j0 + m <= pi0.len());
+    let src = pi0.as_ptr() as *const u64;
+    for j in 0..m {
+        let mut acc = [vdupq_n_u64(0); 4];
+        for (u, wu) in w.iter().enumerate() {
+            let at = 2 * (u * stride + j0 + j);
+            let x0 = *src.add(at);
+            let x1 = *src.add(at + 1);
+            for i in 0..3 {
+                let wi = wu.0[i];
+                acc[i] = veorq_u64(acc[i], vreinterpretq_u64_p128(vmull_p64(wi, x0)));
+                acc[i + 1] = veorq_u64(acc[i + 1], vreinterpretq_u64_p128(vmull_p64(wi, x1)));
+            }
+        }
+        let lo = |x: uint64x2_t| vgetq_lane_u64::<0>(x);
+        let hi = |x: uint64x2_t| vgetq_lane_u64::<1>(x);
+        let p = [
+            lo(acc[0]),
+            hi(acc[0]) ^ lo(acc[1]),
+            hi(acc[1]) ^ lo(acc[2]),
+            hi(acc[2]) ^ lo(acc[3]),
+            hi(acc[3]),
+            0,
+        ];
+        let y = reduce(p);
+        o0[j] = y.0[0];
+        o1[j] = y.0[1];
+        o2[j] = y.0[2];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
