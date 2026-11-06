@@ -422,6 +422,75 @@ static FOLD: Fold = Fold({
 include!("sms_slot_gen.rs");
 const _: () = assert!(STREAMS == 7 && LOCK == 8);
 
+macro_rules! sms_round8 {
+    ($x:literal, $r:literal) => { concat!(
+        "vpdpwssd zmm20, {", $x, "}, dword ptr [{k} + ", $r, "]{{1to16}}\n",
+        "vpdpwssd zmm21, {", $x, "}, dword ptr [{k} + 32 + ", $r, "]{{1to16}}\n",
+        "vpdpwssd zmm22, {", $x, "}, dword ptr [{k} + 64 + ", $r, "]{{1to16}}\n",
+        "vpdpwssd zmm23, {", $x, "}, dword ptr [{k} + 96 + ", $r, "]{{1to16}}\n",
+        "vpdpwssd zmm24, {", $x, "}, dword ptr [{k} + 128 + ", $r, "]{{1to16}}\n",
+        "vpdpwssd zmm25, {", $x, "}, dword ptr [{k} + 160 + ", $r, "]{{1to16}}\n",
+        "vpdpwssd zmm26, {", $x, "}, dword ptr [{k} + 192 + ", $r, "]{{1to16}}\n",
+    ) };
+}
+macro_rules! sms_slot8_folded {
+    (reduce) => { concat!(
+        "vmovdqa64 zmm27, zmmword ptr [{f}]\n",
+        "vpbroadcastd zmm28, dword ptr [{f} + 64]\n",
+        "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
+        "vmovdqa64 zmm21, zmmword ptr [{a} + 64]\n",
+        "vmovdqa64 zmm22, zmmword ptr [{a} + 128]\n",
+        "vmovdqa64 zmm23, zmmword ptr [{a} + 192]\n",
+        "vmovdqa64 zmm24, zmmword ptr [{a} + 256]\n",
+        "vmovdqa64 zmm25, zmmword ptr [{a} + 320]\n",
+        "vmovdqa64 zmm26, zmmword ptr [{a} + 384]\n",
+        sms_slot8_folded!(rounds_and_fold),
+    ) };
+    (reduce_first) => { concat!(
+        "vmovdqa64 zmm27, zmmword ptr [{f}]\n",
+        "vpbroadcastd zmm28, dword ptr [{f} + 64]\n",
+        "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
+        "vpbroadcastd zmm21, dword ptr [{b} + 0]\n",
+        "vpbroadcastd zmm22, dword ptr [{b} + 4]\n",
+        "vpbroadcastd zmm23, dword ptr [{b} + 8]\n",
+        "vpbroadcastd zmm24, dword ptr [{b} + 12]\n",
+        "vpbroadcastd zmm25, dword ptr [{b} + 16]\n",
+        "vpbroadcastd zmm26, dword ptr [{b} + 20]\n",
+        sms_slot8_folded!(rounds_and_fold),
+    ) };
+    (rounds_and_fold) => { concat!(
+        sms_round8!("x0", "0"),
+        sms_round8!("x1", "4"),
+        sms_round8!("x2", "8"),
+        sms_round8!("x3", "12"),
+        sms_round8!("x4", "16"),
+        sms_round8!("x5", "20"),
+        sms_round8!("x6", "24"),
+        sms_round8!("x7", "28"),
+        "vpxord zmm20, zmm20, zmm28\n",
+        "vpmaddwd zmm20, zmm20, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 0], zmm20\n",
+        "vpxord zmm21, zmm21, zmm28\n",
+        "vpmaddwd zmm21, zmm21, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 64], zmm21\n",
+        "vpxord zmm22, zmm22, zmm28\n",
+        "vpmaddwd zmm22, zmm22, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 128], zmm22\n",
+        "vpxord zmm23, zmm23, zmm28\n",
+        "vpmaddwd zmm23, zmm23, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 192], zmm23\n",
+        "vpxord zmm24, zmm24, zmm28\n",
+        "vpmaddwd zmm24, zmm24, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 256], zmm24\n",
+        "vpxord zmm25, zmm25, zmm28\n",
+        "vpmaddwd zmm25, zmm25, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 320], zmm25\n",
+        "vpxord zmm26, zmm26, zmm28\n",
+        "vpmaddwd zmm26, zmm26, zmm27\n",
+        "vmovdqa64 zmmword ptr [{a} + 384], zmm26\n",
+    ) };
+}
+
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
@@ -514,9 +583,9 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
                 };
             }
             if LOCK == 8 {
-                if RED && FIRST { call_first!(sms_slot8, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                if RED && FIRST { call_first!(sms_slot8_folded, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else if FIRST { call_first!(sms_slot8, plain_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-                else if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else if RED { call!(sms_slot8_folded, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
             } else if LOCK == 16 {
                 call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
