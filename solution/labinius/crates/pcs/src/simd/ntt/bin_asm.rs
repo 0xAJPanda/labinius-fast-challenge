@@ -1398,7 +1398,8 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
         }
         let cv = t.cv.as_ptr() as *const i16;
         let tail_blocks = core::hint::black_box(6usize);
-        for j in 0..tail_blocks {
+        for jr in 0..tail_blocks {
+            let j = tail_blocks - 1 - jr;
             let kk = 6 * k + j;
             let os = buf(kk);
             let (t4, t5, t6) = if Q == 9721 {
