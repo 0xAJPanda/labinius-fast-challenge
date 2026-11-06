@@ -1838,14 +1838,16 @@ unsafe fn materialize_prefix_range(
         let j1 = (j0 + BIND_STRETCH).min(range.end);
         for (s, ws) in weights.chunks(BIND_WAYS).enumerate() {
             let q0 = s * BIND_WAYS;
+            let last = j1.saturating_sub(8);
             for j in (j0..j1).step_by(8) {
-                let a0 = words.wrapping_add(j + MATERIALIZE_AHEAD + q0 * len) as *const i8;
+                let ahead = (j + MATERIALIZE_AHEAD).min(last);
+                let a0 = words.wrapping_add(ahead + q0 * len) as *const i8;
                 _mm_prefetch::<_MM_HINT_T0>(a0);
                 _mm_prefetch::<_MM_HINT_T0>(a0.wrapping_add(64));
                 let mut acc = prods_word10(ws[0], split_words(words.add(j + q0 * len)));
                 for (i, &weight) in ws.iter().enumerate().skip(1) {
                     let q = q0 + i;
-                    let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q * len) as *const i8;
+                    let a = words.wrapping_add(ahead + q * len) as *const i8;
                     _mm_prefetch::<_MM_HINT_T0>(a);
                     _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
                     mac_word10(&mut acc, weight, split_words(words.add(j + q * len)));
