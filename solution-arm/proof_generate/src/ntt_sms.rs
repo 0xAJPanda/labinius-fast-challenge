@@ -443,6 +443,16 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
+const AHEAD: usize = GROUP;
+
+#[inline(always)]
+unsafe fn prefetch_element(words: &[(*const u8, usize); LANES], e: usize) {
+    for &(base, stride) in words {
+        let p = base.wrapping_add(e * stride);
+        core::arch::asm!("prfm pldl2keep, [{p}]", p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+}
+
 /// The batch's pass: the base slot sums (row 0 of `acc`, reduced, `|v| <= p`), and each chunk's
 /// digit sums inverted to canonical coefficients, handed to `chunk(c, d, coefficients)`. With
 /// `acc64` (SVE available) the products go into its `i64` lanes instead.
@@ -471,6 +481,9 @@ unsafe fn sums(
         let e0 = GROUP * g;
         let here = (a.elements - e0).min(GROUP);
         for i in 0..here {
+            if e0 + i + AHEAD < a.elements {
+                prefetch_element(words, e0 + i + AHEAD);
+            }
             let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
             masks(&at, m);
             let x = &mut xs[i];
