@@ -938,7 +938,7 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                 }
             };
             let Some(u) = unit else { break };
-            let (part, gi) = (u / groups, u % groups);
+            let (part, gi) = (u / groups, groups - 1 - u % groups);
             let range = part * np / HALVES..(part + 1) * np / HALVES;
             let lo = gi * g;
             let n = g.min(columns.len() - lo);
@@ -1015,6 +1015,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
                 if gi >= groups {
                     break;
                 }
+                let gi = groups - 1 - gi;
                 let c0 = gi * g;
                 let gc = g.min(columns.len() - c0);
                 let ws = ws.get_or_insert_with(SmsWorker::new);
