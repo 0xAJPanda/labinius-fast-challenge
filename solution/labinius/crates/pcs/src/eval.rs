@@ -452,6 +452,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
             if k >= chunks {
                 break;
             }
+            let k = if add { chunks - 1 - k } else { k };
             // Chunk `k` owns `out[k * chunk ..]`.
             let end = ((k + 1) * chunk).min(columns);
             let mut j = k * chunk;
