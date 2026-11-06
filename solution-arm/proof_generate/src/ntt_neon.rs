@@ -50,9 +50,10 @@ pub struct Kernel {
     /// ([`pass_lut`]), per level-1 node `n`: table `t` holds, for each nibble `v` (bit `g` the
     /// coefficient `j + 162 g`), the centered residue of `f_t` times node `n`'s level-1 value of
     /// `-s` ([`pass_a`]'s formula on that nibble), where, with `tau` node `n`'s radix-2 twiddle
-    /// and `z_h` the radix-3 twiddle of its level-2 child `2 n + h`, `f` is
-    /// `[1, tau, z_0, z_0 tau, z_1, z_1 tau, z_0^2, z_0^2 tau, z_1^2, z_1^2 tau]`.
-    lut: [[[i16; 16]; 10]; 4],
+    /// and `z_0` the radix-3 twiddle of its level-2 child `2 n`, `f` is
+    /// `[1, tau, z_0, z_0 tau, z_0^2, z_0^2 tau]`. The other child's twiddles
+    /// are `(1 + eps) z_0` and `eps z_0^2`, so its butterfly shares these lookups.
+    lut: [[[i16; 16]; 6]; 4],
 }
 
 fn twiddle(p: u32, w: u64) -> [i16; 2] {
@@ -100,7 +101,7 @@ impl Kernel {
             slot[..4].copy_from_slice(&r3(plan.exps[5][2 * q]));
             slot[4..].copy_from_slice(&r3(plan.exps[5][2 * q + 1]));
         }
-        let mut lut = [[[0i16; 16]; 10]; 4];
+        let mut lut = [[[0i16; 16]; 6]; 4];
         for (n, tables) in lut.iter_mut().enumerate() {
             let tau = plan.root(plan.exps[1][n] as usize / 2);
             let z = |h: usize| plan.root(plan.exps[2][2 * n + h] as usize / 3);
@@ -110,13 +111,13 @@ impl Kernel {
                 tau,
                 z(0),
                 z(0) * tau % pp,
-                z(1),
-                z(1) * tau % pp,
                 z(0) * z(0) % pp,
                 z(0) * z(0) % pp * tau % pp,
-                z(1) * z(1) % pp,
-                z(1) * z(1) % pp * tau % pp,
             ];
+            // Adjacent radix-2 children differ in exponent by 972. Their
+            // radix-3 twiddles differ by zeta^324 = 1 + eps, whose square is eps.
+            assert_eq!(z(1), z(0) * ((1 + plan.root(648)) % pp) % pp);
+            assert_eq!(z(1) * z(1) % pp, z(0) * z(0) % pp * plan.root(648) % pp);
             for v in 0..16 {
                 let level1 = lut_level1(&a, n, v) as i64;
                 for (t, table) in tables.iter_mut().enumerate() {
@@ -369,49 +370,77 @@ unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
     }
 }
 
-/// Byte rows of [`indices`] per word. The absent fourth pattern bit is omitted below, so every
-/// load names a real coefficient below 512 and no padded rows are needed.
-const BYTE_ROWS: usize = 16;
-
-/// `idx` of position `32 b + JJ` from `row = bytes[0][b]`: coefficient `c = 32 b + JJ + 162 t`
-/// is bit `(c / 4) % 8` of byte `c / 32` of word `c % 4`, and goes to bits `t + 1` and `t + 9`.
+/// Exchange alternating groups of `D` bits between two bit planes. After the two
+/// rounds below, each byte contains the nibbles of positions `r` and `r + 4`.
 #[inline(always)]
-unsafe fn index_one<const JJ: usize, const FOUR: bool>(
-    row: *const uint16x8_t,
-    bit: &[uint16x8_t; 8],
-    field: &[uint16x8_t; 4],
-    base: uint16x8_t,
-) -> uint8x16_t {
-    let mut x = base;
-    for t in 0..if FOUR { 4 } else { 3 } {
-        let c = JJ + 162 * t;
-        let l = *row.add((c % 4) * BYTE_ROWS + c / 32);
-        // `cmtst` and `bit` as written: from the intrinsics LLVM builds and/cmeq/bic/orr.
-        core::arch::asm!(
-            "cmtst {m:v}.8h, {l:v}.8h, {b:v}.8h",
-            "bit {x:v}.16b, {m:v}.16b, {f:v}.16b",
-            m = out(vreg) _,
-            l = in(vreg) l,
-            b = in(vreg) bit[(c / 4) % 8],
-            f = in(vreg) field[t],
-            x = inout(vreg) x,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-    }
-    vreinterpretq_u8_u16(x)
+unsafe fn index_swap<const D: i32>(a: uint8x16_t, b: uint8x16_t, mask: u8) -> (uint8x16_t, uint8x16_t) {
+    let mask = vdupq_n_u8(mask);
+    (vbslq_u8(mask, a, vshlq_n_u8::<D>(b)), vbslq_u8(mask, vshrq_n_u8::<D>(a), b))
 }
 
-/// The table indices of one element of the eight columns whose words `words` point at:
-/// `idx[j]`, lane `c`, holds the bytes `2 p, 2 p + 1` for column `c`'s pattern `p` at `j`
-/// (bit `t` of `p` is coefficient `j + 162 t`; coefficient `4 q + k` is bit `q` of word `k`, and
-/// none is set from 512 on).
+/// Sixteen bit positions of word `K`, across all eight columns. Each byte-row
+/// vector packs two consecutive bytes, eight columns of each. The sentinel row
+/// supplies the zero bits above the end of a word.
 #[inline(always)]
-unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; 162]) {
-    // bytes[k][b], lane c: byte b < 16 of word k of column c
-    let mut bytes = [[vdupq_n_u16(0); BYTE_ROWS]; 4];
-    for (k, row) in bytes.iter_mut().enumerate() {
+unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 2], idx: &mut [uint8x16_t; GROUPS]) {
+    let a = bytes[K / 2][G];
+    let other = &bytes[1 - K / 2];
+    // j + 162: the other word shifted by 40 bits (K < 2) or 41 bits.
+    let mut b = vextq_u8::<8>(other[2 + G], other[3 + G]);
+    if K >= 2 {
+        b = vorrq_u8(vshrq_n_u8::<1>(b), vshlq_n_u8::<7>(other[3 + G]));
+    }
+    // j + 324: the same word shifted by 81 bits.
+    let c0 = bytes[K / 2][5 + G];
+    let c1 = vextq_u8::<8>(c0, bytes[K / 2][6 + G]);
+    let c = vorrq_u8(vshrq_n_u8::<1>(c0), vshlq_n_u8::<7>(c1));
+    // j + 486 exists only in the first seven (K < 2) or six positions.
+    let d = if G == 0 {
+        let last = vextq_u8::<8>(other[7], vdupq_n_u8(0));
+        if K < 2 { vshrq_n_u8::<1>(last) } else { vshrq_n_u8::<2>(last) }
+    } else {
+        vdupq_n_u8(0)
+    };
+    let (a, b) = index_swap::<1>(a, b, 0x55);
+    let (c, d) = index_swap::<1>(c, d, 0x55);
+    let (a, c) = index_swap::<2>(a, c, 0x33);
+    let (b, d) = index_swap::<2>(b, d, 0x33);
+    macro_rules! put {
+        ($q:expr, $z:expr) => {
+            if 4 * (16 * G + $q) + K < GROUPS {
+                *idx.get_unchecked_mut(4 * (16 * G + $q) + K) = $z;
+            }
+        };
+    }
+    macro_rules! emit {
+        ($v:expr, $r:literal) => {{
+            let v = $v;
+            let lo = vandq_u8(vshlq_n_u8::<1>(v), vdupq_n_u8(0x1e));
+            let hi = vandq_u8(vshrq_n_u8::<3>(v), vdupq_n_u8(0x1e));
+            // Set the second byte before duplication: one OR serves both halves.
+            let lo_odd = vorrq_u8(lo, vdupq_n_u8(1));
+            let hi_odd = vorrq_u8(hi, vdupq_n_u8(1));
+            put!($r, vzip1q_u8(lo, lo_odd));
+            put!($r + 4, vzip1q_u8(hi, hi_odd));
+            put!($r + 8, vzip2q_u8(lo, lo_odd));
+            put!($r + 12, vzip2q_u8(hi, hi_odd));
+        }};
+    }
+    emit!(a, 0);
+    emit!(b, 1);
+    emit!(c, 2);
+    emit!(d, 3);
+}
+
+/// The table indices of one element of eight columns. Coefficient `4 q + k`
+/// is bit `q` of word `k`; each result lane holds `(2 p, 2 p + 1)` for the
+/// four-bit pattern at `j + 162 t`, with coefficients above 511 zero.
+#[inline(never)]
+unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
+    let mut bytes = [[vdupq_n_u8(0); 9]; 2];
+    for (i, row) in bytes.iter_mut().enumerate() {
+        let k = P + 2 * i;
         let r: [uint8x16_t; 8] = core::array::from_fn(|c| vld1q_u8(words[c].add(16 * k)));
-        // three zip rounds transpose the 8 x 16 bytes, as in `masks`
         let a: [uint8x16_t; 8] = core::array::from_fn(|i| {
             let (x, y) = (r[2 * (i % 4)], r[2 * (i % 4) + 1]);
             if i < 4 { vzip1q_u8(x, y) } else { vzip2q_u8(x, y) }
@@ -428,27 +457,31 @@ unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; 162]) {
             let h = v / 4;
             let z = (v % 4) / 2;
             let (x, y) = (vreinterpretq_u32_u16(b[4 * h + z]), vreinterpretq_u32_u16(b[4 * h + 2 + z]));
-            let pair = vreinterpretq_u8_u32(if v % 2 == 0 { vzip1q_u32(x, y) } else { vzip2q_u32(x, y) });
-            row[2 * v] = vmovl_u8(vget_low_u8(pair));
-            row[2 * v + 1] = vmovl_high_u8(pair);
+            row[v] = vreinterpretq_u8_u32(if v % 2 == 0 { vzip1q_u32(x, y) } else { vzip2q_u32(x, y) });
         }
     }
-    let bit: [uint16x8_t; 8] = core::array::from_fn(|i| vdupq_n_u16(1 << i));
-    let field: [uint16x8_t; 4] = core::array::from_fn(|t| vdupq_n_u16(0x0202 << t));
-    let base = vdupq_n_u16(0x0100);
-    let rows = bytes.as_ptr() as *const uint16x8_t;
-    macro_rules! one {
-        ($b:expr, $four:literal, $($jj:literal)*) => {$(
-            *idx.get_unchecked_mut(32 * $b + $jj) = index_one::<$jj, $four>(rows.add($b), &bit, &field, base);
-        )*};
+    macro_rules! word {
+        ($k:literal) => {{
+            index_block::<$k, 0>(&bytes, idx);
+            index_block::<$k, 1>(&bytes, idx);
+            index_block::<$k, 2>(&bytes, idx);
+        }};
     }
-    // j + 486 exists only for j < 26; its bit is identically zero elsewhere.
-    one!(0, true, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25);
-    one!(0, false, 26 27 28 29 30 31);
-    for b in 1..5 {
-        one!(b, false, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
+    if P == 0 {
+        word!(0);
+        word!(2);
+    } else {
+        word!(1);
+        word!(3);
     }
-    one!(5, false, 0 1);
+}
+
+/// Process independent word pairs separately, keeping only sixteen transposed
+/// byte rows live rather than all thirty-two rows of the four-word input.
+#[inline(always)]
+unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
+    indices_pair::<0>(words, idx);
+    indices_pair::<1>(words, idx);
 }
 
 /// The 16-entry `i16` table `t` as the two registers `vqtbl2q_u8` reads.
@@ -463,37 +496,58 @@ unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
     vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
 }
 
-/// Levels 0 to 3 of the binary transform from the nibble indices ([`nibbles`]), in place of
-/// [`pass_a`] and [`pass_b`] (same output slots, values within [`super::lut_transform_bound`]'s
-/// level-3 bound): per level-1 node `n` and `j < 27`, the level-3 inputs of its two level-2
-/// children `2 n + h` are sums of two lookups ([`Kernel::lut`]), `a_r` and `b_r` for input `r`
-/// at slot `j + 27 r` of the child, already multiplied by their level-3 twiddles; level 3 then
-/// multiplies only by `eps`.
+/// The second child's radix-3 butterfly from the shared lookups. If `b` and
+/// `c` are the differences of the same tables whose sums feed the first child,
+/// its multiplied inputs are `(1 + eps) b` and `eps c`. Using eps^2 = -1-eps:
+/// y = [a + b + eps(b+c), a - b + c, a - c - eps(b+c)].
+/// All inputs are bounded by 2h, so `b+c` is bounded by 4h; the three output
+/// bounds are the same 4h+product_bound(p,4h), 6h as in radix3_twiddled.
+#[inline(always)]
+unsafe fn radix3_sixth<const RD: u8>(
+    a: int16x8_t,
+    b: int16x8_t,
+    c: int16x8_t,
+    k: int16x8_t,
+) -> (int16x8_t, int16x8_t, int16x8_t) {
+    let mut d = vaddq_s16(b, c);
+    if RD == 1 {
+        d = reduce(d, k);
+    } else if RD == 2 {
+        d = reduce_cheap(d, k);
+    }
+    let e = mulc::<2, 3>(d, k, k);
+    (
+        vaddq_s16(vaddq_s16(a, b), e),
+        vaddq_s16(vsubq_s16(a, b), c),
+        vsubq_s16(vsubq_s16(a, c), e),
+    )
+}
+
+/// Levels 0 to 3 from six tables per level-1 node. The two children share every
+/// lookup: sums feed the first radix-3 butterfly and differences the second,
+/// whose sixth-root twiddle is absorbed by radix3_sixth. Every intermediate
+/// stays within the existing lut_transform_bound, and only eps is multiplied.
 #[inline(always)]
 unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(S);
-    // every value of this pass and of levels 4 to 6 after it fits i16
     const { assert!(S < 3 && super::lut_transform_bound(PRIMES[S], SCHEDULES[S]) <= i16::MAX as u32) };
     let k = vld1q_s16(kern.k.as_ptr());
     let ix = |i: usize| *idx.get_unchecked(i);
     for n in 0..4 {
         let l = &kern.lut[n];
-        let t: [uint8x16x2_t; 10] = core::array::from_fn(|i| table(&l[i]));
+        let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
         let base = 162 * n;
         for j in 0..27 {
-            let (i0, i0h) = (ix(j), ix(j + 81));
-            let (i1, i1h) = (ix(j + 27), ix(j + 108));
-            let (i2, i2h) = (ix(j + 54), ix(j + 135));
-            let (x0, y0) = (look(t[0], i0), look(t[1], i0h));
+            let (x0, y0) = (look(t[0], ix(j)), look(t[1], ix(j + 81)));
+            let (x1, y1) = (look(t[2], ix(j + 27)), look(t[3], ix(j + 108)));
+            let (x2, y2) = (look(t[4], ix(j + 54)), look(t[5], ix(j + 135)));
             let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
-            let a1 = vaddq_s16(look(t[2], i1), look(t[3], i1h));
-            let b1 = vsubq_s16(look(t[4], i1), look(t[5], i1h));
-            let a2 = vaddq_s16(look(t[6], i2), look(t[7], i2h));
-            let b2 = vsubq_s16(look(t[8], i2), look(t[9], i2h));
+            let (a1, b1) = (vaddq_s16(x1, y1), vsubq_s16(x1, y1));
+            let (a2, b2) = (vaddq_s16(x2, y2), vsubq_s16(x2, y2));
             let (u, v) = match (s.reduce_d, s.cheap) {
-                (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_twiddled::<0>(b0, b1, b2, k)),
-                (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_twiddled::<1>(b0, b1, b2, k)),
-                (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_twiddled::<2>(b0, b1, b2, k)),
+                (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_sixth::<0>(b0, b1, b2, k)),
+                (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_sixth::<1>(b0, b1, b2, k)),
+                (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_sixth::<2>(b0, b1, b2, k)),
             };
             let at = base + j;
             store(x, at, u.0);
@@ -986,6 +1040,18 @@ mod tests {
     use super::super::{product_bound, reduced_bound, tests::xorshift};
     use super::*;
 
+    #[no_mangle]
+    #[inline(never)]
+    unsafe fn mca_pass_lut(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+        pass_lut::<1>(idx, x, kern);
+    }
+
+    #[no_mangle]
+    #[inline(never)]
+    unsafe fn mca_indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
+        indices(words, idx);
+    }
+
     fn lanes(v: int16x8_t) -> [i16; 8] {
         unsafe { core::mem::transmute(v) }
     }
@@ -1252,6 +1318,37 @@ mod tests {
         }
     }
 
+    /// Exact byte-pair indices, including every one-hot coefficient in every
+    /// column and the mixed patterns used by the transform regression tests.
+    #[test]
+    fn indices_match_mask_nibbles() {
+        let mut state = 7u64;
+        for case in 0..BITS + 12 {
+            let words = if case < BITS {
+                core::array::from_fn(|c| {
+                    let bit = (case + 37 * c) % BITS;
+                    core::array::from_fn(|k| if k == bit % 4 { 1u128 << (bit / 4) } else { 0 })
+                })
+            } else {
+                case_words(case - BITS, &mut state)
+            };
+            let ptrs: [*const u8; LANES] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            let mut m = [unsafe { vdupq_n_s16(0) }; BITS];
+            let mut want = [unsafe { vdupq_n_u8(0) }; GROUPS];
+            let mut got = want;
+            unsafe {
+                masks(&ptrs, &mut m);
+                nibbles(&m, &mut want);
+                mca_indices(&ptrs, &mut got);
+            }
+            for j in 0..GROUPS {
+                let got: [u8; 16] = unsafe { core::mem::transmute(got[j]) };
+                let want: [u8; 16] = unsafe { core::mem::transmute(want[j]) };
+                assert_eq!(got, want, "case {case} group {j}");
+            }
+        }
+    }
+
     /// The table-fed levels 0 to 3 ([`nibbles`], [`pass_lut`]) agree lane by lane with the scalar
     /// levels 0 to 3 of `-s` and with [`pass_a`] and [`pass_b`] modulo `p`, within
     /// [`super::super::lut_level3_bound`]; checked for every prime whose bound admits the tables.
@@ -1263,7 +1360,7 @@ mod tests {
             let kern = &kernels()[P];
             unsafe {
                 nibbles(m, idx);
-                pass_lut::<P>(idx, x, kern);
+                if P == 1 { mca_pass_lut(idx, x, kern); } else { pass_lut::<P>(idx, x, kern); }
                 pass_a(m, old, kern);
                 pass_b::<P>(old, kern);
             }
