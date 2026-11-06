@@ -125,8 +125,26 @@ const fn byte_tr() -> [u8; 64] {
     t
 }
 
+const fn byte_tr_lanes() -> [u8; 64] {
+    let t = byte_tr();
+    let mut s = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        let j = t[i] as usize;
+        let lane = match j / 16 {
+            1 => 2,
+            2 => 1,
+            l => l,
+        };
+        s[i] = (16 * lane + j % 16) as u8;
+        i += 1;
+    }
+    s
+}
+
 static BYTE_PERM: A64<[u8; 64]> = A64(byte_perm());
 static BYTE_TR: A64<[u8; 64]> = A64(byte_tr());
+static BYTE_TR_LANES: A64<[u8; 64]> = A64(byte_tr_lanes());
 static AFFINE_BOTH: A64<[u8; 64]> = A64(affine_both());
 static DUP_A: A64<[u8; 64]> = A64(dup_idx(0));
 static DUP_B: A64<[u8; 64]> = A64(dup_idx(32));
@@ -613,6 +631,7 @@ pub unsafe fn slice_b128_lanes(elems: &[*const crate::fields::scalar::B128; 32])
 /// [`slice_b128_lanes_into`] for a 16-column pair batch: lane `2 * l + e` (`l in 0..16`,
 /// `e in 0..2`) is read at `cols[l].add(4 * e)`, avoiding constructing a 32-pointer array per
 /// batch.
+///
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_b128_cols16_into(
@@ -625,10 +644,13 @@ pub unsafe fn slice_b128_cols16_into(
     let v = (*wk).v.as_mut_ptr();
     let mut g: MaybeUninit<[[__m512i; 16]; 2]> = MaybeUninit::uninit();
     let gp = g.as_mut_ptr() as *mut [__m512i; 16];
-    for h in 0..2 {
+    for w in 0..2 {
         let mut r: [__m512i; 16] = core::array::from_fn(|row| {
-            let lane = 16 * h + ROW_LANE[row];
-            _mm512_loadu_si512(cols[lane >> 1].add(4 * (lane & 1)) as *const __m512i)
+            let at = |h: usize| {
+                let lane = 16 * h + ROW_LANE[row];
+                cols[lane >> 1].add(4 * (lane & 1) + 2 * w) as *const __m256i
+            };
+            _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm256_loadu_si256(at(0))), _mm256_loadu_si256(at(1)))
         });
         macro_rules! stage {
             ($lo:ident, $hi:ident) => {{
@@ -643,18 +665,14 @@ pub unsafe fn slice_b128_cols16_into(
         stage!(_mm512_unpacklo_epi16, _mm512_unpackhi_epi16);
         stage!(_mm512_unpacklo_epi32, _mm512_unpackhi_epi32);
         stage!(_mm512_unpacklo_epi64, _mm512_unpackhi_epi64);
-        gp.add(h).write(r);
+        gp.add(w).write(r);
     }
     let g = g.assume_init_ref();
     let ident = _mm512_set1_epi64(GF_IDENT);
-    let qt = _mm512_load_si512(BYTE_TR.0.as_ptr() as *const __m512i);
-    let iu = _mm512_load_si512(LANE_IU.0.as_ptr() as *const __m512i);
-    let iv = _mm512_load_si512(LANE_IV.0.as_ptr() as *const __m512i);
+    let qt = _mm512_load_si512(BYTE_TR_LANES.0.as_ptr() as *const __m512i);
     for b in 0..16 {
-        let tu = _mm512_permutex2var_epi64(g[0][b], iu, g[1][b]);
-        let tv = _mm512_permutex2var_epi64(g[0][b], iv, g[1][b]);
-        let mu = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tu));
-        let mv = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tv));
+        let mu = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, g[0][b]));
+        let mv = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, g[1][b]));
         _mm512_store_si512(u.add(8 * b) as *mut __m512i, mu);
         _mm512_store_si512(v.add(8 * b) as *mut __m512i, mv);
     }
