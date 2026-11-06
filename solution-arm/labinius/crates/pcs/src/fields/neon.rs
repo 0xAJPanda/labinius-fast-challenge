@@ -127,6 +127,72 @@ pub(super) fn partial_evals_rows(pi0: &[B128], eq: &[B128]) -> Vec<B128> {
     v
 }
 
+/// Rows per block of [`partial_evals_split`]: `eq[j] = eq_hi[j >> 8] * eq_lo[j & 255]`.
+pub(super) const SPLIT_LOW: usize = 256;
+
+/// `v[k] = sum_j bit_k(pi0[j]) eq[j]` for the tensor `eq[j] = eq_hi[j / 256] * eq_lo[j % 256]`,
+/// without the `2^n`-entry `eq`. The 32 four-Russians tables of `eq_lo` (one per eight rows of
+/// a block, 4 KiB each) are built once; per block of 256 rows and per `k` the 32 lookups give
+/// `u_k = sum_{j < 256} bit_k(pi0[256 b + j]) eq_lo[j]`, and `v[k] += eq_hi[b] * u_k` is
+/// accumulated as an unreduced 256-bit carry-less product (four `PMULL`s) and reduced once at
+/// the end. The field sums are the same as the full table's, so the result is exact.
+pub(super) fn partial_evals_split(pi0: &[B128], eq_lo: &[B128], eq_hi: &[B128]) -> Vec<B128> {
+    assert_eq!(eq_lo.len(), SPLIT_LOW);
+    assert_eq!(pi0.len(), SPLIT_LOW * eq_hi.len());
+    const CHUNKS: usize = SPLIT_LOW / GROUP;
+    let mut tabs: Vec<[uint8x16_t; 256]> = unsafe { vec![[vdupq_n_u8(0); 256]; CHUNKS] };
+    for (c, t) in tabs.iter_mut().enumerate() {
+        unsafe { combinations(eq_lo.as_ptr().add(GROUP * c), t) };
+    }
+    let tabs = &tabs;
+    let blocks = eq_hi.len();
+    let parts = crate::par::workers(blocks, 64);
+    // Per worker, per `q` (the order `patterns` emits): the low, middle and high 128-bit words
+    // of the unreduced sum.
+    let sums = crate::par::map_blocks(blocks, parts, 1, |_, b0, b1| unsafe {
+        let mut acc = [[vdupq_n_u64(0); 3]; 128];
+        let mut pats = [[0u8; 128]; CHUNKS];
+        for b in b0..b1 {
+            let rows = pi0.as_ptr().add(SPLIT_LOW * b);
+            for (c, p) in pats.iter_mut().enumerate() {
+                patterns(rows.add(GROUP * c), p);
+            }
+            let e = vld1q_u64(eq_hi.as_ptr().add(b) as *const u64);
+            let (e0, e1) = (vgetq_lane_u64::<0>(e), vgetq_lane_u64::<1>(e));
+            for (q, a) in acc.iter_mut().enumerate() {
+                let mut u = vdupq_n_u8(0);
+                for c in 0..CHUNKS {
+                    u = veorq_u8(u, *tabs.get_unchecked(c).get_unchecked(pats[c][q] as usize));
+                }
+                let u = vreinterpretq_u64_u8(u);
+                let (u0, u1) = (vgetq_lane_u64::<0>(u), vgetq_lane_u64::<1>(u));
+                let lo = vreinterpretq_u64_p128(vmull_p64(u0, e0));
+                let hi = vreinterpretq_u64_p128(vmull_p64(u1, e1));
+                let m0 = vreinterpretq_u64_p128(vmull_p64(u0, e1));
+                let m1 = vreinterpretq_u64_p128(vmull_p64(u1, e0));
+                a[0] = veorq_u64(a[0], lo);
+                a[1] = veorq_u64(a[1], veorq_u64(m0, m1));
+                a[2] = veorq_u64(a[2], hi);
+            }
+        }
+        acc.map(|a| a.map(|x| to_u128(x)))
+    });
+    let mut v = vec![B128::ZERO; 128];
+    let x128 = B128((1 << 7) | (1 << 2) | (1 << 1) | 1);
+    for q in 0..128 {
+        let (mut l, mut m, mut h) = (0u128, 0u128, 0u128);
+        for s in &sums {
+            l ^= s[q][0];
+            m ^= s[q][1];
+            h ^= s[q][2];
+        }
+        let (p_lo, p_hi) = (l ^ (m << 64), h ^ (m >> 64));
+        // x^128 = x^7 + x^2 + x + 1 in the GHASH field.
+        v[8 * (q % 16) + q / 16] = B128(p_lo) + B128(p_hi) * x128;
+    }
+    v
+}
+
 // ---------------------------------------------------------------------------------------------
 // the sumcheck's polynomials
 // ---------------------------------------------------------------------------------------------

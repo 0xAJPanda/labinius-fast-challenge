@@ -205,6 +205,26 @@ fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     v
 }
 
+/// [`partial_evals`] against `eq = eq_expand_b128(r_hi)`. On AArch64 with PMULL it splits the
+/// tensor instead of reading `eq` (see [`super::neon::partial_evals_split`]); the sums are the
+/// same field elements.
+fn partial_evals_at(pi0: &[B128], eq: &[B128], r_hi: &[B128]) -> Vec<B128> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        const LOW: usize = super::neon::SPLIT_LOW.trailing_zeros() as usize;
+        if r_hi.len() >= LOW && pi0.len() == 1 << r_hi.len() && super::neon::pmull() {
+            let (top, low) = r_hi.split_at(r_hi.len() - LOW);
+            return super::neon::partial_evals_split(
+                pi0,
+                &eq_expand_b128(low),
+                &eq_expand_b128(top),
+            );
+        }
+    }
+    let _ = r_hi;
+    partial_evals(pi0, eq)
+}
+
 /// [`partial_evals`] over whole tiles, natively on AArch64.
 #[cfg(target_arch = "aarch64")]
 fn tile_sums(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
@@ -536,7 +556,7 @@ impl Workspace {
     /// The partial evaluations of claim `i` at `r_hi`; its `eq` stays for the sumcheck.
     pub fn partial_evals(&mut self, i: usize, pi0: &[B128], r_hi: &[B128]) -> Vec<B128> {
         eq_expand_b128_into(r_hi, &mut self.eq[i]);
-        partial_evals(pi0, &self.eq[i])
+        partial_evals_at(pi0, &self.eq[i], r_hi)
     }
 }
 
@@ -548,7 +568,7 @@ pub struct SwitchProver {
 impl SwitchProver {
     pub fn partial_evals_and_eq(pi0: &[B128], r_hi: &[B128]) -> (Vec<B128>, Vec<B128>) {
         let eq_hi = eq_expand_b128(r_hi);
-        let v = partial_evals(pi0, &eq_hi);
+        let v = partial_evals_at(pi0, &eq_hi, r_hi);
         (v, eq_hi)
     }
 
@@ -841,6 +861,23 @@ mod tests {
             let pi0: Vec<B128> = (0..n).map(|_| next()).collect();
             let eq: Vec<B128> = (0..n).map(|_| next()).collect();
             assert_eq!(partial_evals(&pi0, &eq), reference(&pi0, &eq));
+        }
+    }
+
+    #[test]
+    fn split_partial_evals_match_the_full_table() {
+        let mut x = 0x0123_4567_89AB_CDEFu128;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            B128(x.wrapping_mul(0x2545F4914F6CDD1Du128) ^ (x >> 64))
+        };
+        for l in [3usize, 8, 9, 12, 15] {
+            let pi0: Vec<B128> = (0..1usize << l).map(|_| next()).collect();
+            let r: Vec<B128> = (0..l).map(|_| next()).collect();
+            let eq = eq_expand_b128(&r);
+            assert_eq!(partial_evals_at(&pi0, &eq, &r), reference(&pi0, &eq), "l {l}");
         }
     }
 }
