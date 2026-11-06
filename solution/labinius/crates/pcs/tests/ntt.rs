@@ -445,31 +445,45 @@ mod bin_asm {
     // stored rows exactly with the ordinary kernel on adversarial and random input.
     #[test]
     fn batched_matches_plain() {
-        struct Sink<'a>(&'a mut [Batch32]);
-        impl vb::SliceSink<8> for Sink<'_> {
-            unsafe fn rows(&mut self,blk:usize,w:[*const i16;8],r0:usize,r1:usize) {
-                for h in 0..8 { for i in r0..r1 {
-                    self.0[h].v[27*blk+i].copy_from_slice(core::slice::from_raw_parts(w[h].add(32*i),32));
+        struct Sink<'a, const H: usize>(&'a mut [Batch32]);
+        impl<const H: usize> vb::SliceSink<H> for Sink<'_, H> {
+            unsafe fn rows(&mut self, blk: usize, w: [*const i16; H], r0: usize, r1: usize) {
+                for h in 0..H { for i in r0..r1 {
+                    self.0[h].v[27 * blk + i].copy_from_slice(core::slice::from_raw_parts(w[h].add(32 * i), 32));
                 }}
             }
         }
-        #[repr(align(64))]
-        struct Scratch([i16;6*8*27*32]);
-        fn check<const Q:u16>() {
-            let inputs=batches(32,0x51227 ^ Q as u64);
-            for polys in inputs.chunks_exact(8) {
-                let idx:Vec<_>=polys.iter().map(idx_of_polys).collect();
-                let mut got:Vec<_>=(0..8).map(|_|Batch32::zero(Representation::Coefficients)).collect();
-                let mut scratch=Box::new(Scratch([0;6*8*27*32]));
-                unsafe {vb::ntt_bin_batch32_batched::<Q,8,_>(core::array::from_fn(|h|&idx[h]),scratch.0.as_mut_ptr(),&mut Sink(&mut got));}
-                for h in 0..8 {
-                    let mut expected=Batch32::zero(Representation::Coefficients);
-                    unsafe {vb::ntt_bin_batch32::<Q>(&idx[h],&mut expected);}
-                    assert_eq!(got[h].v,expected.v,"Q={Q}, batch={h}");
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct Block([i16; 32]);
+        fn check<const Q: u16, const H: usize>() {
+            let inputs = batches(32, 0x51227 ^ Q as u64);
+            for polys in inputs.chunks_exact(H) {
+                let idx: Vec<_> = polys.iter().map(idx_of_polys).collect();
+                let mut got: Vec<_> = (0..H).map(|_| Batch32::zero(Representation::Coefficients)).collect();
+                // Poison every prefix/output vector, with guards on both sides of the exact
+                // advertised buffer span. The producer must initialize its input in place.
+                let mut scratch = vec![Block([0x5a5a; 32]); 6 * H * 27 + 2];
+                unsafe {
+                    vb::ntt_bin_batch32_batched::<Q, H, _>(
+                        core::array::from_fn(|h| &idx[h]),
+                        scratch.as_mut_ptr().add(1).cast(),
+                        &mut Sink::<H>(&mut got),
+                    );
+                }
+                assert_eq!(scratch[0].0, [0x5a5a; 32]);
+                assert_eq!(scratch.last().unwrap().0, [0x5a5a; 32]);
+                for h in 0..H {
+                    let mut expected = Batch32::zero(Representation::Coefficients);
+                    unsafe { vb::ntt_bin_batch32::<Q>(&idx[h], &mut expected); }
+                    assert_eq!(got[h].v, expected.v, "Q={Q}, H={H}, batch={h}");
                 }
             }
         }
-        check::<3889>();check::<9721>();
+        check::<3889, 1>(); check::<3889, 2>(); check::<3889, 4>();
+        check::<3889, 8>(); check::<3889, 16>();
+        check::<9721, 1>(); check::<9721, 2>(); check::<9721, 4>();
+        check::<9721, 8>(); check::<9721, 16>();
     }
 
     /// The *proved* bound of the schedule (the shadow model only sees the inputs the test feeds it):

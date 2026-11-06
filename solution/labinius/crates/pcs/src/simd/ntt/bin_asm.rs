@@ -1330,7 +1330,8 @@ pub trait SliceSink<const H: usize> {
 
 /// Transform a quarter of all `H` inputs, then consume its six completed 27-row blocks.
 /// Batching callbacks amortizes the accumulator call boundary and its row-loop setup.
-/// `wbuf` holds `6 H` 27-vector blocks, each aligned to 64 bytes. Every callback receives
+/// `wbuf` holds both the prefix and completed values in `6 H` 27-vector blocks, each
+/// aligned to 64 bytes. The leaf transforms each block in place. Every callback receives
 /// rows `0..27`; the transforms and their output representatives match [`ntt_bin_batch32`].
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink<H>>(
@@ -1345,9 +1346,10 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
         omp: bc(&t.om[1]),
     };
     let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
-    let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
-    let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
+    // Prefix blocks use the callback buffer's block-major layout. Each leaf loads all
+    // 27 input vectors before its first output store, so it can transform that block in place.
+    let bps: [*mut i16; H] = core::array::from_fn(|h| wbuf.add(32 * 27 * h));
+    let buf = |j: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * j + h))) };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
     for k in 0..4 {
@@ -1389,18 +1391,18 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
                 let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
                 let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
                 st(bp, i, u0);
-                st(bp, i + 27, u1);
-                st(bp, i + 54, u2);
-                st(bp, i + 81, v2);
-                st(bp, i + 108, v0);
-                st(bp, i + 135, v1);
+                st(bp, i + 27 * H, u1);
+                st(bp, i + 54 * H, u2);
+                st(bp, i + 81 * H, v2);
+                st(bp, i + 108 * H, v0);
+                st(bp, i + 135 * H, v1);
             }
         }
         let cv = t.cv.as_ptr() as *const i16;
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let os = buf(kk);
+            let os = buf(j);
             let (t4, t5, t6) = if Q == 9721 {
                 (SMS_TWIDDLES.t4.as_ptr().add(4 * kk).cast::<u32>(),
                  SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
@@ -1411,13 +1413,13 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
                 t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
             ) };
             for h in 0..core::hint::black_box(H) {
-                let bpj = bps[h].add(32 * 27 * j);
+                let bpj = os[h];
                 tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
             }
         }
         for j in 0..6 {
             let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, ro(buf(j)), 0, 27);
         }
     }
 }
