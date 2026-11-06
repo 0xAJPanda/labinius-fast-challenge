@@ -1347,12 +1347,24 @@ pub fn fold_witness_bitsliced(
     q: u16,
     workers: usize,
 ) -> Vec<RingElement> {
+    fold_witness_bitsliced_into(words, columns, challenges, bpc, q, workers, Vec::new())
+}
+
+pub fn fold_witness_bitsliced_into(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    q: u16,
+    workers: usize,
+    out: Vec<RingElement>,
+) -> Vec<RingElement> {
     assert_eq!(challenges.len(), columns, "one challenge per column");
     assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
     if bpc % 4 != 0 || !bitsliced::fits(challenges) {
         return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
     }
-    bitsliced::fold_words(words, challenges, 128 * bpc, workers)
+    bitsliced::fold_words(words, challenges, 128 * bpc, workers, out)
 }
 
 // Exact fold of the binary witness, independent of commitment-modulus arithmetic.
@@ -2330,8 +2342,9 @@ mod bitsliced {
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        out: Vec<RingElement>,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers, out)
     }
 
     fn fold_config<const GROUP: usize, const FUSED: bool>(
@@ -2339,6 +2352,7 @@ mod bitsliced {
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        mut out: Vec<RingElement>,
     ) -> Vec<RingElement> {
         assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
         #[cfg(test)]
@@ -2367,7 +2381,8 @@ mod bitsliced {
         let free: std::sync::Mutex<Vec<Vec<[i16; LANES]>>> =
             std::sync::Mutex::new(Vec::new());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut out: Vec<RingElement> = Vec::with_capacity(len);
+        out.clear();
+        out.reserve(len);
         let out_addr = out.as_mut_ptr() as usize;
         let t0 = std::time::Instant::now();
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
@@ -2629,10 +2644,10 @@ mod bitsliced {
             let columns = (COL_GROUP + 2).next_multiple_of(2);
             let words = table(columns * LANES);
             let cs = challenges(columns);
-            let exact = fold_words(&words, &cs, LANES, 2);
+            let exact = fold_words(&words, &cs, LANES, 2, Vec::new());
             assert_eq!(exact, scalar(&words, &cs, LANES));
             let multi = table(columns * 3 * LANES);
-            assert_eq!(fold_words(&multi, &cs, 3 * LANES, 2), scalar(&multi, &cs, 3 * LANES));
+            assert_eq!(fold_words(&multi, &cs, 3 * LANES, 2, Vec::new()), scalar(&multi, &cs, 3 * LANES));
             for q in [3889, 2917, 4861, 9721, 12637, 17497, 19441] {
                 assert_eq!(exact, super::super::fold_witness_streaming(&words, columns, &cs, 4, q, 2), "q {q}");
             }
@@ -2646,7 +2661,7 @@ mod bitsliced {
                     c
                 }).collect();
                 let words: Vec<_> = (0..cs.len() * LANES).map(|i| B128(if i % 7 == 0 { 0 } else { u128::MAX })).collect();
-                assert_eq!(fold_words(&words, &cs, LANES, 2), scalar(&words, &cs, LANES));
+                assert_eq!(fold_words(&words, &cs, LANES, 2, Vec::new()), scalar(&words, &cs, LANES));
             }
         }
 
@@ -2660,7 +2675,7 @@ mod bitsliced {
             let mut times = Vec::new();
             for _ in 0..7 {
                 let start = std::time::Instant::now();
-                let v = fold_words(&words, &cs, 1 << 14, workers);
+                let v = fold_words(&words, &cs, 1 << 14, workers, Vec::new());
                 times.push(start.elapsed().as_micros());
                 if let Some(f) = &first { assert_eq!(&v, f); } else { first = Some(v); }
             }
@@ -2676,8 +2691,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers, Vec::new()),
+                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers, Vec::new()),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());

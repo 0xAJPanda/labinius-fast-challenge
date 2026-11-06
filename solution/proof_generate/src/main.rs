@@ -1721,6 +1721,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
     // baseline did, is a ninth runnable thread beside eight busy ones.)
     drop(rows);
+    let mut fold_out: Vec<labinius::RingElement648> = Vec::with_capacity(COLUMN_LEN / 4);
     if let Some(output) = output {
         // The pages of the switch's binding pass first: they are written ~10 ms from here,
         // and faulting them in there stalls the pass's runners.
@@ -1729,7 +1730,10 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             let (addr, _) = p.region();
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
-        output.populate(first.collect());
+        let at = fold_out.as_mut_ptr() as usize;
+        let (lo, hi) = ((at + 4095) & !4095, (at + fold_out.capacity() * std::mem::size_of::<labinius::RingElement648>()) & !4095);
+        let fold_pages = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(move |o| (o, POPULATE_CHUNK.min(hi - o)));
+        output.populate(first.chain(fold_pages).collect());
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1774,8 +1778,8 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced_into(
+        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers, fold_out,
     ));
     let fold_time = clock.elapsed();
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
