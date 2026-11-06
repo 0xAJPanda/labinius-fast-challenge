@@ -1643,16 +1643,13 @@ mod bitsliced {
     /// The 128 planes of a block of 512 words to `out`; the guard planes around them are the
     /// caller's.
     ///
-    /// The 8 KB the next call slices (`next`, any readable address) are prefetched a tile at a
-    /// time: the blocks of a group are 256 KB apart, two fresh pages each, which the hardware
-    /// prefetchers only start on after the first misses, and the table comes from DRAM.
     #[inline(always)]
     unsafe fn slice(words: *const B128, out: *mut __m512i, next: *const B128) {
         let mut tiles = core::mem::MaybeUninit::<[[__m512i; 16]; 8]>::uninit();
         let tiles_ptr = tiles.as_mut_ptr() as *mut __m512i;
         for t in 0..8 {
             for i in 0..16 {
-                _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
+                _mm_prefetch::<{ _MM_HINT_T1 }>((next as *const i8).add(1024 * t + 64 * i));
             }
             transpose_tile(words.add(64 * t), tiles_ptr.add(16 * t));
         }
