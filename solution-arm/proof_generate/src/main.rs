@@ -343,9 +343,53 @@ fn commit_reference(values: &[B128], matrix: &[u128], modulus: u128) -> Vec<u128
 }
 
 fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        // SAFETY: the CPU has PMULL (FEAT_PMULL comes with the `aes` feature).
+        return unsafe { dot_lifted_pmull(eq, column) };
+    }
+    dot_lifted_scalar(eq, column)
+}
+
+/// [`dot_lifted`] one reduced product at a time: the reference.
+fn dot_lifted_scalar(eq: &[F162], column: &[B128]) -> F162 {
     eq.iter()
         .zip(column)
         .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x))
+}
+
+/// [`dot_lifted`] with the carry-less products summed unreduced and reduced once. `e x` for
+/// `e = (e0, e1, e2)` and `x = (x0, x1)` (64-bit limbs) is `sum e_i x_j z^(64 (i + j))`, four
+/// 128-bit partial sums at limb offsets 0..3; the sum over the column stays below `2^(162 + 128)`
+/// and is reduced modulo `z^162 + z^81 + 1` exactly as [`F162`]'s product is, so the result is
+/// the same field element.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,aes")]
+unsafe fn dot_lifted_pmull(eq: &[F162], column: &[B128]) -> F162 {
+    use core::arch::aarch64::*;
+    let mul = |a: u64, b: u64| vreinterpretq_u64_p128(vmull_p64(a, b));
+    let mut c = [vdupq_n_u64(0); 4];
+    for (e, x) in eq.iter().zip(column) {
+        let (x0, x1) = (x.0 as u64, (x.0 >> 64) as u64);
+        let [e0, e1, e2] = e.0;
+        c[0] = veorq_u64(c[0], mul(e0, x0));
+        c[1] = veorq_u64(c[1], veorq_u64(mul(e0, x1), mul(e1, x0)));
+        c[2] = veorq_u64(c[2], veorq_u64(mul(e1, x1), mul(e2, x0)));
+        c[3] = veorq_u64(c[3], mul(e2, x1));
+    }
+    let l: [[u64; 2]; 4] = core::array::from_fn(|k| [vgetq_lane_u64::<0>(c[k]), vgetq_lane_u64::<1>(c[k])]);
+    let p = [l[0][0], l[0][1] ^ l[1][0], l[1][1] ^ l[2][0], l[2][1] ^ l[3][0], l[3][1], 0u64];
+    // the reduction of `F162 * F162` (scalar.rs), on the six limbs
+    const M34: u64 = (1 << 34) - 1;
+    let h00 = (p[2] >> 34) | (p[3] << 30);
+    let h01 = (p[3] >> 34) & ((1 << 17) - 1);
+    let h10 = (p[3] >> 51) | (p[4] << 13);
+    let h11 = (p[4] >> 51) | (p[5] << 13);
+    F162([
+        p[0] ^ h00 ^ h10,
+        p[1] ^ h01 ^ h11 ^ (h00 << 17),
+        (p[2] & M34) ^ (h01 << 17) ^ (h00 >> 47),
+    ])
 }
 
 /// `u_j = sum_i eq(p0, i) W[i + COLUMN_LEN j]`, one field element per column.
@@ -757,6 +801,50 @@ mod tests {
                 B128(word)
             })
             .collect()
+    }
+
+    /// The unreduced PMULL dot product is the scalar one, on random and on extreme inputs
+    /// (all-ones words, `eq` entries with every bit of all three limbs set), many lengths.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn dot_lifted_pmull_matches_scalar() {
+        assert!(std::arch::is_aarch64_feature_detected!("aes"));
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut cases = 0;
+        for len in [0usize, 1, 2, 3, 7, 64, 1000, 1 << 14] {
+            for kind in 0..4 {
+                let eq: Vec<F162> = (0..len)
+                    .map(|_| match kind {
+                        1 => F162([u64::MAX, u64::MAX, (1 << 34) - 1]),
+                        _ => F162([next(), next(), next() & ((1 << 34) - 1)]),
+                    })
+                    .collect();
+                let col: Vec<B128> = (0..len)
+                    .map(|_| match kind {
+                        2 => B128(u128::MAX),
+                        3 => B128(1u128 << (next() % 128)),
+                        _ => B128((next() as u128) << 64 | next() as u128),
+                    })
+                    .collect();
+                let got = unsafe { dot_lifted_pmull(&eq, &col) };
+                assert_eq!(got, dot_lifted_scalar(&eq, &col), "len {len} kind {kind}");
+                assert_eq!(got, dot_lifted(&eq, &col));
+                cases += 1;
+            }
+        }
+        for _ in 0..20000 {
+            let eq = [F162([next(), next(), next() & ((1 << 34) - 1)])];
+            let col = [B128((next() as u128) << 64 | next() as u128)];
+            assert_eq!(unsafe { dot_lifted_pmull(&eq, &col) }, dot_lifted_scalar(&eq, &col));
+            cases += 1;
+        }
+        assert_eq!(cases, 32 + 20000);
     }
 
     /// The direct encoding is byte for byte bincode's under the proof codec.
