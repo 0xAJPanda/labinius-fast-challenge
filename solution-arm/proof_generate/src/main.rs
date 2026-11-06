@@ -8,6 +8,7 @@
 //! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
 //! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
+mod fold_blocked;
 mod hugealloc;
 mod ntt;
 mod hybrid;
@@ -453,8 +454,13 @@ fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize)
         }
     }
     flush(&mut raw, &mut near);
+    reduce_ring(&raw)
+}
+
+/// Reduces the `i16` sums modulo `X^648 - X^324 + 1`.
+fn reduce_ring(raw: &[i16]) -> RingElement648 {
     let mut wide = [0i32; 2 * rq::N];
-    for (w, &r) in wide.iter_mut().zip(&raw) {
+    for (w, &r) in wide.iter_mut().zip(raw) {
         *w = r as i32;
     }
     for k in (rq::N..2 * rq::N - 1).rev() {
@@ -515,9 +521,23 @@ fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
     let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
         .map(|_| RingElement648::zero(Representation::Coefficients))
         .collect();
+    #[cfg(target_arch = "aarch64")]
+    let plan = fold_blocked::Plan::new(challenges);
     std::thread::scope(|scope| {
         for (block, base) in out.chunks_mut(per).zip((0..).step_by(per)) {
+            #[cfg(target_arch = "aarch64")]
+            let plan = &plan;
             scope.spawn(move || {
+                #[cfg(target_arch = "aarch64")]
+                if narrow && challenges.len() * fold_blocked::STRIDE < u32::MAX as usize {
+                    let mut masks = fold_blocked::scratch(challenges.len());
+                    let mut sums = [0i16; fold_blocked::SUMS];
+                    for (i, slot) in block.iter_mut().enumerate() {
+                        fold_blocked::sums(values, COLUMN_LEN, plan, base + i, &mut masks, &mut sums);
+                        *slot = reduce_ring(&sums);
+                    }
+                    return;
+                }
                 for (i, slot) in block.iter_mut().enumerate() {
                     *slot = if narrow {
                         fold_element_narrow(values, challenges, base + i)
@@ -615,7 +635,8 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> 
     let row = RowEvaluation::of(row_evaluate(values, &p0));
     timer.lap("row");
     let challenges = folding_challenges(&mut t, &row);
-    let folded = FoldedWitness::of(fold(values, &challenges));
+    let rings = fold(values, &challenges);
+    let folded = FoldedWitness::of(rings);
     timer.lap("fold");
     Proof {
         version: 1,
@@ -730,6 +751,20 @@ mod tests {
                     values[j * COLUMN_LEN + 4 * m + k] =
                         if m == 2048 { B128(u128::MAX) } else { col[k] };
                 }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let plan = fold_blocked::Plan::new(&challenges);
+            let mut masks = fold_blocked::scratch(COLUMNS);
+            let mut sums = [0i16; fold_blocked::SUMS];
+            for m in elements {
+                fold_blocked::sums(&values, COLUMN_LEN, &plan, m, &mut masks, &mut sums);
+                assert_eq!(
+                    reduce_ring(&sums).v,
+                    fold_element(&values, &challenges, m).v,
+                    "blocked element {m}"
+                );
             }
         }
         for m in elements {
