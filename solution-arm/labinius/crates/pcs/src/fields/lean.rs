@@ -1,4 +1,4 @@
-use super::crossfield::{eq_expand_b128, eq_expand_f162};
+use super::crossfield::{eq_expand_b128_from, eq_expand_f162};
 use super::neon::{self, ByteTables};
 use super::scalar::{B128, F162};
 use crate::par;
@@ -52,18 +52,9 @@ impl Prepared {
         let inverses: Vec<_> = r.iter().map(|&x| inverse(B128::ONE + x)).collect();
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..PREFIX].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
-        let mut eq = eq_expand_b128(&r[PREFIX..]);
+        let mut eq = vec![B128::ZERO; 1 << (r.len() - PREFIX)];
+        eq_expand_b128_from(&r[PREFIX..], &mut eq, scale);
         let parts = par::workers(eq.len(), 1 << 13);
-        let per = eq.len().div_ceil(parts);
-        std::thread::scope(|scope| {
-            for chunk in eq.chunks_mut(per) {
-                scope.spawn(move || {
-                    for e in chunk {
-                        *e = *e * scale;
-                    }
-                });
-            }
-        });
         let parts = par::map_blocks(eq.len(), parts, 64, |_, start, end| {
             neon::partial_evals_sets(words, &eq, start, end)
         });
