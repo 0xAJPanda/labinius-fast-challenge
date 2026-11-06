@@ -389,7 +389,35 @@ impl Table {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            let ptr = unsafe {
+            const HUGE: usize = 2 << 20;
+            let span = Self::BYTES.div_ceil(HUGE) * HUGE;
+            let reserved = unsafe {
+                sys::mmap(
+                    core::ptr::null_mut(),
+                    span + HUGE,
+                    sys::PROT_NONE,
+                    sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            let aligned = if reserved as isize == -1 || reserved.is_null() {
+                None
+            } else {
+                let at = (reserved as usize + HUGE - 1) & !(HUGE - 1);
+                let p = unsafe {
+                    sys::mmap(
+                        at as *mut _,
+                        Self::BYTES,
+                        sys::PROT_READ,
+                        sys::MAP_PRIVATE | sys::MAP_FIXED,
+                        file.as_raw_fd(),
+                        0,
+                    )
+                };
+                (p as usize == at).then_some(p)
+            };
+            let ptr = aligned.unwrap_or_else(|| unsafe {
                 sys::mmap(
                     core::ptr::null_mut(),
                     Self::BYTES,
@@ -398,7 +426,7 @@ impl Table {
                     file.as_raw_fd(),
                     0,
                 )
-            };
+            });
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
                 return Table::Mapped {
                     ptr: ptr as *const B128,
