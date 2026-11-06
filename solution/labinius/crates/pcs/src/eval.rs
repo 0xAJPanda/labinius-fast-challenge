@@ -316,9 +316,8 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
     let (mut acc, blocks) = ([_mm512_setzero_si512(); 10], n / 8);
     let last = blocks.saturating_sub(1);
     for t in 0..blocks {
-        // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
         // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
-        let ahead = b.wrapping_add(8 * (t + 8).min(last)) as *const i8;
+        let ahead = b.wrapping_add(8 * (t + 16).min(last)) as *const i8;
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
         let x = [
@@ -342,7 +341,6 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
 
 /// [`dot_words`] on two columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
 /// 384 KB at `n = 2^14`) is loaded from L2 once per pair of columns while both witness streams
-/// are prefetched 1 KB ahead.
 ///
 /// # Safety
 unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
@@ -354,7 +352,7 @@ unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162
     let blocks = n / 8;
     let last = blocks.saturating_sub(1);
     for t in 0..blocks {
-        let at = 8 * (t + 8).min(last);
+        let at = 8 * (t + 16).min(last);
         let ahead0 = b0.wrapping_add(at) as *const i8;
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0.wrapping_add(64));
