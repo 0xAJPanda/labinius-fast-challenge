@@ -1175,6 +1175,8 @@ unsafe fn partials_blocks<const G: usize>(
     let rows = high.len();
     let chunk = (rows / (32 * threads.max(1))).clamp(1, 8);
     let chunks = rows.div_ceil(chunk);
+    let ways = if chunks % 4 == 0 { 4 } else { 1 };
+    let per_way = chunks / ways;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let runners = threads.max(1).min(chunks);
     let pi0_addr = pi0.as_ptr() as usize;
@@ -1184,14 +1186,16 @@ unsafe fn partials_blocks<const G: usize>(
         let mut scratch = RowScratch::new(groups);
         let mut row = vec![B128::ZERO; low.len()];
         loop {
-            let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c >= chunks {
+            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k >= chunks {
                 break;
             }
+            let c = (k % ways) * per_way + (per_way - 1 - k / ways);
+            let start = c * chunk;
             let end = ((c + 1) * chunk).min(rows);
-            for jh in c * chunk..end {
+            for jh in (start..end).rev() {
                 scale_b128_row(&low, high[jh], row.as_mut_ptr());
-                let next_row = if jh + 1 < end { pi0.add((jh + 1) << h) } else { core::ptr::null() };
+                let next_row = if jh > start { pi0.add((jh - 1) << h) } else { core::ptr::null() };
                 partials_row(&mut acc, pi0.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
             }
         }
