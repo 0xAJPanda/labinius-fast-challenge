@@ -389,17 +389,37 @@ impl Table {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            let ptr = unsafe {
+            // A 2 MB-aligned address, so that file offset 0 starts a huge page: reserve, then map
+            const HUGE: usize = 2 << 20;
+            let span = Self::BYTES.div_ceil(HUGE) * HUGE;
+            let reserved = unsafe {
                 sys::mmap(
                     core::ptr::null_mut(),
+                    span + HUGE,
+                    sys::PROT_NONE,
+                    sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            let at = if reserved as isize == -1 || reserved.is_null() {
+                None
+            } else {
+                Some((reserved as usize + HUGE - 1) & !(HUGE - 1))
+            };
+            let ptr = unsafe {
+                sys::mmap(
+                    at.map_or(core::ptr::null_mut(), |a| a as *mut _),
                     Self::BYTES,
                     sys::PROT_READ,
-                    sys::MAP_PRIVATE,
+                    if at.is_some() { sys::MAP_PRIVATE | sys::MAP_FIXED } else { sys::MAP_PRIVATE },
                     file.as_raw_fd(),
                     0,
                 )
             };
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                // Advisory: without large page-cache folios the mapping is 4 KB pages.
+                unsafe { sys::madvise(ptr, Self::BYTES, sys::MADV_HUGEPAGE) };
                 return Table::Mapped {
                     ptr: ptr as *const B128,
                     bytes: Self::BYTES,
