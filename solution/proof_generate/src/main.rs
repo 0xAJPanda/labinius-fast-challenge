@@ -472,20 +472,30 @@ fn populate_part(addr: usize, bytes: usize) {
 /// inside the measured time.
 #[cfg(target_os = "linux")]
 fn release_words(words: &[B128], keys: &[u8], threads: usize) {
-    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
-    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
-    let release = |addr: usize, bytes: usize| {
-        let start = addr & !4095;
-        unsafe { sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_DONTNEED) };
-    };
-    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+    let parts = release_ranges(words, keys, threads);
+    labinius::par::pool().run(parts.len(), |i| release_part(parts[i]));
+}
+
+#[cfg(target_os = "linux")]
+fn release_ranges(words: &[B128], keys: &[u8], pieces: usize) -> Vec<(usize, usize)> {
+    let runs = labinius::par::ranges(words.len(), pieces, 4096 / 16);
+    let kruns = labinius::par::ranges(keys.len(), pieces, 4096);
+    let mut parts = Vec::with_capacity(runs.len() + kruns.len());
+    for i in 0..runs.len().max(kruns.len()) {
         if let Some(r) = kruns.get(i) {
-            release(keys[r.clone()].as_ptr() as usize, r.len());
+            parts.push((keys[r.clone()].as_ptr() as usize, r.len()));
         }
         if let Some(r) = runs.get(i) {
-            release(words[r.clone()].as_ptr() as usize, r.len() * 16);
+            parts.push((words[r.clone()].as_ptr() as usize, r.len() * 16));
         }
-    });
+    }
+    parts
+}
+
+#[cfg(target_os = "linux")]
+fn release_part((addr, bytes): (usize, usize)) {
+    let start = addr & !4095;
+    unsafe { sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_DONTNEED) };
 }
 
 // A read-only mapping: any thread may read or unmap it.
@@ -1223,12 +1233,9 @@ impl ProofLayout {
 
 /// The codec's encoding of `parts`, written into `out` (`layout.len()` bytes): the small
 /// fields on this thread, the commitment and the folded witness (`i32` little-endian per
-/// coefficient) in parallel on the pool.
 ///
 /// # Safety
-/// `out` must be valid for writes of `layout.len()` bytes, and `layout` must be
-/// [`ProofLayout::of_parts`]`(parts)`.
-unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
+unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8, release: &[(usize, usize)]) {
     let put = |at: &mut usize, bytes: &[u8]| {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
         *at += bytes.len();
@@ -1266,14 +1273,19 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
             .all(|e| e.representation == Representation::Coefficients),
         "a fold is in coefficient form"
     );
-    // A few commitment slices and many folded runs, taken dynamically.
     let ctasks = 4;
     let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
     let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
     let avx512 = std::arch::is_x86_feature_detected!("avx512f");
-    labinius::par::pool().run(cruns.len() + fruns.len(), |i| {
+    labinius::par::pool().run(release.len() + cruns.len() + fruns.len(), |i| {
+        if i < release.len() {
+            #[cfg(target_os = "linux")]
+            release_part(release[i]);
+            return;
+        }
+        let i = i - release.len();
         let out = addr as *mut u8;
         if i < cruns.len() {
             let r = cruns[i].clone();
@@ -1320,6 +1332,7 @@ struct Output {
     populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
     /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
     commitment: std::sync::Mutex<Option<Vec<u8>>>,
+    release: std::sync::Mutex<Vec<(usize, usize)>>,
 }
 
 struct OutputState {
@@ -1455,6 +1468,7 @@ impl Output {
             job,
             populate: std::sync::OnceLock::new(),
             commitment: std::sync::Mutex::new(Some(commitment)),
+            release: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1486,6 +1500,10 @@ impl Output {
         let _ = self.populate.set(job);
     }
 
+    fn defer_release(&self, ranges: Vec<(usize, usize)>) {
+        self.release.lock().unwrap().extend(ranges);
+    }
+
     /// Write the proof: encoded into the mapping when it has the expected layout, else through
     /// the codec into a freshly truncated file.
     fn write(self, parts: ProofParts) {
@@ -1494,13 +1512,16 @@ impl Output {
             labinius::par::pool().quiesce(job);
         }
         let layout = ProofLayout::of_parts(&parts);
+        let release = std::mem::take(&mut *self.release.lock().unwrap());
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
-                unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
+                unsafe { encode_into(&parts, &layout, m.addr as *mut u8, &release) };
                 // The pages are the file's; the exit unmaps them.
                 return;
             }
         }
+        #[cfg(target_os = "linux")]
+        labinius::par::pool().run(release.len(), |i| release_part(release[i]));
         #[cfg(target_os = "linux")]
         if let Some(Some(m)) = self.state.map.get() {
             unsafe { sys::munmap(m.addr as *mut _, self.state.layout.len()) };
@@ -1779,11 +1800,12 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     ));
     let fold_time = clock.elapsed();
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
-    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
-    // written. The emptied mapping itself is left to the exit.
     #[cfg(target_os = "linux")]
     if let Table::Mapped { .. } = table {
-        release_words(values, image, workers);
+        match output {
+            Some(o) => o.defer_release(release_ranges(values, image, 2 * workers)),
+            None => release_words(values, image, workers),
+        }
     }
     std::mem::forget(table);
     let proof = ProofParts {
@@ -2129,7 +2151,7 @@ mod tests {
             };
             let layout = ProofLayout::of_parts(&parts);
             let mut out = vec![0xA5u8; layout.len()];
-            unsafe { encode_into(&parts, &layout, out.as_mut_ptr()) };
+            unsafe { encode_into(&parts, &layout, out.as_mut_ptr(), &[]) };
             assert_eq!(out, codec().serialize(&parts.into_proof()).unwrap());
         }
         assert_eq!(ProofLayout::of_instance(MODULUS).len(), 13_958_612, "the default proof's length");
