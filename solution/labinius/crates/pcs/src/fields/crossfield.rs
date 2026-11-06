@@ -1175,8 +1175,11 @@ unsafe fn partials_blocks<const G: usize>(
     let rows = high.len();
     let chunk = (rows / (32 * threads.max(1))).clamp(1, 8);
     let chunks = rows.div_ceil(chunk);
+    let hot = G - G / 4;
+    let phases: Vec<core::ops::Range<usize>> = [hot..G, 0..hot].into_iter().filter(|b| !b.is_empty()).collect();
+    let tasks = phases.len() * chunks;
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let runners = threads.max(1).min(chunks);
+    let runners = threads.max(1).min(tasks);
     let pi0_addr = pi0.as_ptr() as usize;
     let parts: Vec<Vec<RawAcc>> = crate::par::pool().map(runners, |_| {
         let pi0 = pi0_addr as *const B128;
@@ -1184,15 +1187,17 @@ unsafe fn partials_blocks<const G: usize>(
         let mut scratch = RowScratch::new(groups);
         let mut row = vec![B128::ZERO; low.len()];
         loop {
-            let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if c >= chunks {
+            let t = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if t >= tasks {
                 break;
             }
+            let (blocks, c) = (phases[t / chunks].clone(), t % chunks);
+            let base = pi0.add(blocks.start * block_len);
             let end = ((c + 1) * chunk).min(rows);
             for jh in c * chunk..end {
                 scale_b128_row(&low, high[jh], row.as_mut_ptr());
-                let next_row = if jh + 1 < end { pi0.add((jh + 1) << h) } else { core::ptr::null() };
-                partials_row(&mut acc, pi0.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
+                let next_row = if jh + 1 < end { base.add((jh + 1) << h) } else { core::ptr::null() };
+                partials_row(&mut acc[blocks.clone()], base.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
             }
         }
         acc
