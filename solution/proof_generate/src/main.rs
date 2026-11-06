@@ -466,26 +466,56 @@ fn populate_part(addr: usize, bytes: usize) {
     std::hint::black_box(sink);
 }
 
-/// Drop the words' and the keys' page-table entries (`MADV_DONTNEED`), a slice of each per task.
-/// Both are read-only file mappings: the page cache keeps the pages, and a later read faults the
-/// same bytes back in. Whatever is still mapped at the end is torn down by the exit on one CPU,
-/// inside the measured time.
 #[cfg(target_os = "linux")]
-fn release_words(words: &[B128], keys: &[u8], threads: usize) {
-    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
-    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
-    let release = |addr: usize, bytes: usize| {
-        let start = addr & !4095;
-        unsafe { sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_DONTNEED) };
-    };
-    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
-        if let Some(r) = kruns.get(i) {
-            release(keys[r.clone()].as_ptr() as usize, r.len());
+static RELEASE: std::sync::OnceLock<[(usize, usize); 2]> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+const RELEASE_CHUNK: usize = 4 << 20;
+
+#[cfg(target_os = "linux")]
+struct Release {
+    steps: std::sync::Arc<(Vec<(usize, usize)>, std::sync::atomic::AtomicUsize)>,
+    job: &'static labinius::par::IdleJob,
+}
+
+#[cfg(target_os = "linux")]
+impl Release {
+    fn step(steps: &(Vec<(usize, usize)>, std::sync::atomic::AtomicUsize)) -> bool {
+        let i = steps.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match steps.0.get(i) {
+            Some(&(addr, len)) => {
+                unsafe { sys::madvise(addr as *mut _, len, sys::MADV_DONTNEED) };
+                true
+            }
+            None => false,
         }
-        if let Some(r) = runs.get(i) {
-            release(words[r.clone()].as_ptr() as usize, r.len() * 16);
+    }
+
+    fn start(ranges: &[(usize, usize); 2]) -> Release {
+        let mut list = Vec::new();
+        for &(addr, bytes) in ranges {
+            // whole pages: the range need not start on one
+            let (mut at, end) = (addr & !4095, addr + bytes);
+            while at < end {
+                let len = RELEASE_CHUNK.min(end - at);
+                list.push((at, len));
+                at += len;
+            }
         }
-    });
+        let chunks = list.len();
+        let steps = std::sync::Arc::new((list, std::sync::atomic::AtomicUsize::new(0)));
+        let mine = steps.clone();
+        let job = labinius::par::pool().idle(chunks, move |_| {
+            Release::step(&mine);
+        });
+        Release { steps, job }
+    }
+
+    fn finish(self) {
+        let pool = labinius::par::pool();
+        pool.quiesce(self.job);
+        pool.run(labinius::par::threads(), |_| while Release::step(&self.steps) {});
+    }
 }
 
 // A read-only mapping: any thread may read or unmap it.
@@ -1487,12 +1517,21 @@ impl Output {
     }
 
     /// Write the proof: encoded into the mapping when it has the expected layout, else through
-    /// the codec into a freshly truncated file.
     fn write(self, parts: ProofParts) {
         labinius::par::pool().quiesce(self.job);
         if let Some(job) = self.populate.get() {
             labinius::par::pool().quiesce(job);
         }
+        #[cfg(target_os = "linux")]
+        let release = RELEASE.get().map(Release::start);
+        self.encode(parts);
+        #[cfg(target_os = "linux")]
+        if let Some(release) = release {
+            release.finish();
+        }
+    }
+
+    fn encode(&self, parts: ProofParts) {
         let layout = ProofLayout::of_parts(&parts);
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
@@ -1779,11 +1818,12 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     ));
     let fold_time = clock.elapsed();
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
-    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
-    // written. The emptied mapping itself is left to the exit.
     #[cfg(target_os = "linux")]
     if let Table::Mapped { .. } = table {
-        release_words(values, image, workers);
+        let _ = RELEASE.set([
+            (values.as_ptr() as usize, std::mem::size_of_val(values)),
+            (image.as_ptr() as usize, std::mem::size_of_val(image)),
+        ]);
     }
     std::mem::forget(table);
     let proof = ProofParts {
