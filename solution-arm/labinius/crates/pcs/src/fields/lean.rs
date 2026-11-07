@@ -5,6 +5,7 @@ use crate::par;
 
 const PACK: usize = 128;
 const PREFIX: usize = 6;
+const PLANE_RESERVE: usize = 4 << 20;
 
 fn inverse(x: B128) -> B128 {
     assert_ne!(x, B128::ZERO);
@@ -295,7 +296,12 @@ impl<'a> Switch<'a> {
 
     fn materialize(&mut self) {
         let n = self.words.len() >> self.prepared.prefix;
-        self.planes = core::array::from_fn(|_| vec![0; n]);
+        let reserve = n.max(PLANE_RESERVE / core::mem::size_of::<u64>());
+        self.planes = core::array::from_fn(|_| {
+            let mut v = Vec::<u64>::with_capacity(reserve);
+            unsafe { v.set_len(n) };
+            v
+        });
         let weights = eq_expand_f162(&self.prefix_r);
         let words = self.words;
         let parts = par::workers(n, 1 << 12);
