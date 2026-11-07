@@ -30,8 +30,7 @@ fn scales(ratios: &[B128]) -> Vec<B128> {
         .collect()
 }
 
-fn compose(images: &[F162], d: B128) -> Vec<F162> {
-    let map = ByteTables::new(images);
+fn compose(map: &ByteTables, d: B128) -> Vec<F162> {
     (0..PACK).map(|i| map.apply(B128(1u128 << i) * d)).collect()
 }
 
@@ -118,6 +117,7 @@ pub struct Switch<'a> {
     prepared: Prepared,
     l: Vec<F162>,
     lp: Vec<F162>,
+    lt: ByteTables,
     prefix_r: Vec<F162>,
     planes: [Vec<u64>; 3],
     half: usize,
@@ -127,13 +127,15 @@ pub struct Switch<'a> {
 
 impl<'a> Switch<'a> {
     pub fn new(words: &'a [B128], prepared: Prepared, batch: &[F162]) -> Self {
-        let lp = compose(batch, prepared.inverses[0]);
+        let lt = ByteTables::new(batch);
+        let lp = compose(&lt, prepared.inverses[0]);
         let prefix_r = vec![F162::ZERO; prepared.prefix];
         let mut out = Self {
             words,
             prepared,
             l: batch.to_vec(),
             lp,
+            lt,
             prefix_r,
             planes: core::array::from_fn(|_| Vec::new()),
             half: words.len(),
@@ -150,7 +152,7 @@ impl<'a> Switch<'a> {
         let suffix = prefix - k - 1;
         let scale = scales(&self.prepared.ratios[k + 1..prefix]);
         let weights = eq_expand_f162(&self.prefix_r[..k]);
-        let l = ByteTables::new(&self.l);
+        let l = &self.lt;
         let lp = ByteTables::new(&self.lp);
         let tasks = weights.len() * PACK;
         let sums = par::map_blocks(tasks, par::workers(tasks, 16), 16, |_, start, end| {
@@ -196,7 +198,7 @@ impl<'a> Switch<'a> {
     }
 
     fn message(&self, half: usize) -> [F162; 2] {
-        let l = ByteTables::new(&self.l);
+        let l = &self.lt;
         let lp = ByteTables::new(&self.lp);
         let p = &self.planes;
         let parts = par::workers(half, 1 << 10);
@@ -224,8 +226,9 @@ impl<'a> Switch<'a> {
         for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
             *l += r * lp;
         }
+        self.lt = ByteTables::new(&self.l);
         if self.round + 1 < self.prepared.inverses.len() {
-            self.lp = compose(&self.l, self.prepared.inverses[self.round + 1]);
+            self.lp = compose(&self.lt, self.prepared.inverses[self.round + 1]);
         }
         if self.round < self.prepared.prefix {
             self.prefix_r[self.round] = r;
@@ -246,7 +249,7 @@ impl<'a> Switch<'a> {
 
     fn fold_message(&mut self, r: F162) -> [F162; 2] {
         let hh = self.half / 2;
-        let l = ByteTables::new(&self.l);
+        let l = &self.lt;
         let lp = ByteTables::new(&self.lp);
         let eq = &self.prepared.eq;
         let parts = par::workers(hh, 1 << 10);
