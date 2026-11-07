@@ -705,6 +705,44 @@ fn crt(r: u32, t: i64) -> u128 {
     (r as u64 + P1 as u64 * k) as u128
 }
 
+#[repr(C)]
+struct Scratch {
+    xs: [[int16x8_t; N]; SWEEP],
+    acc: [int64x2_t; ROWS * 4 * N],
+    dev: [int32x4_t; DIGITS * 2 * N],
+    m: [int16x8_t; BITS],
+    nib: [uint8x16_t; N / 4],
+    y: [int16x8_t; N],
+    tail: [[i64; LANES]; N],
+}
+
+const ARENA: usize = 4 << 20;
+const _: () = assert!(core::mem::size_of::<Scratch>() <= 2 << 20, "the scratch fits one huge page");
+
+struct Arena(*mut Scratch);
+
+impl Arena {
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(ARENA.max(core::mem::size_of::<Scratch>()), core::mem::align_of::<Scratch>())
+            .expect("the scratch layout")
+    }
+
+    fn new() -> Self {
+        let layout = Self::layout();
+        let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Scratch;
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Arena(p)
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.0 as *mut u8, Self::layout()) }
+    }
+}
+
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
@@ -713,15 +751,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
-        let mut m = Box::new([vdupq_n_s16(0); BITS]);
-        let mut nib = Box::new([vdupq_n_u8(0); N / 4]);
-        let mut xs = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
-        let mut y = Box::new([vdupq_n_s16(0); N]);
-        let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
-        // per digit, the chunk deviations S - mean summed over the chunks
-        let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
-        // the eight columns' tails, `i64` per lane (41 KiB, off the stack)
-        let mut tail = Box::new([[0i64; LANES]; N]);
+        let arena = Arena::new();
+        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / N;
         for (b, target) in block.chunks_mut(LANES * N).enumerate() {
@@ -735,7 +766,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
+            sums(&words, a, m, nib, xs, acc, y, dev);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
