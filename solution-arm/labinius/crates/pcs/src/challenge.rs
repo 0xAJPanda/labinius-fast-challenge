@@ -326,13 +326,18 @@ impl Transcript {
     /// The same derivation as [`fill`](Self::fill), as a stream — for samplers that consume a
     /// number of bytes they do not know in advance.
     fn reader(&mut self, label: &[u8]) -> blake3::OutputReader {
-        let mut state = self.state.clone();
-        state.update(&self.counter.to_le_bytes());
-        state.update(&(label.len() as u64).to_le_bytes());
-        state.update(label);
+        let r = derive(&self.state, self.counter, label);
         self.counter += 1;
-        state.finalize_xof()
+        r
     }
+}
+
+fn derive(state: &Stream, counter: u64, label: &[u8]) -> blake3::OutputReader {
+    let mut state = state.clone();
+    state.update(&counter.to_le_bytes());
+    state.update(&(label.len() as u64).to_le_bytes());
+    state.update(label);
+    state.finalize_xof()
 }
 
 /// A buffered view of one XOF derivation.
@@ -705,17 +710,16 @@ pub fn sample_short_challenges(
     weight: usize,
     bound: f64,
 ) -> Vec<ShortChallenge> {
-    let readers: Vec<blake3::OutputReader> =
-        (0..n).map(|_| t.reader(b"short-challenge")).collect();
+    const LABEL: &[u8] = b"short-challenge";
+    let base = t.counter;
+    let state = &t.state;
     let bound_sq = bound * bound + 1e-12;
     let parts = crate::par::workers(n, 32);
-    let readers = &readers;
-    crate::par::map_blocks(n, parts, 1, |_, s, e| {
+    let out: Vec<ShortChallenge> = crate::par::map_blocks(n, parts, 1, |_, s, e| {
         let mut perm = [0u8; N162];
-        readers[s..e]
-            .iter()
-            .map(|r| {
-                let mut x = Xof::new(r.clone());
+        (s..e)
+            .map(|i| {
+                let mut x = Xof::new(derive(state, base + i as u64, LABEL));
                 loop {
                     let c = attempt(&mut x, weight, &mut perm).signed();
                     if within(&c, bound_sq) {
@@ -727,7 +731,9 @@ pub fn sample_short_challenges(
     })
     .into_iter()
     .flatten()
-    .collect()
+    .collect();
+    t.counter += n as u64;
+    out
 }
 
 pub fn sample_short_challenge(
